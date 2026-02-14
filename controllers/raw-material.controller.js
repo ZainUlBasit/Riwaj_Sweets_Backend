@@ -35,13 +35,14 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, supplier_id, unit, in_quantity, out_quantity, available_quantity } = req.body;
+    const { name, supplier_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
     if (!name || !supplier_id || unit == null) {
       return createError(res, 400, "Name, supplier_id and unit are required.");
     }
     const item = await RawMaterial.create({
       name,
       supplier_id,
+      price: price ?? 0,
       unit,
       in_quantity: in_quantity ?? 0,
       out_quantity: out_quantity ?? 0,
@@ -57,12 +58,13 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, supplier_id, unit, in_quantity, out_quantity, available_quantity } = req.body;
+    const { name, supplier_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
     const item = await RawMaterial.findByIdAndUpdate(
       req.params.id,
       {
         name,
         supplier_id,
+        price,
         unit,
         in_quantity,
         out_quantity,
