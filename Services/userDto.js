@@ -1,11 +1,10 @@
 const UserDto = (user) => {
-  const userdata = {
+  return {
     _id: user._id,
-    name: user.fullName,
+    name: user.name || user.fullName,
     email: user.email,
     role: user.role,
   };
-  return userdata;
 };
 
 module.exports = UserDto;

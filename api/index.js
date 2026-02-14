@@ -151,8 +151,8 @@ app.get("/api/test", (req, res) => {
 // ===================================================
 // Auth Routes
 // ===================================================
-// const AuthRoutes = require("../routes/auth.routes");
-// app.use("/api/auth", AuthRoutes);
+const AuthRoutes = require("../routes/auth.routes");
+app.use("/api/auth", AuthRoutes);
 // ===================================================
 // Supplier Routes
 // ===================================================
