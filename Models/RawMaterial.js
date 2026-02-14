@@ -11,7 +11,7 @@ const RawMaterialSchema = new Schema(
   {
     name: requiredString,
     supplier_id: {
-      type: Schema.Types.ObjectId,
+      type: mongoose.Types.ObjectId,
       ref: "Supplier",
       required: true,
     },
