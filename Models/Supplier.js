@@ -1,5 +1,9 @@
 const mongoose = require("mongoose");
-const { requiredString, NumberWithDefault } = require("../utils/Types");
+const {
+  requiredString,
+  requiredNumberWithDefault,
+  requiredBooleanWithDefaultFalse,
+} = require("../utils/Types");
 
 const Schema = mongoose.Schema;
 
@@ -15,7 +19,8 @@ const SupplierSchema = new Schema(
       type: String,
       default: "",
     },
-    paid: NumberWithDefault,
+    paid: requiredNumberWithDefault,
+    isDeleted: requiredBooleanWithDefaultFalse,
   },
   {
     timestamps: true,

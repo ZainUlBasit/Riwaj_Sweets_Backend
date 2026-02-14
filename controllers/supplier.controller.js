@@ -7,8 +7,20 @@ const { createError, successMessage } = require("../utils/ResponseMessage");
  */
 const list = async (req, res) => {
   try {
-    const suppliers = await Supplier.find().sort({ createdAt: -1 });
-    return successMessage(res, suppliers, "Suppliers fetched successfully.");
+    const suppliers = await Supplier.find({ isDeleted: false }).sort({
+      createdAt: -1,
+    });
+    const deletedSuppliers = await Supplier.find({ isDeleted: true }).sort({
+      createdAt: -1,
+    });
+    return successMessage(
+      res,
+      {
+        suppliers: suppliers,
+        deletedSuppliers: deletedSuppliers,
+      },
+      "Suppliers fetched successfully.",
+    );
   } catch (err) {
     console.error("Supplier list error:", err);
     return createError(res, 500, err.message || "Failed to fetch suppliers.");
@@ -21,7 +33,9 @@ const list = async (req, res) => {
  */
 const getOne = async (req, res) => {
   try {
-    const supplier = await Supplier.findById(req.params.id);
+    const supplier = await Supplier.findById(req.params.id).where({
+      isDeleted: false,
+    });
     if (!supplier) {
       return createError(res, 404, "Supplier not found.");
     }
@@ -48,6 +62,7 @@ const create = async (req, res) => {
       address: address ?? "",
       desc: desc ?? "",
       paid: paid ?? 0,
+      isDeleted: false,
     });
     return successMessage(res, supplier, "Supplier created successfully.");
   } catch (err) {
@@ -65,8 +80,8 @@ const update = async (req, res) => {
     const { name, contact, address, desc, paid } = req.body;
     const supplier = await Supplier.findByIdAndUpdate(
       req.params.id,
-      { name, contact, address, desc, paid },
-      { new: true, runValidators: true }
+      { name, contact, address, desc, paid, isDeleted: false },
+      { new: true, runValidators: true },
     );
     if (!supplier) {
       return createError(res, 404, "Supplier not found.");
