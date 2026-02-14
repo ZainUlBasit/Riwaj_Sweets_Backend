@@ -1,4 +1,6 @@
 const RawMaterialStock = require("../Models/RawMaterialStock");
+const RawMaterial = require("../Models/RawMaterial");
+const Supplier = require("../Models/Supplier");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 
 const list = async (req, res) => {
@@ -39,14 +41,31 @@ const create = async (req, res) => {
     if (!raw_material_id) {
       return createError(res, 400, "raw_material_id is required.");
     }
+    const qty = quantity ?? 0;
+    const prc = price ?? 0;
+    const totalPrice = total_price ?? qty * prc;
+
+    const rawMaterial = await RawMaterial.findById(raw_material_id).where({
+      isDeleted: false,
+    });
+    if (!rawMaterial) {
+      return createError(res, 404, "Raw material not found.");
+    }
+
     const item = await RawMaterialStock.create({
       raw_material_id,
       desc: desc ?? "",
-      quantity: quantity ?? 0,
-      price: price ?? 0,
-      total_price: total_price ?? 0,
+      quantity: qty,
+      price: prc,
+      total_price: totalPrice,
       isDeleted: false,
     });
+
+    // Us raw material ke supplier ka total_amount aur payable increase karo
+    await Supplier.findByIdAndUpdate(rawMaterial.supplier_id, {
+      $inc: { total_amount: totalPrice, payable: totalPrice },
+    });
+
     return successMessage(res, item, "Raw material stock entry created successfully.");
   } catch (err) {
     console.error("RawMaterialStock create error:", err);

@@ -19,7 +19,9 @@ const SupplierSchema = new Schema(
       type: String,
       default: "",
     },
+    total_amount: requiredNumberWithDefault,
     paid: requiredNumberWithDefault,
+    payable: requiredNumberWithDefault,
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {
