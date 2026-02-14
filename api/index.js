@@ -178,49 +178,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-// ===================================================
-// Vercel Cron endpoint(s)
-// Note: Vercel serverless does not keep node-cron timers alive; use Vercel Cron Jobs to call this endpoint on a schedule.
-// Protect with CRON_SECRET (recommended).
-// ===================================================
-const { runResetCallStatusWeekly, scheduleResetCallStatusWeekly } = require("../Services/cronJobs");
-
-app.get("/api/cron/reset-call-status-weekly", async (req, res) => {
-  try {
-    const secret = process.env.CRON_SECRET;
-    if (secret) {
-      const authHeader = req.headers.authorization || "";
-      const bearer = authHeader.startsWith("Bearer ")
-        ? authHeader.slice("Bearer ".length)
-        : null;
-      const provided = bearer || req.query.secret;
-
-      if (provided !== secret) {
-        return res.status(401).json({
-          success: false,
-          error: { msg: "Unauthorized" },
-        });
-      }
-    }
-
-    const result = await runResetCallStatusWeekly();
-    return res.status(200).json({
-      success: true,
-      job: "reset-call-status-weekly",
-      ...result,
-    });
-  } catch (error) {
-    console.error("Cron error:", error);
-    return res.status(500).json({
-      success: false,
-      error: { msg: error.message || "Cron job failed" },
-    });
-  }
-});
-
-// Local scheduler (disabled automatically on Vercel)
-scheduleResetCallStatusWeekly();
-
 // Start server
 if (!process.env.VERCEL) {
   server.listen(port, () => {
