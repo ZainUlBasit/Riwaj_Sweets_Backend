@@ -99,7 +99,7 @@ const update = async (req, res) => {
  */
 const remove = async (req, res) => {
   try {
-    const supplier = await Supplier.findByIdAndDelete(req.params.id);
+    const supplier = await Supplier.findByIdAndDelete(req.params.id).where({ isDeleted: false });
     if (!supplier) {
       return createError(res, 404, "Supplier not found.");
     }
