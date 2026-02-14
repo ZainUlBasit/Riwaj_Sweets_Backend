@@ -158,6 +158,36 @@ app.get("/api/test", (req, res) => {
 // ===================================================
 const SupplierRoutes = require("../routes/supplier.routes");
 app.use("/api/supplier", SupplierRoutes);
+// // ===================================================
+// // Users Routes
+// // ===================================================
+// const UsersRoutes = require("../routes/users.routes");
+// app.use("/api/users", UsersRoutes);
+// ===================================================
+// Raw Material Routes
+// ===================================================
+const RawMaterialRoutes = require("../routes/raw-material.routes");
+app.use("/api/raw-material", RawMaterialRoutes);
+// ===================================================
+// Raw Material Stock Routes
+// ===================================================
+const RawMaterialStockRoutes = require("../routes/raw-material-stock.routes");
+app.use("/api/raw-material-stock", RawMaterialStockRoutes);
+// ===================================================
+// Category Routes
+// ===================================================
+const CategoryRoutes = require("../routes/category.routes");
+app.use("/api/category", CategoryRoutes);
+// ===================================================
+// Product Routes
+// ===================================================
+const ProductRoutes = require("../routes/product.routes");
+app.use("/api/product", ProductRoutes);
+// ===================================================
+// Product Stock Routes
+// ===================================================
+const ProductStockRoutes = require("../routes/product-stock.routes");
+app.use("/api/product-stock", ProductStockRoutes);
 //==============================================
 // Reports
 //==============================================

@@ -1,45 +1,30 @@
 const mongoose = require("mongoose");
 const {
-  requiredString,
-  NumberWithDefault,
+  requiredNumberWithDefault,
   requiredBooleanWithDefaultFalse,
 } = require("../utils/Types");
 
 const Schema = mongoose.Schema;
 
-// BOM entry: raw material + quantity required per unit of finished product
-const BomEntrySchema = new Schema(
+const ProductStockSchema = new Schema(
   {
-    rawMaterialId: {
+    product_id: {
       type: Schema.Types.ObjectId,
-      ref: "RawMaterial",
+      ref: "Product",
       required: true,
     },
-    quantity_required_per_unit: {
-      type: Number,
-      required: true,
-      min: 0,
-      default: 0,
+    desc: {
+      type: String,
+      default: "",
     },
-  },
-  { _id: false },
-);
-
-const ProductSchema = new Schema(
-  {
-    name: requiredString,
-    category_id: {
-      type: Schema.Types.ObjectId,
-      ref: "Category",
-      required: true,
-    },
-    price: NumberWithDefault,
-    bom_entries: [BomEntrySchema],
+    quantity: requiredNumberWithDefault,
+    price: requiredNumberWithDefault,
+    total_price: requiredNumberWithDefault,
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {
     timestamps: true,
-  },
+  }
 );
 
-module.exports = mongoose.model("Product", ProductSchema);
+module.exports = mongoose.model("ProductStock", ProductStockSchema);
