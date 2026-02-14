@@ -156,7 +156,7 @@ app.get("/api/test", (req, res) => {
 // ===================================================
 // Supplier Routes
 // ===================================================
-const SupplierRoutes = require(path.join(__dirname, "..", "routes", "supplier.routes"));
+const SupplierRoutes = require("../routes/supplier.routes");
 app.use("/api/supplier", SupplierRoutes);
 //==============================================
 // Reports
