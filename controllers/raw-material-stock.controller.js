@@ -14,11 +14,15 @@ const list = async (req, res) => {
     return successMessage(
       res,
       { items, deletedItems },
-      "Raw material stock entries fetched successfully."
+      "Raw material stock entries fetched successfully.",
     );
   } catch (err) {
     console.error("RawMaterialStock list error:", err);
-    return createError(res, 500, err.message || "Failed to fetch raw material stock.");
+    return createError(
+      res,
+      500,
+      err.message || "Failed to fetch raw material stock.",
+    );
   }
 };
 
@@ -27,11 +31,20 @@ const getOne = async (req, res) => {
     const item = await RawMaterialStock.findById(req.params.id)
       .populate("raw_material_id")
       .where({ isDeleted: false });
-    if (!item) return createError(res, 404, "Raw material stock entry not found.");
-    return successMessage(res, item, "Raw material stock fetched successfully.");
+    if (!item)
+      return createError(res, 404, "Raw material stock entry not found.");
+    return successMessage(
+      res,
+      item,
+      "Raw material stock fetched successfully.",
+    );
   } catch (err) {
     console.error("RawMaterialStock getOne error:", err);
-    return createError(res, 500, err.message || "Failed to fetch raw material stock.");
+    return createError(
+      res,
+      500,
+      err.message || "Failed to fetch raw material stock.",
+    );
   }
 };
 
@@ -61,15 +74,28 @@ const create = async (req, res) => {
       isDeleted: false,
     });
 
+    // Raw Material bhi increase karo
+    await RawMaterial.findByIdAndUpdate(raw_material_id, {
+      $inc: { in_quantity: qty, available_quantity: qty },
+    });
+
     // Us raw material ke supplier ka total_amount aur payable increase karo
     await Supplier.findByIdAndUpdate(rawMaterial.supplier_id, {
       $inc: { total_amount: totalPrice, payable: totalPrice },
     });
 
-    return successMessage(res, item, "Raw material stock entry created successfully.");
+    return successMessage(
+      res,
+      item,
+      "Raw material stock entry created successfully.",
+    );
   } catch (err) {
     console.error("RawMaterialStock create error:", err);
-    return createError(res, 500, err.message || "Failed to create raw material stock.");
+    return createError(
+      res,
+      500,
+      err.message || "Failed to create raw material stock.",
+    );
   }
 };
 
@@ -81,10 +107,13 @@ const update = async (req, res) => {
     const oldItem = await RawMaterialStock.findById(req.params.id).where({
       isDeleted: false,
     });
-    if (!oldItem) return createError(res, 404, "Raw material stock entry not found.");
+    if (!oldItem)
+      return createError(res, 404, "Raw material stock entry not found.");
 
     const oldTotalPrice = oldItem.total_price || 0;
-    const oldRawMaterial = await RawMaterial.findById(oldItem.raw_material_id).where({
+    const oldRawMaterial = await RawMaterial.findById(
+      oldItem.raw_material_id,
+    ).where({
       isDeleted: false,
     });
     if (oldRawMaterial) {
@@ -116,7 +145,7 @@ const update = async (req, res) => {
         total_price: newTotalPrice,
         isDeleted: false,
       },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
 
     // Naye supplier ka total_amount aur payable increase karo (jaise create mein)
@@ -124,10 +153,30 @@ const update = async (req, res) => {
       $inc: { total_amount: newTotalPrice, payable: newTotalPrice },
     });
 
-    return successMessage(res, item, "Raw material stock updated successfully.");
+    // Raw Material bhi increase karo
+    await RawMaterial.findByIdAndUpdate(newRawMaterialId, {
+      $inc: { in_quantity: qty, available_quantity: qty },
+    });
+    // Purani raw material bhi decrease karo
+    await RawMaterial.findByIdAndUpdate(oldItem.raw_material_id, {
+      $inc: {
+        in_quantity: -oldItem.quantity,
+        available_quantity: -oldItem.quantity,
+      },
+    });
+
+    return successMessage(
+      res,
+      item,
+      "Raw material stock updated successfully.",
+    );
   } catch (err) {
     console.error("RawMaterialStock update error:", err);
-    return createError(res, 500, err.message || "Failed to update raw material stock.");
+    return createError(
+      res,
+      500,
+      err.message || "Failed to update raw material stock.",
+    );
   }
 };
 
@@ -136,7 +185,8 @@ const remove = async (req, res) => {
     const item = await RawMaterialStock.findById(req.params.id).where({
       isDeleted: false,
     });
-    if (!item) return createError(res, 404, "Raw material stock entry not found.");
+    if (!item)
+      return createError(res, 404, "Raw material stock entry not found.");
 
     const totalPrice = item.total_price || 0;
     const rawMaterial = await RawMaterial.findById(item.raw_material_id).where({
@@ -148,12 +198,25 @@ const remove = async (req, res) => {
       });
     }
 
+    // Raw Material bhi decrease karo
+    await RawMaterial.findByIdAndUpdate(item.raw_material_id, {
+      $inc: { in_quantity: -item.quantity, available_quantity: -item.quantity },
+    });
+
     await RawMaterialStock.findByIdAndDelete(req.params.id);
 
-    return successMessage(res, item, "Raw material stock deleted successfully.");
+    return successMessage(
+      res,
+      item,
+      "Raw material stock deleted successfully.",
+    );
   } catch (err) {
     console.error("RawMaterialStock remove error:", err);
-    return createError(res, 500, err.message || "Failed to delete raw material stock.");
+    return createError(
+      res,
+      500,
+      err.message || "Failed to delete raw material stock.",
+    );
   }
 };
 
