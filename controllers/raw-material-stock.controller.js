@@ -133,10 +133,23 @@ const update = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
-    const item = await RawMaterialStock.findByIdAndDelete(req.params.id).where({
+    const item = await RawMaterialStock.findById(req.params.id).where({
       isDeleted: false,
     });
     if (!item) return createError(res, 404, "Raw material stock entry not found.");
+
+    const totalPrice = item.total_price || 0;
+    const rawMaterial = await RawMaterial.findById(item.raw_material_id).where({
+      isDeleted: false,
+    });
+    if (rawMaterial) {
+      await Supplier.findByIdAndUpdate(rawMaterial.supplier_id, {
+        $inc: { total_amount: -totalPrice, payable: -totalPrice },
+      });
+    }
+
+    await RawMaterialStock.findByIdAndDelete(req.params.id);
+
     return successMessage(res, item, "Raw material stock deleted successfully.");
   } catch (err) {
     console.error("RawMaterialStock remove error:", err);
