@@ -10,7 +10,7 @@ const Schema = mongoose.Schema;
 const RawMaterialStockSchema = new Schema(
   {
     raw_material_id: {
-      type: Schema.Types.ObjectId,
+      type: mongoose.Types.ObjectId,
       ref: "RawMaterial",
       required: true,
     },

@@ -29,7 +29,7 @@ const ProductSchema = new Schema(
   {
     name: requiredString,
     category_id: {
-      type: Schema.Types.ObjectId,
+      type: mongoose.Types.ObjectId,
       ref: "Category",
       required: true,
     },

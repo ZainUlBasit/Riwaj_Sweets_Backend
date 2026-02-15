@@ -9,7 +9,7 @@ const Schema = mongoose.Schema;
 const ProductStockSchema = new Schema(
   {
     product_id: {
-      type: Schema.Types.ObjectId,
+      type: mongoose.Types.ObjectId,
       ref: "Product",
       required: true,
     },
