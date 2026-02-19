@@ -13,11 +13,7 @@ global.rootDirectory = path.resolve(__dirname);
 
 // CORS configuration (explicitly add allowed origin for Vercel frontend)
 const allowedOrigins = [
-  "https://itsd-frontend.vercel.app",
-  "https://itsd-frontend-stg.vercel.app",
-  "https://itsd-f.vercel.app",
-  "http://localhost:3000",
-  "http://localhost:3001",
+  "https://www.riwajsweets.com",
   "http://localhost:5173",
   "http://localhost:5171",
   "http://localhost:5174",
