@@ -59,24 +59,16 @@ const create = async (req, res) => {
     }
     let cakeDesignImageUrl = null;
     try {
-      const uploadPromises = req.files.map((file) => {
-        return new Promise((resolve, reject) => {
-          const stream = cloudinary.uploader.upload_stream(
-            { folder: "cake-designs" },
-            (error, result) => {
-              if (error) {
-                reject(error);
-              } else {
-                resolve(result.secure_url);
-              }
-            },
-          );
-          stream.end(file.buffer);
-        });
+      cakeDesignImageUrl = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: "cake-designs" },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result.secure_url);
+          },
+        );
+        stream.end(req.file.buffer);
       });
-
-      const uploadedImages = await Promise.all(uploadPromises);
-      cakeDesignImageUrl = uploadedImages[0]; // Use first image if multiple uploaded
     } catch (uploadError) {
       console.error("Image upload failed:", uploadError);
       return createError(
@@ -105,39 +97,32 @@ const create = async (req, res) => {
 const update = async (req, res) => {
   try {
     const { title, description } = req.body;
-    let cakeDesignImageUrl = null;
-    try {
-      const uploadPromises = req.files.map((file) => {
-        return new Promise((resolve, reject) => {
+    const updatePayload = { isDeleted: false };
+    if (title !== undefined) updatePayload.title = title;
+    if (description !== undefined) updatePayload.description = description;
+
+    if (req.file) {
+      try {
+        const cakeDesignImageUrl = await new Promise((resolve, reject) => {
           const stream = cloudinary.uploader.upload_stream(
             { folder: "cake-designs" },
             (error, result) => {
-              if (error) {
-                reject(error);
-              } else {
-                resolve(result.secure_url);
-              }
+              if (error) reject(error);
+              else resolve(result.secure_url);
             },
           );
-          stream.end(file.buffer);
+          stream.end(req.file.buffer);
         });
-      });
-
-      const uploadedImages = await Promise.all(uploadPromises);
-      cakeDesignImageUrl = uploadedImages[0]; // Use first image if multiple uploaded
-    } catch (uploadError) {
-      console.error("Image upload failed:", uploadError);
-      return createError(
-        res,
-        500,
-        "Failed to upload cake design image: " + uploadError.message,
-      );
+        updatePayload.image = cakeDesignImageUrl;
+      } catch (uploadError) {
+        console.error("Image upload failed:", uploadError);
+        return createError(
+          res,
+          500,
+          "Failed to upload cake design image: " + uploadError.message,
+        );
+      }
     }
-    const updatePayload = { isDeleted: false };
-    if (title !== undefined) updatePayload.title = title;
-    if (cakeDesignImageUrl !== undefined)
-      updatePayload.image = cakeDesignImageUrl;
-    if (description !== undefined) updatePayload.description = description;
 
     const item = await CakeDesign.findOneAndUpdate(
       { _id: req.params.id, isDeleted: false },
