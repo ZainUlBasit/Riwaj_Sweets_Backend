@@ -175,6 +175,11 @@ app.use("/api/raw-material-stock", RawMaterialStockRoutes);
 const CategoryRoutes = require("../routes/category.routes");
 app.use("/api/category", CategoryRoutes);
 // ===================================================
+// Counter Routes
+// ===================================================
+const CounterRoutes = require("../routes/counter.routes");
+app.use("/api/counter", CounterRoutes);
+// ===================================================
 // Product Routes
 // ===================================================
 const ProductRoutes = require("../routes/product.routes");

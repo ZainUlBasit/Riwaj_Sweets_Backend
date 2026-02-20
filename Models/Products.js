@@ -43,6 +43,11 @@ const ProductSchema = new Schema(
     in_quantity: requiredNumberWithDefault,
     out_quantity: requiredNumberWithDefault,
     available_quantity: requiredNumberWithDefault,
+    counter_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "Counter",
+      required: false,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {

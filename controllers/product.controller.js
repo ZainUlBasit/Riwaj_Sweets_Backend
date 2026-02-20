@@ -5,9 +5,11 @@ const list = async (req, res) => {
   try {
     const products = await Product.find({ isDeleted: false })
       .populate("category_id")
+      .populate("counter_id")
       .sort({ createdAt: -1 });
     const deletedProducts = await Product.find({ isDeleted: true })
       .populate("category_id")
+      .populate("counter_id")
       .sort({ createdAt: -1 });
     return successMessage(
       res,
@@ -24,6 +26,7 @@ const getOne = async (req, res) => {
   try {
     const product = await Product.findById(req.params.id)
       .populate("category_id")
+      .populate("counter_id")
       .where({ isDeleted: false });
     if (!product) return createError(res, 404, "Product not found.");
     return successMessage(res, product, "Product fetched successfully.");
@@ -35,11 +38,11 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, category_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
+    const { name, category_id, price, unit, in_quantity, out_quantity, available_quantity, counter_id } = req.body;
     if (!name || !category_id || !unit) {
       return createError(res, 400, "Name, category_id and unit are required.");
     }
-    const product = await Product.create({
+    const payload = {
       name,
       category_id,
       price: price ?? 0,
@@ -48,7 +51,11 @@ const create = async (req, res) => {
       out_quantity: out_quantity ?? 0,
       available_quantity: available_quantity ?? 0,
       isDeleted: false,
-    });
+    };
+    if (counter_id !== undefined && counter_id !== null && counter_id !== "") {
+      payload.counter_id = counter_id;
+    }
+    const product = await Product.create(payload);
     return successMessage(res, product, "Product created successfully.");
   } catch (err) {
     console.error("Product create error:", err);
@@ -58,10 +65,23 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, category_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
+    const { name, category_id, price, unit, in_quantity, out_quantity, available_quantity, counter_id } = req.body;
+    const updatePayload = {
+      name,
+      category_id,
+      price,
+      unit,
+      in_quantity,
+      out_quantity,
+      available_quantity,
+      isDeleted: false,
+    };
+    if (counter_id !== undefined) {
+      updatePayload.counter_id = counter_id || null;
+    }
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      { name, category_id, price, unit, in_quantity, out_quantity, available_quantity, isDeleted: false },
+      updatePayload,
       { new: true, runValidators: true },
     );
     if (!product) return createError(res, 404, "Product not found.");
