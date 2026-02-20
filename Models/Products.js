@@ -33,6 +33,11 @@ const ProductSchema = new Schema(
       ref: "Category",
       required: true,
     },
+    unit: {
+      type: Number,
+      enum: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+      required: true,
+    }, // 1:kg, 2:bag, 3:piece, 4:liter, 5:ounce, 6:pound, 7:gallon, 8:quart, 9:pint, 10:cup
     price: NumberWithDefault,
     isDeleted: requiredBooleanWithDefaultFalse,
   },

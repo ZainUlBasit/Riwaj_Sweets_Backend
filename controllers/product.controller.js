@@ -12,7 +12,7 @@ const list = async (req, res) => {
     return successMessage(
       res,
       { products, deletedProducts },
-      "Products fetched successfully."
+      "Products fetched successfully.",
     );
   } catch (err) {
     console.error("Product list error:", err);
@@ -35,14 +35,15 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, category_id, price } = req.body;
-    if (!name || !category_id) {
-      return createError(res, 400, "Name and category_id are required.");
+    const { name, category_id, price, unit } = req.body;
+    if (!name || !category_id || !unit) {
+      return createError(res, 400, "Name, category_id and unit are required.");
     }
     const product = await Product.create({
       name,
       category_id,
       price: price ?? 0,
+      unit,
       isDeleted: false,
     });
     return successMessage(res, product, "Product created successfully.");
@@ -54,11 +55,11 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, category_id, price } = req.body;
+    const { name, category_id, price, unit } = req.body;
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      { name, category_id, price, isDeleted: false },
-      { new: true, runValidators: true }
+      { name, category_id, price, unit, isDeleted: false },
+      { new: true, runValidators: true },
     );
     if (!product) return createError(res, 404, "Product not found.");
     return successMessage(res, product, "Product updated successfully.");
