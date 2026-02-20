@@ -1,5 +1,6 @@
 const ProductStock = require("../Models/ProductStock");
-const RawMaterialStock = require("../Models/RawMaterialStock");
+const Product = require("../Models/Products");
+const RawMaterial = require("../Models/RawMaterial");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 
 const list = async (req, res) => {
@@ -43,21 +44,34 @@ const create = async (req, res) => {
     if (!product_id) {
       return createError(res, 400, "product_id is required.");
     }
+    const qty = quantity ?? 0;
+    const product = await Product.findById(product_id).where({ isDeleted: false });
+    if (!product) return createError(res, 404, "Product not found.");
+
     const item = await ProductStock.create({
       product_id,
       desc: desc ?? "",
-      quantity: quantity ?? 0,
+      quantity: qty,
       price: price ?? 0,
-      total_price: total_price ?? 0,
+      total_price: total_price ?? qty * (price ?? 0),
       raw_materials_used: Array.isArray(raw_materials_used) ? raw_materials_used : [],
       isDeleted: false,
     });
 
-    // Us product stock entry par kaun kaun se raw materials kitni quantity use hue
-    for (const rawMaterial of raw_materials_used) {
-      await RawMaterialStock.findByIdAndUpdate(rawMaterial.raw_material_id, {
-        $inc: { quantity: -rawMaterial.quantity_used },
-      });
+    // Product ki in_quantity aur available_quantity increase (jaise raw-material-stock se RawMaterial)
+    await Product.findByIdAndUpdate(product_id, {
+      $inc: { in_quantity: qty, available_quantity: qty },
+    });
+
+    // Raw materials use hue to unki out_quantity / available_quantity adjust
+    if (Array.isArray(raw_materials_used)) {
+      for (const rm of raw_materials_used) {
+        if (rm.raw_material_id && rm.quantity_used != null) {
+          await RawMaterial.findByIdAndUpdate(rm.raw_material_id, {
+            $inc: { out_quantity: rm.quantity_used, available_quantity: -rm.quantity_used },
+          });
+        }
+      }
     }
 
     return successMessage(res, item, "Product stock entry created successfully.");
@@ -70,39 +84,41 @@ const create = async (req, res) => {
 const update = async (req, res) => {
   try {
     const { product_id, desc, quantity, price, total_price, raw_materials_used } = req.body;
-    const updatePayload = {
-      product_id,
-      desc,
-      quantity,
-      price,
-      total_price,
-      isDeleted: false,
-    };
     const oldItem = await ProductStock.findById(req.params.id).where({
       isDeleted: false,
     });
     if (!oldItem) return createError(res, 404, "Product stock entry not found.");
+
+    const oldQty = oldItem.quantity ?? 0;
+    const newQty = quantity ?? oldItem.quantity ?? 0;
+    const newProductId = product_id ?? oldItem.product_id;
+
+    // Purane product se in_quantity aur available_quantity decrement
+    await Product.findByIdAndUpdate(oldItem.product_id, {
+      $inc: { in_quantity: -oldQty, available_quantity: -oldQty },
+    });
+
+    const updatePayload = {
+      product_id: newProductId,
+      desc: desc !== undefined ? desc : oldItem.desc,
+      quantity: newQty,
+      price: price !== undefined ? price : oldItem.price,
+      total_price: total_price !== undefined ? total_price : newQty * (price ?? oldItem.price ?? 0),
+      isDeleted: false,
+    };
     if (Array.isArray(raw_materials_used)) updatePayload.raw_materials_used = raw_materials_used;
+
     const item = await ProductStock.findByIdAndUpdate(
       req.params.id,
       updatePayload,
       { new: true, runValidators: true }
     );
 
-    // Us product stock entry par kaun kaun se raw materials kitni quantity use hue
-    for (const rawMaterial of raw_materials_used) {
-      await RawMaterialStock.findByIdAndUpdate(rawMaterial.raw_material_id, {
-        $inc: { quantity: -rawMaterial.quantity_used },
-      });
-    }
-    // Purani raw materials used entry delete karo
-    for (const rawMaterial of oldItem?.raw_materials_used ?? []) {
-      await RawMaterialStock.findByIdAndUpdate(oldItem.raw_material_id, {
-        $inc: { quantity: oldItem.quantity_used },
-      });
-    }
+    // Naye product par in_quantity aur available_quantity increment
+    await Product.findByIdAndUpdate(newProductId, {
+      $inc: { in_quantity: newQty, available_quantity: newQty },
+    });
 
-    if (!item) return createError(res, 404, "Product stock entry not found.");
     return successMessage(res, item, "Product stock updated successfully.");
   } catch (err) {
     console.error("ProductStock update error:", err);
@@ -112,16 +128,18 @@ const update = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
-    const item = await ProductStock.findByIdAndDelete(req.params.id).where({
+    const item = await ProductStock.findById(req.params.id).where({
       isDeleted: false,
     });
     if (!item) return createError(res, 404, "Product stock entry not found.");
-    // Purani raw materials used entry delete karo
-    for (const rawMaterial of item?.raw_materials_used ?? []) {
-      await RawMaterialStock.findByIdAndUpdate(rawMaterial.raw_material_id, {
-        $inc: { quantity: rawMaterial.quantity_used },
-      });
-    }
+
+    const qty = item.quantity ?? 0;
+    // Product se in_quantity aur available_quantity decrement
+    await Product.findByIdAndUpdate(item.product_id, {
+      $inc: { in_quantity: -qty, available_quantity: -qty },
+    });
+
+    await ProductStock.findByIdAndDelete(req.params.id);
     return successMessage(res, item, "Product stock deleted successfully.");
   } catch (err) {
     console.error("ProductStock remove error:", err);

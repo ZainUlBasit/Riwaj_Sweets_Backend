@@ -35,7 +35,7 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, category_id, price, unit } = req.body;
+    const { name, category_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
     if (!name || !category_id || !unit) {
       return createError(res, 400, "Name, category_id and unit are required.");
     }
@@ -44,6 +44,9 @@ const create = async (req, res) => {
       category_id,
       price: price ?? 0,
       unit,
+      in_quantity: in_quantity ?? 0,
+      out_quantity: out_quantity ?? 0,
+      available_quantity: available_quantity ?? 0,
       isDeleted: false,
     });
     return successMessage(res, product, "Product created successfully.");
@@ -55,10 +58,10 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, category_id, price, unit } = req.body;
+    const { name, category_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      { name, category_id, price, unit, isDeleted: false },
+      { name, category_id, price, unit, in_quantity, out_quantity, available_quantity, isDeleted: false },
       { new: true, runValidators: true },
     );
     if (!product) return createError(res, 404, "Product not found.");

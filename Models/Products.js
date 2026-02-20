@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const {
   requiredString,
   NumberWithDefault,
+  requiredNumberWithDefault,
   requiredBooleanWithDefaultFalse,
 } = require("../utils/Types");
 
@@ -39,6 +40,9 @@ const ProductSchema = new Schema(
       required: true,
     }, // 1:kg, 2:bag, 3:piece, 4:liter, 5:ounce, 6:pound, 7:gallon, 8:quart, 9:pint, 10:cup
     price: NumberWithDefault,
+    in_quantity: requiredNumberWithDefault,
+    out_quantity: requiredNumberWithDefault,
+    available_quantity: requiredNumberWithDefault,
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {
