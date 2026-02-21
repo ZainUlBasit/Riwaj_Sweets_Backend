@@ -1,9 +1,11 @@
 const mongoose = require("mongoose");
+const AutoIncrement = require("mongoose-sequence")(mongoose);
 const {
   requiredString,
   NumberWithDefault,
   requiredNumberWithDefault,
   requiredBooleanWithDefaultFalse,
+  requiredNumber,
 } = require("../utils/Types");
 
 const Schema = mongoose.Schema;
@@ -28,6 +30,7 @@ const BomEntrySchema = new Schema(
 
 const ProductSchema = new Schema(
   {
+    id: requiredNumber,
     name: requiredString,
     category_id: {
       type: mongoose.Types.ObjectId,
@@ -54,5 +57,11 @@ const ProductSchema = new Schema(
     timestamps: true,
   },
 );
+
+ProductSchema.plugin(AutoIncrement, {
+  id: "product_id_seq",
+  inc_field: "id",
+  start_seq: 1,
+});
 
 module.exports = mongoose.model("Product", ProductSchema);

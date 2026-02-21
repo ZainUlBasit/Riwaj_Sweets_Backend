@@ -87,11 +87,6 @@ function authControllers() {
         maxAge: 1000 * 60 * 60, // 1 hour
       });
 
-      new RefreshModel({
-        userId: user._id,
-        token: refreshToken,
-      }).save();
-
       delete user.password;
 
       // Return user data (remove undefined populatedUser reference)
