@@ -185,6 +185,11 @@ app.use("/api/counter", CounterRoutes);
 const CakeDesignRoutes = require("../routes/cake-design.routes");
 app.use("/api/cake-design", CakeDesignRoutes);
 // ===================================================
+// Cake Order Routes
+// ===================================================
+const CakeOrderRoutes = require("../routes/cake-order.routes");
+app.use("/api/cake-order", CakeOrderRoutes);
+// ===================================================
 // Product Routes
 // ===================================================
 const ProductRoutes = require("../routes/product.routes");
