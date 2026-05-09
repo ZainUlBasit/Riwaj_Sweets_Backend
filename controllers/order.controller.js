@@ -36,54 +36,77 @@ const paymentFlagFromStatus = (status) => {
   return "unpaid";
 };
 
+const isLegacyJsonBarcode = (val) => {
+  if (typeof val !== "string") return false;
+  const s = val.trim();
+  if (!s.startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(s);
+    return !!parsed?.order_id;
+  } catch (_err) {
+    return false;
+  }
+};
+
 /**
- * Self-healing helper: ensures every Order in the given list has a short
- * `barcode_lookup`. Older rows may only have the long JSON `barcode`, which
- * is unsuitable for tables and CODE128 print-outs.
+ * Self-healing helper:
+ *
+ *   1. Every Order must carry a short, printable `barcode_lookup`
+ *      (e.g. `RW-12-A8B3`). Backfills it for older rows that don't have one.
+ *   2. The visible `barcode` field must mirror that short code. Older rows
+ *      were briefly storing a long JSON payload as `barcode` — we replace
+ *      those with the short code so consumers (OrderDetail visual barcode,
+ *      thermal print, table cells, scanner display) never see bakwas JSON.
+ *
+ * Lookup-by-JSON still works because `parseBarcode()` decodes legacy JSON
+ * scans into an `order_id`, and we resolve via `_id`.
  */
 const ensureBarcodeLookups = async (orders) => {
   if (!Array.isArray(orders) || orders.length === 0) return orders;
-  const missing = orders.filter((o) => !o.barcode_lookup);
-  if (missing.length === 0) return orders;
-  for (const order of missing) {
-    let lookup = `RW-${order.order_number || ""}`.toUpperCase();
-    if (!order.order_number) lookup = generateBarcodeLookup();
-    let exists = await Order.findOne({
-      _id: { $ne: order._id },
-      barcode_lookup: lookup,
-    }).select("_id");
-    let attempt = 0;
-    while (exists && attempt < 5) {
-      lookup = generateBarcodeLookup();
-      exists = await Order.findOne({ barcode_lookup: lookup }).select("_id");
-      attempt += 1;
+  for (const order of orders) {
+    let needsLookup = !order.barcode_lookup;
+    let needsBarcodeRewrite =
+      isLegacyJsonBarcode(order.barcode) ||
+      (order.barcode_lookup && order.barcode !== order.barcode_lookup);
+
+    if (needsLookup) {
+      let lookup = `RW-${order.order_number || ""}`.toUpperCase();
+      if (!order.order_number) lookup = generateBarcodeLookup();
+      let exists = await Order.findOne({
+        _id: { $ne: order._id },
+        barcode_lookup: lookup,
+      }).select("_id");
+      let attempt = 0;
+      while (exists && attempt < 5) {
+        lookup = generateBarcodeLookup();
+        exists = await Order.findOne({ barcode_lookup: lookup }).select(
+          "_id",
+        );
+        attempt += 1;
+      }
+      order.barcode_lookup = lookup;
+      needsBarcodeRewrite = true;
     }
-    order.barcode_lookup = lookup;
-    await Order.updateOne({ _id: order._id }, { barcode_lookup: lookup });
+
+    if (needsBarcodeRewrite) {
+      const clean = order.barcode_lookup;
+      order.barcode = clean;
+      await Order.updateOne(
+        { _id: order._id },
+        { barcode: clean, barcode_lookup: clean },
+      );
+    }
   }
   return orders;
 };
-
-const buildBarcodePayload = (order) =>
-  JSON.stringify({
-    t: "RW_ORDER",
-    order_id: String(order._id),
-    order_number: order.order_number,
-    customer: order.customer_info || {},
-    items: (order.items || []).map((item) => ({
-      itemId: String(item.product_id),
-      item_name: item.name,
-      qty: item.quantity,
-      price: item.unit_price,
-      amount: item.total_price,
-    })),
-  });
 
 const parseBarcode = (code) => {
   const raw = String(code || "").trim();
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw);
+    // Legacy JSON-encoded barcodes still resolve via order_id for back-compat
+    // with anything already printed on physical receipts.
     if (parsed?.order_id) return { orderId: parsed.order_id, raw };
   } catch (_err) {
     // Not JSON: treat as lookup code.
@@ -283,8 +306,9 @@ const create = async (req, res) => {
 
     const barcodeLookup = generateBarcodeLookup();
     const order = await Order.create({
-      // Temporarily use lookup; once Mongo assigns _id/order_number we replace
-      // this with the full item-wrapped barcode payload.
+      // `barcode` and `barcode_lookup` are kept in sync — both store the
+      // short, printable code (e.g. RW-12-A8B3). The cash counter scans this
+      // code; the server then re-fetches the full order on the wire.
       barcode: barcodeLookup,
       barcode_lookup: barcodeLookup,
       items: resolved,
@@ -305,8 +329,9 @@ const create = async (req, res) => {
       isDeleted: false,
     });
 
-    order.barcode = buildBarcodePayload(order);
-    await order.save();
+    // `barcode` mirrors the short `barcode_lookup` so visual CODE128 prints,
+    // table cells and scanner readouts stay readable. Resolution by long JSON
+    // is still supported in `parseBarcode()` for legacy printed receipts.
 
     const populated = await populate(Order.findById(order._id));
     return successMessage(

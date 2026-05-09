@@ -35,6 +35,9 @@ const ProductSchema = new Schema(
     // would fail before the plugin can populate it.
     id: { type: Number, default: 0 },
     name: requiredString,
+    // Cloudinary `secure_url` of the product image. Optional — products can
+    // exist without artwork (e.g. legacy items or quick raw entries).
+    image: { type: String, default: null },
     category_id: {
       type: mongoose.Types.ObjectId,
       ref: "Category",

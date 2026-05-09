@@ -22,6 +22,42 @@ async function loadCounter(id) {
   return Counter.findById(id).where({ isDeleted: false });
 }
 
+const isLegacyJsonBarcode = (val) => {
+  if (typeof val !== "string") return false;
+  const s = val.trim();
+  if (!s.startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(s);
+    return !!parsed?.order_id;
+  } catch (_err) {
+    return false;
+  }
+};
+
+/**
+ * Self-heals legacy SaleInvoice rows whose `barcode` field still contains the
+ * old JSON payload. Replaces it with the parent Order's short `barcode_lookup`
+ * so thermal print previews never show bakwas JSON.
+ */
+const ensureCleanBarcode = async (invoices) => {
+  const list = Array.isArray(invoices) ? invoices : invoices ? [invoices] : [];
+  for (const inv of list) {
+    if (!inv) continue;
+    if (!isLegacyJsonBarcode(inv.barcode)) continue;
+    const orderRef = inv.order_id;
+    let lookup = null;
+    if (orderRef && typeof orderRef === "object") {
+      lookup = orderRef.barcode_lookup || null;
+    }
+    if (!lookup) {
+      lookup = `RW-${inv.order_number || ""}`.toUpperCase();
+    }
+    inv.barcode = lookup;
+    await SaleInvoice.updateOne({ _id: inv._id }, { barcode: lookup });
+  }
+  return invoices;
+};
+
 /**
  * Creates or returns the SaleInvoice for a delivered Order.
  *
@@ -101,6 +137,8 @@ const list = async (req, res) => {
         createdAt: -1,
       }),
     );
+    await ensureCleanBarcode(items);
+    await ensureCleanBarcode(deletedItems);
     return successMessage(
       res,
       { items, deletedItems },
@@ -118,6 +156,7 @@ const getOne = async (req, res) => {
       SaleInvoice.findById(req.params.id).where({ isDeleted: false }),
     );
     if (!item) return createError(res, 404, "Sale invoice not found.");
+    await ensureCleanBarcode(item);
     return successMessage(res, item, "Sale invoice fetched successfully.");
   } catch (err) {
     console.error("SaleInvoice getOne error:", err);
@@ -142,6 +181,7 @@ const getByOrder = async (req, res) => {
 
     const invoice = await createFromOrder(order);
     const populated = await populateRefs(SaleInvoice.findById(invoice._id));
+    await ensureCleanBarcode(populated);
     return successMessage(
       res,
       populated,
@@ -161,6 +201,7 @@ const getByBarcode = async (req, res) => {
       SaleInvoice.findOne({ barcode: code, isDeleted: false }),
     );
     if (!item) return createError(res, 404, "Sale invoice not found.");
+    await ensureCleanBarcode(item);
     return successMessage(res, item, "Sale invoice fetched successfully.");
   } catch (err) {
     console.error("SaleInvoice getByBarcode error:", err);
