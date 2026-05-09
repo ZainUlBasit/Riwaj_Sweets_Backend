@@ -11,9 +11,12 @@ const cors = require("cors");
 
 global.rootDirectory = path.resolve(__dirname);
 
-// CORS configuration (explicitly add allowed origin for Vercel frontend)
-const allowedOrigins = [
+// CORS allowlist (env-driven, with sensible defaults for prod + local dev).
+// Configure by setting CORS_ORIGINS to a comma-separated list, e.g.
+//   CORS_ORIGINS="https://www.riwajsweets.com,https://staging.riwajsweets.com"
+const DEFAULT_ALLOWED_ORIGINS = [
   "https://www.riwajsweets.com",
+  "http://localhost:3000",
   "http://localhost:5173",
   "http://localhost:5171",
   "http://localhost:5174",
@@ -27,6 +30,17 @@ const allowedOrigins = [
   "http://127.0.0.1:5176",
   "http://127.0.0.1:5179",
 ];
+
+const envOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = envOrigins.length > 0 ? envOrigins : DEFAULT_ALLOWED_ORIGINS;
+
+const isLocalhostOrigin = (origin) =>
+  /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+
 const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps, curl, Postman)
@@ -36,11 +50,8 @@ const corsOptions = {
       return callback(null, true);
     }
 
-    // In development, be more permissive
-    if (
-      process.env.NODE_ENV !== "production" &&
-      origin.match(/^https?:\/\/localhost(:\d+)?$/)
-    ) {
+    // In development, be more permissive for any localhost/127.0.0.1 origin
+    if (process.env.NODE_ENV !== "production" && isLocalhostOrigin(origin)) {
       return callback(null, true);
     }
 
@@ -57,6 +68,8 @@ const corsOptions = {
     "token",
     "accesstoken",
     "refreshtoken",
+    "counter-token",
+    "countertoken",
   ],
   optionsSuccessStatus: 200, // Some legacy browsers choke on 204
 };
@@ -145,6 +158,28 @@ app.get("/api/test", (req, res) => {
 });
 
 // ===================================================
+// Vercel Cron stub
+// ===================================================
+// `vercel.json` schedules this endpoint weekly. The original implementation
+// in Services/cronJobs.js depends on a Customer model that does not exist
+// in this repo — returning a documented no-op keeps the cron green and
+// surfaces a clear status payload for monitoring.
+app.get("/api/cron/reset-call-status-weekly", (req, res) => {
+  res.status(200).json({
+    success: true,
+    data: {
+      payload: {
+        ran: false,
+        reason: "Customer model not enabled in this environment.",
+      },
+      msg: "Cron endpoint reachable (no-op).",
+    },
+    meta: null,
+    errors: null,
+  });
+});
+
+// ===================================================
 // Auth Routes
 // ===================================================
 const AuthRoutes = require("../routes/auth.routes");
@@ -199,6 +234,36 @@ app.use("/api/product", ProductRoutes);
 // ===================================================
 const ProductStockRoutes = require("../routes/product-stock.routes");
 app.use("/api/product-stock", ProductStockRoutes);
+// ===================================================
+// Cake Production Routes
+// ===================================================
+const CakeProductionRoutes = require("../routes/cake-production.routes");
+app.use("/api/cake-production", CakeProductionRoutes);
+// ===================================================
+// Raw Material Dispatch Routes
+// ===================================================
+const RawMaterialDispatchRoutes = require("../routes/raw-material-dispatch.routes");
+app.use("/api/raw-material-dispatch", RawMaterialDispatchRoutes);
+// ===================================================
+// Dispatch Location Routes
+// ===================================================
+const DispatchLocationRoutes = require("../routes/dispatch-location.routes");
+app.use("/api/dispatch-location", DispatchLocationRoutes);
+// ===================================================
+// Production Dashboard Routes
+// ===================================================
+const ProductionDashboardRoutes = require("../routes/production-dashboard.routes");
+app.use("/api/production-dashboard", ProductionDashboardRoutes);
+// ===================================================
+// Order Routes
+// ===================================================
+const OrderRoutes = require("../routes/order.routes");
+app.use("/api/order", OrderRoutes);
+// ===================================================
+// Sale Invoice Routes
+// ===================================================
+const SaleInvoiceRoutes = require("../routes/sale-invoice.routes");
+app.use("/api/sale-invoice", SaleInvoiceRoutes);
 //==============================================
 // Reports
 //==============================================
@@ -210,12 +275,59 @@ app.use("/api/product-stock", ProductStockRoutes);
 // Remove the previous catch-all CORS and custom error CORS middlewares
 // They are no longer needed since headers are handled above
 
-// Fallback error handler (does not interfere with CORS)
+// Fallback error handler — maps common library errors to consistent codes
+// while preserving the legacy `{ success, error: { status, msg } }` shape
+// expected by the frontend axios layer. Field-level details (when available)
+// are surfaced under `errors`.
 app.use((err, req, res, next) => {
-  const status = err.status || 500;
+  let status = err.status || err.statusCode || 500;
+  let message = err.message || "Internal Server Error";
+  let errors = null;
+
+  // Joi validation errors (when validate() is bypassed and Joi is invoked manually)
+  if (err.isJoi || err.name === "ValidationError" && Array.isArray(err.details)) {
+    status = 422;
+    message = "Validation failed";
+    errors = err.details.map((d) => ({
+      field: Array.isArray(d.path) ? d.path.join(".") : String(d.path || ""),
+      message: d.message,
+    }));
+  }
+  // Mongoose validation errors
+  else if (err.name === "ValidationError" && err.errors) {
+    status = 422;
+    message = "Validation failed";
+    errors = Object.keys(err.errors).map((field) => ({
+      field,
+      message: err.errors[field]?.message || "Invalid value",
+    }));
+  }
+  // Mongoose cast errors (e.g. invalid ObjectId)
+  else if (err.name === "CastError") {
+    status = 400;
+    message = `Invalid ${err.path || "value"}`;
+  }
+  // JWT auth errors
+  else if (err.name === "JsonWebTokenError") {
+    status = 401;
+    message = "Invalid token.";
+  } else if (err.name === "TokenExpiredError") {
+    status = 401;
+    message = "Token has expired. Please log in again.";
+  }
+  // Mongo duplicate key
+  else if (err.code === 11000) {
+    status = 409;
+    const field = Object.keys(err.keyValue || {})[0];
+    message = field
+      ? `Duplicate value for "${field}".`
+      : "Duplicate value.";
+  }
+
   res.status(status).json({
     success: false,
-    error: { status, msg: err.message || "Internal Server Error" },
+    error: { status, msg: message },
+    errors,
   });
 });
 

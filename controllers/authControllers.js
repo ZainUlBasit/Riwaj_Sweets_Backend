@@ -481,81 +481,14 @@ function authControllers() {
     },
 
     employeeLogin: async (req, res) => {
-      // Validate the request
-      const employeeLoginSchema = Joi.object({
-        name: Joi.string().required(),
-        contact: Joi.string().required(),
-      });
-
-      const { error } = employeeLoginSchema.validate(req.body);
-      if (error) return createError(res, 422, error.details[0].message);
-
-      const { name, contact } = req.body;
-
-      // Find employee by name and contact (mobile number)
-      const Employee = require("../Models/Employee");
-      const employee = await Employee.findOne({
-        name: name.trim(),
-        contact: contact.trim(),
-        isDeleted: false,
-      });
-
-      if (!employee) {
-        return createError(
-          res,
-          422,
-          "Invalid credentials! Employee not found."
-        );
-      }
-
-      // Generate JWT tokens for employee
-      const jwtBody = {
-        _id: employee._id,
-        role: "employee", // Special role for employees
-        type: "employee",
-      };
-
-      const { accessToken, refreshToken } = JwtService.generateToken(jwtBody);
-
-      // Store refresh token
-      await JwtService.storeRefreshToken(refreshToken, employee._id);
-
-      // Set cookies
-      const cookieOptions = {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
-      };
-
-      res.cookie("accesstoken", accessToken, {
-        ...cookieOptions,
-        maxAge: 1000 * 60 * 60, // 1 hour
-      });
-
-      res.cookie("refreshtoken", refreshToken, {
-        ...cookieOptions,
-        maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
-      });
-
-      // Return employee data without sensitive information
-      const employeeData = {
-        _id: employee._id,
-        name: employee.name,
-        contact: employee.contact,
-        address: employee.address,
-        salary: employee.salary,
-        start_date: employee.start_date,
-        role: "employee",
-      };
-
-      return successMessage(
+      // The Employee model is not enabled in this environment.
+      // The original handler `require("../Models/Employee")` would crash on
+      // resolution at runtime. Quarantining behind a 501 keeps the route safe
+      // until the Employee module is re-introduced.
+      return createError(
         res,
-        {
-          user: employeeData,
-          accessToken,
-          refreshToken,
-        },
-        "Employee logged in successfully"
+        501,
+        "Employee module not enabled in this environment."
       );
     },
   };

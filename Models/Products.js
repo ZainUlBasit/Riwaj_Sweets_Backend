@@ -5,7 +5,6 @@ const {
   NumberWithDefault,
   requiredNumberWithDefault,
   requiredBooleanWithDefaultFalse,
-  requiredNumber,
 } = require("../utils/Types");
 
 const Schema = mongoose.Schema;
@@ -30,7 +29,11 @@ const BomEntrySchema = new Schema(
 
 const ProductSchema = new Schema(
   {
-    id: requiredNumber,
+    // Auto-increment human-friendly id assigned by mongoose-sequence below.
+    // Must NOT be `required: true` because the plugin's pre('save') hook
+    // runs after schema validation in newer Mongoose, so a required check
+    // would fail before the plugin can populate it.
+    id: { type: Number, default: 0 },
     name: requiredString,
     category_id: {
       type: mongoose.Types.ObjectId,

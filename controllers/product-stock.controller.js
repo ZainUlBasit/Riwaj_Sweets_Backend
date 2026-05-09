@@ -139,8 +139,15 @@ const remove = async (req, res) => {
       $inc: { in_quantity: -qty, available_quantity: -qty },
     });
 
-    await ProductStock.findByIdAndDelete(req.params.id);
-    return successMessage(res, item, "Product stock deleted successfully.");
+    // Soft-delete the stock entry. The active-doc filter above guarantees
+    // the inventory reversal runs at most once per entry.
+    const deleted = await ProductStock.findOneAndUpdate(
+      { _id: req.params.id, isDeleted: false },
+      { isDeleted: true },
+      { new: true }
+    );
+
+    return successMessage(res, deleted || item, "Product stock deleted successfully.");
   } catch (err) {
     console.error("ProductStock remove error:", err);
     return createError(res, 500, err.message || "Failed to delete product stock.");

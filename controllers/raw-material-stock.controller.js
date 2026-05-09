@@ -203,11 +203,17 @@ const remove = async (req, res) => {
       $inc: { in_quantity: -item.quantity, available_quantity: -item.quantity },
     });
 
-    await RawMaterialStock.findByIdAndDelete(req.params.id);
+    // Soft-delete the stock entry. The active-doc filter above guarantees
+    // the inventory reversal runs at most once per entry.
+    const deleted = await RawMaterialStock.findOneAndUpdate(
+      { _id: req.params.id, isDeleted: false },
+      { isDeleted: true },
+      { new: true }
+    );
 
     return successMessage(
       res,
-      item,
+      deleted || item,
       "Raw material stock deleted successfully.",
     );
   } catch (err) {
@@ -220,4 +226,133 @@ const remove = async (req, res) => {
   }
 };
 
-module.exports = { list, getOne, create, update, remove };
+/**
+ * POST /api/raw-material-stock/production
+ *
+ * Allocates raw material to production. Creates a stock entry with
+ * `purpose: 2` (production), decrements `available_quantity` and increments
+ * `out_quantity` on the parent RawMaterial. Does NOT touch supplier ledgers
+ * (production allocation is not a new purchase).
+ *
+ * The existing `POST /` flow remains the canonical purchase path and is
+ * untouched, so this is purely additive.
+ *
+ * Body: { raw_material_id, quantity, desc?, price?, total_price? }
+ */
+const createProduction = async (req, res) => {
+  try {
+    const { raw_material_id, desc, quantity, price, total_price } = req.body;
+    if (!raw_material_id) {
+      return createError(res, 400, "raw_material_id is required.");
+    }
+    const qty = Number(quantity ?? 0);
+    if (!qty || qty <= 0) {
+      return createError(res, 400, "quantity must be greater than 0.");
+    }
+    const prc = Number(price ?? 0);
+    const totalPrice = total_price != null ? Number(total_price) : qty * prc;
+
+    const rawMaterial = await RawMaterial.findById(raw_material_id).where({
+      isDeleted: false,
+    });
+    if (!rawMaterial) {
+      return createError(res, 404, "Raw material not found.");
+    }
+    const available = Number(rawMaterial.available_quantity || 0);
+    if (qty > available) {
+      return createError(
+        res,
+        409,
+        `Insufficient stock. Available: ${available}, requested: ${qty}.`,
+      );
+    }
+
+    const item = await RawMaterialStock.create({
+      raw_material_id,
+      desc: desc ?? "",
+      quantity: qty,
+      price: prc,
+      total_price: totalPrice,
+      purpose: 2,
+      isDeleted: false,
+    });
+
+    // Production allocation: out_quantity ↑, available_quantity ↓.
+    // No supplier impact (this is not a purchase).
+    await RawMaterial.findByIdAndUpdate(raw_material_id, {
+      $inc: { out_quantity: qty, available_quantity: -qty },
+    });
+
+    return successMessage(
+      res,
+      item,
+      "Production stock allocation created successfully.",
+    );
+  } catch (err) {
+    console.error("RawMaterialStock createProduction error:", err);
+    return createError(
+      res,
+      500,
+      err.message || "Failed to create production allocation.",
+    );
+  }
+};
+
+/**
+ * DELETE /api/raw-material-stock/production/:id
+ *
+ * Soft-deletes a production-purpose stock entry and reverses its inventory
+ * impact (restores available_quantity, decrements out_quantity). Refuses to
+ * touch entries with purpose=1 so the existing remove flow keeps owning
+ * purchase reversals.
+ */
+const removeProduction = async (req, res) => {
+  try {
+    const item = await RawMaterialStock.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!item)
+      return createError(res, 404, "Production stock entry not found.");
+    if (Number(item.purpose) !== 2) {
+      return createError(
+        res,
+        400,
+        "This endpoint only deletes production-purpose entries.",
+      );
+    }
+
+    // Reverse the production allocation against RawMaterial.
+    await RawMaterial.findByIdAndUpdate(item.raw_material_id, {
+      $inc: { out_quantity: -item.quantity, available_quantity: item.quantity },
+    });
+
+    const deleted = await RawMaterialStock.findOneAndUpdate(
+      { _id: req.params.id, isDeleted: false },
+      { isDeleted: true },
+      { new: true },
+    );
+
+    return successMessage(
+      res,
+      deleted || item,
+      "Production stock allocation deleted successfully.",
+    );
+  } catch (err) {
+    console.error("RawMaterialStock removeProduction error:", err);
+    return createError(
+      res,
+      500,
+      err.message || "Failed to delete production allocation.",
+    );
+  }
+};
+
+module.exports = {
+  list,
+  getOne,
+  create,
+  update,
+  remove,
+  createProduction,
+  removeProduction,
+};

@@ -62,10 +62,34 @@ const VerifyUserCookie = (req, res, next) => {
   }
 };
 
+/**
+ * VerifyAdmin — gate that requires the authenticated user's role to be Admin (1).
+ * Operator-precedence fix: previous expression `!req.user.role === 1` evaluated
+ * as `(!req.user.role) === 1` (always falsy). Use a strict equality check.
+ *
+ * Roles enum (Users.role): 1: Admin, 2: Cashier, 3: Saleman.
+ */
 const VerifyAdmin = (req, res, next) => {
-  // Check if user has branch information
-  if (!req.user || !req.user.role === 1) {
+  if (!req.user || Number(req.user.role) !== 1) {
     return createError(res, 403, "Admin access required.");
+  }
+  next();
+};
+
+/**
+ * requireRole(...allowedRoles) — generic role guard. Use after `verifyToken`.
+ *
+ *   router.delete("/:id", verifyToken, requireRole(1), controller.remove);
+ *
+ * Plumbed for future per-module phase. Not yet attached to any route.
+ */
+const requireRole = (...allowedRoles) => (req, res, next) => {
+  if (!req.user) {
+    return createError(res, 401, "Authentication required.");
+  }
+  const role = Number(req.user.role);
+  if (!allowedRoles.map(Number).includes(role)) {
+    return createError(res, 403, "You don't have permission for this action.");
   }
   next();
 };
@@ -90,4 +114,5 @@ module.exports = {
   VerifyUserCookie,
   VerifyBranch,
   VerifyAdmin,
+  requireRole,
 };

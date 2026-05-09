@@ -21,6 +21,18 @@ const RawMaterialStockSchema = new Schema(
     quantity: requiredNumberWithDefault,
     price: requiredNumberWithDefault,
     total_price: requiredNumberWithDefault,
+    // purpose tags an inventory movement.
+    //   1 = purchase   (default; inflow from a supplier — existing behavior)
+    //   2 = production (outflow allocated for cake production)
+    // Default = 1 keeps every existing document semantically correct
+    // without a migration.
+    purpose: {
+      type: Number,
+      enum: [1, 2],
+      default: 1,
+      required: true,
+      index: true,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {

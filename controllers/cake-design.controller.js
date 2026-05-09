@@ -48,14 +48,32 @@ const getOne = async (req, res) => {
   }
 };
 
+// Coerce the multipart form / JSON `price_per_pound` value into a non-negative
+// number. Returns `null` if the input is unparseable so callers can surface a
+// 400. Empty / undefined inputs resolve to 0 so older clients keep working.
+const parsePricePerPound = (value) => {
+  if (value === undefined || value === null || value === "") return 0;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return null;
+  return num;
+};
+
 const create = async (req, res) => {
   try {
-    const { title, description } = req.body;
+    const { title, description, price_per_pound } = req.body;
     if (!title || !description) {
       return createError(res, 400, "Title and description are required.");
     }
     if (!req.file) {
       return createError(res, 400, "Image is required.");
+    }
+    const pricePerPound = parsePricePerPound(price_per_pound);
+    if (pricePerPound === null) {
+      return createError(
+        res,
+        400,
+        "price_per_pound must be a non-negative number.",
+      );
     }
     let cakeDesignImageUrl = null;
     try {
@@ -81,6 +99,7 @@ const create = async (req, res) => {
       title,
       image: cakeDesignImageUrl,
       description,
+      price_per_pound: pricePerPound,
       isDeleted: false,
     });
     return successMessage(res, item, "Cake design created successfully.");
@@ -96,10 +115,21 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { title, description } = req.body;
+    const { title, description, price_per_pound } = req.body;
     const updatePayload = { isDeleted: false };
     if (title !== undefined) updatePayload.title = title;
     if (description !== undefined) updatePayload.description = description;
+    if (price_per_pound !== undefined) {
+      const parsed = parsePricePerPound(price_per_pound);
+      if (parsed === null) {
+        return createError(
+          res,
+          400,
+          "price_per_pound must be a non-negative number.",
+        );
+      }
+      updatePayload.price_per_pound = parsed;
+    }
 
     if (req.file) {
       try {

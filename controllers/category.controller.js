@@ -3,15 +3,22 @@ const { createError, successMessage } = require("../utils/ResponseMessage");
 
 const list = async (req, res) => {
   try {
-    const categories = await Category.find({ isDeleted: false }).sort({
+    const items = await Category.find({ isDeleted: false }).sort({
       createdAt: -1,
     });
-    const deletedCategories = await Category.find({ isDeleted: true }).sort({
+    const deletedItems = await Category.find({ isDeleted: true }).sort({
       createdAt: -1,
     });
+    // Dual-emit: canonical (items/deletedItems) alongside legacy keys
+    // (categories/deletedCategories) so existing consumers keep working.
     return successMessage(
       res,
-      { categories, deletedCategories },
+      {
+        items,
+        deletedItems,
+        categories: items,
+        deletedCategories: deletedItems,
+      },
       "Categories fetched successfully."
     );
   } catch (err) {
@@ -63,9 +70,11 @@ const update = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
-    const category = await Category.findByIdAndDelete(req.params.id).where({
-      isDeleted: false,
-    });
+    const category = await Category.findOneAndUpdate(
+      { _id: req.params.id, isDeleted: false },
+      { isDeleted: true },
+      { new: true }
+    );
     if (!category) return createError(res, 404, "Category not found.");
     return successMessage(res, category, "Category deleted successfully.");
   } catch (err) {

@@ -83,9 +83,11 @@ const update = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
-    const item = await RawMaterial.findByIdAndDelete(req.params.id).where({
-      isDeleted: false,
-    });
+    const item = await RawMaterial.findOneAndUpdate(
+      { _id: req.params.id, isDeleted: false },
+      { isDeleted: true },
+      { new: true }
+    );
     if (!item) return createError(res, 404, "Raw material not found.");
     return successMessage(res, item, "Raw material deleted successfully.");
   } catch (err) {

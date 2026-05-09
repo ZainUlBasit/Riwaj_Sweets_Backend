@@ -7,17 +7,21 @@ const { createError, successMessage } = require("../utils/ResponseMessage");
  */
 const list = async (req, res) => {
   try {
-    const suppliers = await Supplier.find({ isDeleted: false }).sort({
+    const items = await Supplier.find({ isDeleted: false }).sort({
       createdAt: -1,
     });
-    const deletedSuppliers = await Supplier.find({ isDeleted: true }).sort({
+    const deletedItems = await Supplier.find({ isDeleted: true }).sort({
       createdAt: -1,
     });
+    // Dual-emit: canonical (items/deletedItems) alongside legacy keys
+    // (suppliers/deletedSuppliers) so existing consumers keep working.
     return successMessage(
       res,
       {
-        suppliers: suppliers,
-        deletedSuppliers: deletedSuppliers,
+        items,
+        deletedItems,
+        suppliers: items,
+        deletedSuppliers: deletedItems,
       },
       "Suppliers fetched successfully.",
     );
@@ -95,11 +99,16 @@ const update = async (req, res) => {
 
 /**
  * DELETE /api/supplier/:id
- * Delete a supplier by id
+ * Soft-delete a supplier by id (sets isDeleted: true). The record continues
+ * to appear under `deletedSuppliers` / `deletedItems` in list responses.
  */
 const remove = async (req, res) => {
   try {
-    const supplier = await Supplier.findByIdAndDelete(req.params.id).where({ isDeleted: false });
+    const supplier = await Supplier.findOneAndUpdate(
+      { _id: req.params.id, isDeleted: false },
+      { isDeleted: true },
+      { new: true },
+    );
     if (!supplier) {
       return createError(res, 404, "Supplier not found.");
     }

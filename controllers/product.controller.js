@@ -3,17 +3,24 @@ const { createError, successMessage } = require("../utils/ResponseMessage");
 
 const list = async (req, res) => {
   try {
-    const products = await Product.find({ isDeleted: false })
+    const items = await Product.find({ isDeleted: false })
       .populate("category_id")
       .populate("counter_id")
       .sort({ createdAt: -1 });
-    const deletedProducts = await Product.find({ isDeleted: true })
+    const deletedItems = await Product.find({ isDeleted: true })
       .populate("category_id")
       .populate("counter_id")
       .sort({ createdAt: -1 });
+    // Dual-emit: canonical (items/deletedItems) alongside legacy keys
+    // (products/deletedProducts) so existing consumers keep working.
     return successMessage(
       res,
-      { products, deletedProducts },
+      {
+        items,
+        deletedItems,
+        products: items,
+        deletedProducts: deletedItems,
+      },
       "Products fetched successfully.",
     );
   } catch (err) {
@@ -94,9 +101,11 @@ const update = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
-    const product = await Product.findByIdAndDelete(req.params.id).where({
-      isDeleted: false,
-    });
+    const product = await Product.findOneAndUpdate(
+      { _id: req.params.id, isDeleted: false },
+      { isDeleted: true },
+      { new: true },
+    );
     if (!product) return createError(res, 404, "Product not found.");
     return successMessage(res, product, "Product deleted successfully.");
   } catch (err) {
