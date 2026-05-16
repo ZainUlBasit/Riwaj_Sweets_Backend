@@ -14,7 +14,7 @@ const UsersSchema = new Schema(
     password: requiredString,
     role: {
       type: Number,
-      enum: [1, 2, 3], // 1: Admin 2: Cashier 3: Saleman 4: Cake Designer 5: Raw Material Manager
+      enum: [1, 2, 3, 4, 5], // 1 Admin, 2 Cashier, 3 Saleman, 4 Cake Designer, 5 Cake Order Manager
     },
     isDeleted: requiredBooleanWithDefaultFalse,
   },

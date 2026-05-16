@@ -119,7 +119,7 @@ function authControllers() {
             "string.max": "Password must be upto 15 characters ",
           }),
         confirmPassword: Joi.ref("password"),
-        role: Joi.number().valid(1, 2, 3).required(), // 1: Admin, 2: Cashier, 3: Saleman
+        role: Joi.number().valid(1, 2, 3, 4, 5).required(), // 1 Admin … 5 Cake Order Manager
       });
       const { error } = registerSchema.validate(req.body);
       if (error) return createError(res, 422, error.message);

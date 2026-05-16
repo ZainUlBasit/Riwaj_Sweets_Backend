@@ -225,6 +225,11 @@ app.use("/api/cake-design", CakeDesignRoutes);
 const CakeOrderRoutes = require("../routes/cake-order.routes");
 app.use("/api/cake-order", CakeOrderRoutes);
 // ===================================================
+// Cake staff (mobile app users: order manager + designer)
+// ===================================================
+const CakeStaffRoutes = require("../routes/cake-staff.routes");
+app.use("/api/cake-staff", CakeStaffRoutes);
+// ===================================================
 // Product Routes
 // ===================================================
 const ProductRoutes = require("../routes/product.routes");
