@@ -11,8 +11,11 @@ const CakeOrderSchema = new Schema(
     },
     pound: { type: Number, required: true },
     customization_rupees: { type: Number, default: 0 },
+    /** Text notes: message on cake, theme, colors, toppings, etc. */
+    customization_description: { type: String, default: "", trim: true },
     /** 1 pending, 2 in design, 3 ready, 4 completed, 5 cancelled */
     status: { type: Number, default: 1, min: 1, max: 5 },
+    placed_by: { type: Schema.Types.ObjectId, ref: "User" },
     isDeleted: { type: Boolean, default: false },
   },
   { timestamps: true }
