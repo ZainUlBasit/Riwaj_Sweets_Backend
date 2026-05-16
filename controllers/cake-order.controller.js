@@ -3,7 +3,17 @@ const { createError, successMessage } = require("../utils/ResponseMessage");
 
 const list = async (req, res) => {
   try {
-    const items = await CakeOrder.find({ isDeleted: false })
+    const filter = { isDeleted: false };
+    const statusParam = req.query.status;
+    if (statusParam != null && statusParam !== "") {
+      const status = Number(statusParam);
+      if (!Number.isFinite(status) || status < 1 || status > 5) {
+        return createError(res, 400, "Invalid status filter (1–5).");
+      }
+      filter.status = status;
+    }
+
+    const items = await CakeOrder.find(filter)
       .populate("cake_design_id")
       .sort({ createdAt: -1 });
     const deletedItems = await CakeOrder.find({ isDeleted: true })
@@ -51,6 +61,7 @@ const create = async (req, res) => {
       cake_design_id,
       pound: Number(pound),
       customization_rupees: customization_rupees != null ? Number(customization_rupees) : 0,
+      status: 1,
       isDeleted: false,
     });
     return successMessage(res, item, "Cake order created successfully.");
@@ -66,12 +77,19 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { cake_design_id, pound, customization_rupees } = req.body;
+    const { cake_design_id, pound, customization_rupees, status } = req.body;
     const updatePayload = { isDeleted: false };
     if (cake_design_id !== undefined) updatePayload.cake_design_id = cake_design_id;
     if (pound !== undefined) updatePayload.pound = Number(pound);
     if (customization_rupees !== undefined)
       updatePayload.customization_rupees = Number(customization_rupees);
+    if (status !== undefined) {
+      const nextStatus = Number(status);
+      if (!Number.isFinite(nextStatus) || nextStatus < 1 || nextStatus > 5) {
+        return createError(res, 400, "Invalid status (1–5).");
+      }
+      updatePayload.status = nextStatus;
+    }
 
     const item = await CakeOrder.findOneAndUpdate(
       { _id: req.params.id, isDeleted: false },
