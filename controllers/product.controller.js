@@ -57,10 +57,17 @@ const parseBom = (body) => {
   return [];
 };
 
+const resolveRawMaterialIdFromEntry = (entry) => {
+  const raw = entry?.rawMaterialId ?? entry?.raw_material_id;
+  if (!raw) return null;
+  if (typeof raw === "object" && raw._id) return String(raw._id);
+  return String(raw);
+};
+
 const normalizeBom = (entries) =>
   (Array.isArray(entries) ? entries : [])
     .map((e) => ({
-      rawMaterialId: e.rawMaterialId || e.raw_material_id,
+      rawMaterialId: resolveRawMaterialIdFromEntry(e),
       quantity_required_per_unit: Number(
         e.quantity_required_per_unit ?? e.quantity_used ?? 0,
       ),
@@ -74,10 +81,12 @@ const list = async (req, res) => {
     const items = await Product.find({ isDeleted: false })
       .populate("category_id")
       .populate("counter_id")
+      .populate("bom.rawMaterialId", "name unit")
       .sort({ createdAt: -1 });
     const deletedItems = await Product.find({ isDeleted: true })
       .populate("category_id")
       .populate("counter_id")
+      .populate("bom.rawMaterialId", "name unit")
       .sort({ createdAt: -1 });
     return successMessage(
       res,
@@ -100,6 +109,7 @@ const getOne = async (req, res) => {
     const product = await Product.findById(req.params.id)
       .populate("category_id")
       .populate("counter_id")
+      .populate("bom.rawMaterialId", "name unit")
       .where({ isDeleted: false });
     if (!product) return createError(res, 404, "Product not found.");
     return successMessage(res, product, "Product fetched successfully.");
