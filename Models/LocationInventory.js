@@ -9,6 +9,7 @@ const Schema = mongoose.Schema;
  * inventory_type:
  *   1 = production area inventory
  *   2 = shop inventory
+ *   3 = main store (finished goods) inventory
  */
 const LocationInventorySchema = new Schema(
   {
@@ -26,7 +27,7 @@ const LocationInventorySchema = new Schema(
     },
     inventory_type: {
       type: Number,
-      enum: [1, 2],
+      enum: [1, 2, 3],
       required: true,
       default: 1,
     },

@@ -1,9 +1,11 @@
+const ProductTransfer = require("../Models/ProductTransfer");
+const ProductStoreReceipt = require("../Models/ProductStoreReceipt");
+const LocationInventory = require("../Models/LocationInventory");
 const RawMaterial = require("../Models/RawMaterial");
 const InventoryLedger = require("../Models/InventoryLedger");
-const ProductTransfer = require("../Models/ProductTransfer");
 const CakeProduction = require("../Models/CakeProduction");
 const { createError, successMessage } = require("../utils/ResponseMessage");
-const { TX } = require("../Services/inventoryService");
+const { TX, INV_TYPE, LOCATION_TYPE } = require("../Services/inventoryService");
 
 /**
  * GET /api/inventory-reports/current-stock
@@ -278,10 +280,144 @@ const transferReport = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/inventory-reports/store-receipts?start_date=&end_date=
+ */
+const storeReceiptReport = async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query || {};
+    const match = { isDeleted: false };
+    if (start_date || end_date) {
+      match.receipt_date = {};
+      if (start_date) match.receipt_date.$gte = new Date(start_date);
+      if (end_date) match.receipt_date.$lte = new Date(end_date);
+    }
+
+    const byStore = await ProductStoreReceipt.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: { to_location_id: "$to_location_id", product_id: "$product_id" },
+          totalQuantity: { $sum: "$quantity" },
+        },
+      },
+      {
+        $lookup: {
+          from: "dispatchlocations",
+          localField: "_id.to_location_id",
+          foreignField: "_id",
+          as: "store",
+        },
+      },
+      {
+        $lookup: {
+          from: "products",
+          localField: "_id.product_id",
+          foreignField: "_id",
+          as: "product",
+        },
+      },
+      { $unwind: { path: "$store", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$product", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          _id: 0,
+          storeName: { $ifNull: ["$store.name", "Unknown"] },
+          productName: { $ifNull: ["$product.name", "Unknown"] },
+          totalQuantity: 1,
+        },
+      },
+      { $sort: { storeName: 1, productName: 1 } },
+    ]);
+
+    const byProduct = await ProductStoreReceipt.aggregate([
+      { $match: match },
+      { $group: { _id: "$product_id", totalQuantity: { $sum: "$quantity" } } },
+      {
+        $lookup: {
+          from: "products",
+          localField: "_id",
+          foreignField: "_id",
+          as: "product",
+        },
+      },
+      { $unwind: { path: "$product", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          _id: 0,
+          productName: { $ifNull: ["$product.name", "Unknown"] },
+          totalQuantity: 1,
+        },
+      },
+    ]);
+
+    return successMessage(
+      res,
+      { byStore, byProduct },
+      "Store receipt report fetched.",
+    );
+  } catch (err) {
+    console.error("InventoryReport storeReceiptReport error:", err);
+    return createError(res, 500, err.message || "Failed to fetch store receipt report.");
+  }
+};
+
+/**
+ * GET /api/inventory-reports/finished-goods-stock
+ * Current finished goods at main stores (location_type = 4).
+ */
+const finishedGoodsStock = async (req, res) => {
+  try {
+    const rows = await LocationInventory.aggregate([
+      { $match: { isDeleted: false, inventory_type: INV_TYPE.STORE } },
+      {
+        $lookup: {
+          from: "dispatchlocations",
+          localField: "location_id",
+          foreignField: "_id",
+          as: "location",
+        },
+      },
+      {
+        $lookup: {
+          from: "products",
+          localField: "product_id",
+          foreignField: "_id",
+          as: "product",
+        },
+      },
+      { $unwind: { path: "$location", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$product", preserveNullAndEmptyArrays: true } },
+      {
+        $match: {
+          "location.location_type": LOCATION_TYPE.FINISHED_GOODS_STORE,
+          "location.isDeleted": false,
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          locationName: { $ifNull: ["$location.name", "Unknown"] },
+          productName: { $ifNull: ["$product.name", "Unknown"] },
+          quantity: 1,
+        },
+      },
+      { $sort: { locationName: 1, productName: 1 } },
+    ]);
+
+    return successMessage(res, { items: rows }, "Finished goods stock fetched.");
+  } catch (err) {
+    console.error("InventoryReport finishedGoodsStock error:", err);
+    return createError(res, 500, err.message || "Failed to fetch finished goods stock.");
+  }
+};
+
 module.exports = {
   currentStock,
   materialLedger,
   consumptionReport,
   productionReport,
   transferReport,
+  storeReceiptReport,
+  finishedGoodsStock,
 };

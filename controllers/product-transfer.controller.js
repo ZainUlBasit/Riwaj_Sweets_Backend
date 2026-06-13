@@ -12,6 +12,7 @@ const {
   writeLedger,
   adjustLocationInventory,
   getLocationInventoryQty,
+  getInventoryTypeForLocation,
   withTransaction,
 } = require("../Services/inventoryService");
 
@@ -107,10 +108,19 @@ const create = async (req, res) => {
     const fromType = Number(fromLoc.location_type || LOCATION_TYPE.PRODUCTION_AREA);
     const toType = Number(toLoc.location_type || LOCATION_TYPE.PRODUCTION_AREA);
 
-    const fromInvType =
-      fromType === LOCATION_TYPE.SHOP ? INV_TYPE.SHOP : INV_TYPE.PRODUCTION;
-    const toInvType =
-      toType === LOCATION_TYPE.SHOP ? INV_TYPE.SHOP : INV_TYPE.PRODUCTION;
+    if (toType !== LOCATION_TYPE.SHOP) {
+      return createError(res, 400, "To location must be a shop.");
+    }
+    if (fromType !== LOCATION_TYPE.FINISHED_GOODS_STORE) {
+      return createError(
+        res,
+        400,
+        "From location must be a main store (finished goods). Receive products from production first.",
+      );
+    }
+
+    const fromInvType = getInventoryTypeForLocation(fromType);
+    const toInvType = getInventoryTypeForLocation(toType);
 
     const availableAtFrom = await getLocationInventoryQty(
       from_location_id,
@@ -121,7 +131,7 @@ const create = async (req, res) => {
       return createError(
         res,
         409,
-        `Insufficient production inventory at ${fromLoc.name}. Available: ${availableAtFrom}, requested: ${qty}.`,
+        `Insufficient stock at ${fromLoc.name}. Available: ${availableAtFrom}, requested: ${qty}.`,
       );
     }
 
@@ -242,10 +252,8 @@ const remove = async (req, res) => {
 
     const fromType = Number(fromLoc?.location_type || LOCATION_TYPE.PRODUCTION_AREA);
     const toType = Number(toLoc?.location_type || LOCATION_TYPE.PRODUCTION_AREA);
-    const fromInvType =
-      fromType === LOCATION_TYPE.SHOP ? INV_TYPE.SHOP : INV_TYPE.PRODUCTION;
-    const toInvType =
-      toType === LOCATION_TYPE.SHOP ? INV_TYPE.SHOP : INV_TYPE.PRODUCTION;
+    const fromInvType = getInventoryTypeForLocation(fromType);
+    const toInvType = getInventoryTypeForLocation(toType);
 
     const item = await withTransaction(async (session) => {
       const qty = Number(existing.quantity || 0);

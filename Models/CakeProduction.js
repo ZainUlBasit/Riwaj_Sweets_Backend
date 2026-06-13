@@ -65,6 +65,13 @@ const CakeProductionSchema = new Schema(
       default: null,
       index: true,
     },
+    /** Auto store receipt when main store is configured for the parent store. */
+    store_receipt_id: {
+      type: Schema.Types.ObjectId,
+      ref: "ProductStoreReceipt",
+      default: null,
+      index: true,
+    },
     /** Auto-generated consumption rows (BOM) — used to reverse on edit/delete. */
     raw_materials_consumed: [
       {

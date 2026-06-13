@@ -9,5 +9,7 @@ router.get("/material-ledger", controller.materialLedger);
 router.get("/consumption", controller.consumptionReport);
 router.get("/production", controller.productionReport);
 router.get("/transfers", controller.transferReport);
+router.get("/store-receipts", controller.storeReceiptReport);
+router.get("/finished-goods-stock", controller.finishedGoodsStock);
 
 module.exports = router;

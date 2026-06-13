@@ -16,6 +16,9 @@ const {
   consumeBomForProduction,
   reverseBomConsumption,
   validateBomAvailability,
+  findFinishedGoodsStore,
+  executeStoreReceipt,
+  reverseStoreReceipt,
   withTransaction,
 } = require("../Services/inventoryService");
 
@@ -108,6 +111,7 @@ async function applyProductionImpact({
   const opts = session ? { session } : {};
   let productStock = null;
   let consumptions = [];
+  let storeReceipt = null;
 
   if (cakes > 0) {
     const bomResult = await consumeBomForProduction({
@@ -161,6 +165,25 @@ async function applyProductionImpact({
         INV_TYPE.PRODUCTION,
         session,
       );
+
+      if (productionLocation.store_id) {
+        const fgStore = await findFinishedGoodsStore(productionLocation.store_id, session);
+        if (fgStore?._id) {
+          storeReceipt = await executeStoreReceipt({
+            fromLocationId: productionLocation._id,
+            toLocationId: fgStore._id,
+            productId: product._id,
+            quantity: cakes,
+            receiptDate: productionDate,
+            userId,
+            referenceType: "CakeProduction",
+            referenceId,
+            notes: `Auto from ${productionLocation.name}`,
+            cakeProductionId: referenceId,
+            session,
+          });
+        }
+      }
     }
 
     await writeLedger(
@@ -182,7 +205,7 @@ async function applyProductionImpact({
     );
   }
 
-  return { productStock, consumptions };
+  return { productStock, consumptions, storeReceipt };
 }
 
 const create = async (req, res) => {
@@ -267,7 +290,7 @@ const create = async (req, res) => {
         opts,
       );
 
-      const { productStock, consumptions } = await applyProductionImpact({
+      const { productStock, consumptions, storeReceipt } = await applyProductionImpact({
         product,
         cakes,
         productionDate: production_date,
@@ -280,6 +303,7 @@ const create = async (req, res) => {
 
       if (productStock) created.product_stock_id = productStock._id;
       if (consumptions.length) created.raw_materials_consumed = consumptions;
+      if (storeReceipt) created.store_receipt_id = storeReceipt._id;
       await created.save(opts);
 
       await writeAudit({
@@ -403,6 +427,7 @@ const update = async (req, res) => {
           product_stock_id: null,
           raw_materials_consumed: [],
           raw_material_stock_id: null,
+          store_receipt_id: null,
         },
         { new: true, runValidators: true, ...opts },
       );
@@ -413,7 +438,7 @@ const update = async (req, res) => {
           ? await DispatchLocation.findById(existing.location_id).session(session)
           : null;
 
-      const { productStock, consumptions } = await applyProductionImpact({
+      const { productStock, consumptions, storeReceipt } = await applyProductionImpact({
         product: finalProduct,
         cakes: finalCakes,
         productionDate: updatePayload.production_date ?? existing.production_date,
@@ -426,6 +451,7 @@ const update = async (req, res) => {
 
       if (productStock) updated.product_stock_id = productStock._id;
       if (consumptions.length) updated.raw_materials_consumed = consumptions;
+      if (storeReceipt) updated.store_receipt_id = storeReceipt._id;
       await updated.save(opts);
 
       await writeAudit({
@@ -471,6 +497,7 @@ const remove = async (req, res) => {
           isDeleted: true,
           product_stock_id: null,
           raw_materials_consumed: [],
+          store_receipt_id: null,
         },
         { new: true, session },
       );
@@ -505,6 +532,12 @@ async function reverseProductionImpact(record, userId = null, session = null) {
     await reverseBomConsumption(record.raw_materials_consumed, userId, session);
   }
 
+  if (record?.store_receipt_id) {
+    await reverseStoreReceipt(record.store_receipt_id, userId, session, {
+      restoreToProduction: false,
+    });
+  }
+
   if (!record?.product_stock_id) return;
 
   const stockQ = ProductStock.findById(record.product_stock_id);
@@ -524,7 +557,7 @@ async function reverseProductionImpact(record, userId = null, session = null) {
       session,
     );
 
-    if (stock.location_id) {
+    if (stock.location_id && !record?.store_receipt_id) {
       await adjustLocationInventory(
         stock.location_id,
         stock.product_id,

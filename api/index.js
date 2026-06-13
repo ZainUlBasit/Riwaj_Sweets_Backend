@@ -185,7 +185,12 @@ app.get("/api/cron/reset-call-status-weekly", (req, res) => {
 const StoreRoutes = require("../routes/store.routes");
 app.use("/api/store", StoreRoutes);
 // ===================================================
-// Product Transfer Routes (production → shop)
+// Product Store Receipt Routes (production area → main store)
+// ===================================================
+const ProductStoreReceiptRoutes = require("../routes/product-store-receipt.routes");
+app.use("/api/product-store-receipt", ProductStoreReceiptRoutes);
+// ===================================================
+// Product Transfer Routes (main store → shop)
 // ===================================================
 const ProductTransferRoutes = require("../routes/product-transfer.routes");
 app.use("/api/product-transfer", ProductTransferRoutes);

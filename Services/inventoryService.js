@@ -5,6 +5,8 @@ const Product = require("../Models/Products");
 const InventoryLedger = require("../Models/InventoryLedger");
 const InventoryAuditLog = require("../Models/InventoryAuditLog");
 const LocationInventory = require("../Models/LocationInventory");
+const DispatchLocation = require("../Models/DispatchLocation");
+const ProductStoreReceipt = require("../Models/ProductStoreReceipt");
 
 /** Ledger transaction types — must match InventoryLedger schema enum. */
 const TX = {
@@ -16,6 +18,7 @@ const TX = {
   PRODUCT_STOCK_IN: 6,
   PRODUCT_SALE: 7,
   ADJUSTMENT: 8,
+  STORE_RECEIPT: 9,
 };
 
 const DIR = { IN: 1, OUT: 2 };
@@ -24,9 +27,28 @@ const LOCATION_TYPE = {
   RAW_MATERIAL_STORE: 1,
   PRODUCTION_AREA: 2,
   SHOP: 3,
+  FINISHED_GOODS_STORE: 4,
 };
 
-const INV_TYPE = { PRODUCTION: 1, SHOP: 2 };
+const INV_TYPE = { PRODUCTION: 1, SHOP: 2, STORE: 3 };
+
+function getInventoryTypeForLocation(locationType) {
+  const t = Number(locationType || LOCATION_TYPE.PRODUCTION_AREA);
+  if (t === LOCATION_TYPE.SHOP) return INV_TYPE.SHOP;
+  if (t === LOCATION_TYPE.FINISHED_GOODS_STORE) return INV_TYPE.STORE;
+  return INV_TYPE.PRODUCTION;
+}
+
+async function findFinishedGoodsStore(storeId, session = null) {
+  if (!storeId) return null;
+  const q = DispatchLocation.findOne({
+    store_id: storeId,
+    location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+    isDeleted: false,
+  });
+  if (session) q.session(session);
+  return q;
+}
 
 function getUserId(req) {
   return req?.user?._id ?? null;
@@ -429,6 +451,165 @@ async function withTransaction(fn) {
   }
 }
 
+/**
+ * Move finished goods from production area → main store.
+ */
+async function executeStoreReceipt({
+  fromLocationId,
+  toLocationId,
+  productId,
+  quantity,
+  receiptDate,
+  userId = null,
+  referenceType = "ProductStoreReceipt",
+  referenceId = null,
+  notes = "",
+  cakeProductionId = null,
+  session = null,
+}) {
+  const opts = session ? { session } : {};
+  const qty = Number(quantity);
+  if (!qty || qty <= 0) {
+    const err = new Error("quantity must be greater than 0.");
+    err.status = 400;
+    throw err;
+  }
+
+  const fromInv = INV_TYPE.PRODUCTION;
+  const toInv = INV_TYPE.STORE;
+
+  const availableAtFrom = await getLocationInventoryQty(
+    fromLocationId,
+    productId,
+    fromInv,
+    session,
+  );
+  if (qty > availableAtFrom) {
+    const err = new Error(
+      `Insufficient production inventory. Available: ${availableAtFrom}, requested: ${qty}.`,
+    );
+    err.status = 409;
+    throw err;
+  }
+
+  await adjustLocationInventory(fromLocationId, productId, -qty, fromInv, session);
+  await adjustLocationInventory(toLocationId, productId, qty, toInv, session);
+
+  const [item] = await ProductStoreReceipt.create(
+    [
+      {
+        from_location_id: fromLocationId,
+        to_location_id: toLocationId,
+        product_id: productId,
+        quantity: qty,
+        receipt_date: new Date(receiptDate),
+        notes: notes ?? "",
+        cake_production_id: cakeProductionId,
+        created_by: userId,
+        isDeleted: false,
+      },
+    ],
+    opts,
+  );
+
+  const [fromLoc, toLoc] = await Promise.all([
+    DispatchLocation.findById(fromLocationId),
+    DispatchLocation.findById(toLocationId),
+  ]);
+
+  await writeLedger(
+    {
+      transactionType: TX.STORE_RECEIPT,
+      direction: DIR.OUT,
+      productId,
+      quantity: qty,
+      locationId: fromLocationId,
+      storeId: fromLoc?.store_id ?? null,
+      referenceType,
+      referenceId: referenceId ?? item._id,
+      userId,
+      notes: notes || `Store receipt out → ${toLoc?.name ?? "main store"}`,
+      previousBalance: availableAtFrom,
+      newBalance: availableAtFrom - qty,
+    },
+    session,
+  );
+
+  const toPrev = await getLocationInventoryQty(toLocationId, productId, toInv, session);
+  await writeLedger(
+    {
+      transactionType: TX.STORE_RECEIPT,
+      direction: DIR.IN,
+      productId,
+      quantity: qty,
+      locationId: toLocationId,
+      storeId: toLoc?.store_id ?? null,
+      referenceType,
+      referenceId: referenceId ?? item._id,
+      userId,
+      notes: notes || `Store receipt in ← ${fromLoc?.name ?? "production"}`,
+      previousBalance: toPrev - qty,
+      newBalance: toPrev,
+    },
+    session,
+  );
+
+  return item;
+}
+
+/**
+ * Reverse a store receipt.
+ * @param {boolean} restoreToProduction — when false, only deduct from main store (production delete).
+ */
+async function reverseStoreReceipt(
+  receiptId,
+  userId = null,
+  session = null,
+  { restoreToProduction = true } = {},
+) {
+  const opts = session ? { session } : {};
+  const q = ProductStoreReceipt.findById(receiptId).where({ isDeleted: false });
+  if (session) q.session(session);
+  const receipt = await q;
+  if (!receipt) return null;
+
+  const qty = Number(receipt.quantity || 0);
+  if (qty > 0) {
+    if (restoreToProduction) {
+      await adjustLocationInventory(
+        receipt.from_location_id,
+        receipt.product_id,
+        qty,
+        INV_TYPE.PRODUCTION,
+        session,
+      );
+    }
+    await adjustLocationInventory(
+      receipt.to_location_id,
+      receipt.product_id,
+      -qty,
+      INV_TYPE.STORE,
+      session,
+    );
+  }
+
+  receipt.isDeleted = true;
+  if (session) await receipt.save({ session });
+  else await receipt.save();
+
+  await writeAudit({
+    entityType: "ProductStoreReceipt",
+    entityId: receipt._id,
+    action: "delete",
+    previousValue: receipt.toObject?.() ?? receipt,
+    userId,
+    notes: restoreToProduction ? "Receipt reversed" : "Receipt reversed (production delete)",
+    session,
+  });
+
+  return receipt;
+}
+
 /** @deprecated use withTransaction */
 const withOptionalSession = withTransaction;
 
@@ -445,6 +626,10 @@ module.exports = {
   adjustProduct,
   getLocationInventoryQty,
   adjustLocationInventory,
+  getInventoryTypeForLocation,
+  findFinishedGoodsStore,
+  executeStoreReceipt,
+  reverseStoreReceipt,
   validateBomAvailability,
   consumeBomForProduction,
   reverseBomConsumption,

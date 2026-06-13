@@ -37,10 +37,11 @@ const DispatchLocationSchema = new Schema(
      *   1 = raw material store (central RM storage)
      *   2 = production area (default for legacy rows)
      *   3 = shop / outlet
+     *   4 = main store (finished goods warehouse)
      */
     location_type: {
       type: Number,
-      enum: [1, 2, 3],
+      enum: [1, 2, 3, 4],
       default: 2,
       index: true,
     },

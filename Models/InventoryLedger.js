@@ -15,6 +15,7 @@ const Schema = mongoose.Schema;
  *   6  PRODUCT_STOCK_IN           manual finished-goods stock-in
  *   7  PRODUCT_SALE               order delivery
  *   8  ADJUSTMENT                 manual correction
+ *   9  STORE_RECEIPT              production area → main store
  *
  * direction: 1 = in, 2 = out
  */
@@ -22,7 +23,7 @@ const InventoryLedgerSchema = new Schema(
   {
     transaction_type: {
       type: Number,
-      enum: [1, 2, 3, 4, 5, 6, 7, 8],
+      enum: [1, 2, 3, 4, 5, 6, 7, 8, 9],
       required: true,
       index: true,
     },
