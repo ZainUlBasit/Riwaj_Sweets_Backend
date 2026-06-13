@@ -6,22 +6,23 @@ const {
   getOrCreateLocation,
 } = require("./dispatch-location.controller");
 const { createError, successMessage } = require("../utils/ResponseMessage");
+const {
+  getUserId,
+  writeAudit,
+  applyRawMaterialDispatchImpact,
+  reverseRawMaterialDispatchImpact,
+  withTransaction,
+} = require("../Services/inventoryService");
 
 const populateRefs = (q) =>
   q
     .populate("raw_material_id")
     .populate("raw_material_stock_id")
+    .populate("generated_stock_id")
     .populate("location_id");
 
 /**
  * GET /api/raw-material-dispatch
- *
- * Optional query params:
- *   start_date, end_date  — filter `dispatch_date` (inclusive)
- *   location/location_id  — exact location match
- *   raw_material_id       — only dispatches for a specific raw material
- *
- * Response payload uses canonical `items` / `deletedItems` keys.
  */
 const list = async (req, res) => {
   try {
@@ -89,11 +90,6 @@ const getOne = async (req, res) => {
 
 /**
  * POST /api/raw-material-dispatch
- *
- * Body: {
- *   location_id? / location, raw_material_id, quantity, dispatch_date,
- *   raw_material_stock_id?, notes?
- * }
  */
 const create = async (req, res) => {
   try {
@@ -144,31 +140,67 @@ const create = async (req, res) => {
       return createError(res, 404, "Dispatch location not found.");
     }
 
-    const item = await RawMaterialDispatch.create({
-      location_id: dispatchLocation._id,
-      location: dispatchLocation.name,
-      raw_material_id,
-      raw_material_stock_id: raw_material_stock_id || null,
-      quantity: qty,
-      dispatch_date: new Date(dispatch_date),
-      notes: notes ?? "",
-      isDeleted: false,
+    const userId = getUserId(req);
+    const dispatchNotes =
+      notes?.trim() ||
+      `Dispatch to ${dispatchLocation.name}${raw_material_stock_id ? " (batch ref)" : ""}`;
+
+    const item = await withTransaction(async (session) => {
+      const opts = { session };
+      const [created] = await RawMaterialDispatch.create(
+        [
+          {
+            location_id: dispatchLocation._id,
+            location: dispatchLocation.name,
+            raw_material_id,
+            raw_material_stock_id: raw_material_stock_id || null,
+            quantity: qty,
+            dispatch_date: new Date(dispatch_date),
+            notes: notes ?? "",
+            isDeleted: false,
+          },
+        ],
+        opts,
+      );
+
+      const { generatedStockId } = await applyRawMaterialDispatchImpact({
+        rawMaterialId: raw_material_id,
+        quantity: qty,
+        locationId: dispatchLocation._id,
+        storeId: dispatchLocation.store_id ?? null,
+        referenceId: created._id,
+        userId,
+        notes: dispatchNotes,
+        session,
+      });
+
+      created.generated_stock_id = generatedStockId;
+      await created.save(opts);
+
+      await writeAudit({
+        entityType: "RawMaterialDispatch",
+        entityId: created._id,
+        action: "create",
+        newValue: created.toObject?.() ?? created,
+        userId,
+        session,
+      });
+
+      return created;
     });
 
-    const populated = await populateRefs(
-      RawMaterialDispatch.findById(item._id),
-    );
+    const populated = await populateRefs(RawMaterialDispatch.findById(item._id));
 
     return successMessage(
       res,
       populated || item,
-      "Dispatch created successfully.",
+      "Dispatch recorded and inventory updated.",
     );
   } catch (err) {
     console.error("RawMaterialDispatch create error:", err);
     return createError(
       res,
-      500,
+      err.status || 500,
       err.message || "Failed to create dispatch.",
     );
   }
@@ -176,6 +208,11 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
+    const existing = await RawMaterialDispatch.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!existing) return createError(res, 404, "Dispatch not found.");
+
     const {
       location,
       location_id,
@@ -187,6 +224,7 @@ const update = async (req, res) => {
     } = req.body || {};
 
     const updatePayload = { isDeleted: false };
+
     if (location_id !== undefined || location !== undefined) {
       if (!location_id && !String(location ?? "").trim()) {
         return createError(res, 400, "location cannot be empty.");
@@ -232,20 +270,75 @@ const update = async (req, res) => {
     }
     if (notes !== undefined) updatePayload.notes = notes;
 
-    const item = await populateRefs(
-      RawMaterialDispatch.findOneAndUpdate(
-        { _id: req.params.id, isDeleted: false },
-        updatePayload,
-        { new: true, runValidators: true },
-      ),
-    );
-    if (!item) return createError(res, 404, "Dispatch not found.");
-    return successMessage(res, item, "Dispatch updated successfully.");
+    const userId = getUserId(req);
+
+    const item = await withTransaction(async (session) => {
+      const opts = { session };
+
+      if (existing.generated_stock_id) {
+        await reverseRawMaterialDispatchImpact(
+          {
+            rawMaterialId: existing.raw_material_id,
+            quantity: existing.quantity,
+            generatedStockId: existing.generated_stock_id,
+            referenceId: existing._id,
+          },
+          userId,
+          session,
+        );
+      }
+
+      const updated = await RawMaterialDispatch.findByIdAndUpdate(
+        req.params.id,
+        { ...updatePayload, generated_stock_id: null },
+        { new: true, runValidators: true, session },
+      );
+
+      const finalLocation = updatePayload.location_id
+        ? await DispatchLocation.findById(updatePayload.location_id).session(session)
+        : await DispatchLocation.findById(existing.location_id).session(session);
+
+      const finalMaterialId = updatePayload.raw_material_id ?? existing.raw_material_id;
+      const finalQty = updatePayload.quantity ?? existing.quantity;
+      const dispatchNotes =
+        updatePayload.notes ??
+        existing.notes ??
+        `Dispatch to ${finalLocation?.name ?? existing.location}`;
+
+      const { generatedStockId } = await applyRawMaterialDispatchImpact({
+        rawMaterialId: finalMaterialId,
+        quantity: finalQty,
+        locationId: finalLocation?._id ?? existing.location_id,
+        storeId: finalLocation?.store_id ?? null,
+        referenceId: updated._id,
+        userId,
+        notes: dispatchNotes,
+        session,
+      });
+
+      updated.generated_stock_id = generatedStockId;
+      await updated.save(opts);
+
+      await writeAudit({
+        entityType: "RawMaterialDispatch",
+        entityId: updated._id,
+        action: "update",
+        previousValue: existing.toObject?.() ?? existing,
+        newValue: updated.toObject?.() ?? updated,
+        userId,
+        session,
+      });
+
+      return updated;
+    });
+
+    const populated = await populateRefs(RawMaterialDispatch.findById(item._id));
+    return successMessage(res, populated || item, "Dispatch updated successfully.");
   } catch (err) {
     console.error("RawMaterialDispatch update error:", err);
     return createError(
       res,
-      500,
+      err.status || 500,
       err.message || "Failed to update dispatch.",
     );
   }
@@ -253,25 +346,56 @@ const update = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
-    const item = await RawMaterialDispatch.findOneAndUpdate(
-      { _id: req.params.id, isDeleted: false },
-      { isDeleted: true },
-      { new: true },
-    );
-    if (!item) return createError(res, 404, "Dispatch not found.");
+    const existing = await RawMaterialDispatch.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!existing) return createError(res, 404, "Dispatch not found.");
+
+    const userId = getUserId(req);
+
+    const item = await withTransaction(async (session) => {
+      if (existing.generated_stock_id) {
+        await reverseRawMaterialDispatchImpact(
+          {
+            rawMaterialId: existing.raw_material_id,
+            quantity: existing.quantity,
+            generatedStockId: existing.generated_stock_id,
+            referenceId: existing._id,
+          },
+          userId,
+          session,
+        );
+      }
+
+      const deleted = await RawMaterialDispatch.findOneAndUpdate(
+        { _id: req.params.id, isDeleted: false },
+        { isDeleted: true, generated_stock_id: null },
+        { new: true, session },
+      );
+
+      await writeAudit({
+        entityType: "RawMaterialDispatch",
+        entityId: deleted._id,
+        action: "delete",
+        previousValue: existing.toObject?.() ?? existing,
+        userId,
+        session,
+      });
+
+      return deleted;
+    });
+
     return successMessage(res, item, "Dispatch deleted successfully.");
   } catch (err) {
     console.error("RawMaterialDispatch remove error:", err);
     return createError(
       res,
-      500,
+      err.status || 500,
       err.message || "Failed to delete dispatch.",
     );
   }
 };
 
-// Internal helper — escape a user-provided string for safe RegExp use in
-// the `location` filter on the list endpoint.
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

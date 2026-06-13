@@ -18,11 +18,10 @@ const Schema = mongoose.Schema;
  *   dispatch_date          When the dispatch happened.
  *   notes                  Optional free-form notes.
  *
- * Inventory side-effects (decrement available_quantity, etc.) are NOT
- * applied automatically by this model — dispatch is treated as an
- * informational event so existing inventory math is not silently changed.
- * Apply movements explicitly through the production-purpose stock flow if
- * dispatched material should also be deducted from inventory.
+ * On create/update/delete the controller applies inventory side-effects
+ * (deduct RM available, purpose=2 stock row, ledger type 10) and stores
+ * `generated_stock_id` for reversal. Legacy rows without that field are
+ * still visible in reports but delete does not restore stock.
  */
 const RawMaterialDispatchSchema = new Schema(
   {
@@ -43,6 +42,13 @@ const RawMaterialDispatchSchema = new Schema(
       type: mongoose.Types.ObjectId,
       ref: "RawMaterialStock",
       default: null,
+    },
+    /** Auto-created purpose=2 stock row when dispatch hits inventory. */
+    generated_stock_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "RawMaterialStock",
+      default: null,
+      index: true,
     },
     quantity: requiredNumberWithDefault,
     dispatch_date: {

@@ -11,5 +11,6 @@ router.get("/production", controller.productionReport);
 router.get("/transfers", controller.transferReport);
 router.get("/store-receipts", controller.storeReceiptReport);
 router.get("/finished-goods-stock", controller.finishedGoodsStock);
+router.get("/rm-dispatch", controller.rmDispatchReport);
 
 module.exports = router;

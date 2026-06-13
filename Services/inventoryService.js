@@ -19,6 +19,7 @@ const TX = {
   PRODUCT_SALE: 7,
   ADJUSTMENT: 8,
   STORE_RECEIPT: 9,
+  RAW_MATERIAL_DISPATCH: 10,
 };
 
 const DIR = { IN: 1, OUT: 2 };
@@ -436,6 +437,128 @@ async function reverseBomConsumption(consumptions, userId = null, session = null
   }
 }
 
+/**
+ * Apply inventory impact when raw material is dispatched to a location.
+ */
+async function applyRawMaterialDispatchImpact({
+  rawMaterialId,
+  quantity,
+  locationId = null,
+  storeId = null,
+  referenceId,
+  userId = null,
+  notes = "",
+  session = null,
+}) {
+  const opts = session ? { session } : {};
+  const qty = Number(quantity);
+  if (!qty || qty <= 0) {
+    const err = new Error("quantity must be greater than 0.");
+    err.status = 400;
+    throw err;
+  }
+
+  const prevAvail = await getRawMaterialAvailable(rawMaterialId, session);
+  if (qty > prevAvail) {
+    const err = new Error(
+      `Insufficient stock. Available: ${prevAvail}, requested: ${qty}.`,
+    );
+    err.status = 409;
+    throw err;
+  }
+
+  const [stockEntry] = await RawMaterialStock.create(
+    [
+      {
+        raw_material_id: rawMaterialId,
+        desc: notes || "Raw material dispatch",
+        quantity: qty,
+        price: 0,
+        total_price: 0,
+        purpose: 2,
+        isDeleted: false,
+      },
+    ],
+    opts,
+  );
+
+  const updated = await adjustRawMaterial(
+    rawMaterialId,
+    { outDelta: qty, availDelta: -qty },
+    session,
+  );
+
+  await writeLedger(
+    {
+      transactionType: TX.RAW_MATERIAL_DISPATCH,
+      direction: DIR.OUT,
+      rawMaterialId,
+      quantity: qty,
+      locationId,
+      storeId,
+      referenceType: "RawMaterialDispatch",
+      referenceId,
+      userId,
+      notes,
+      previousBalance: prevAvail,
+      newBalance: Number(updated?.available_quantity ?? prevAvail - qty),
+    },
+    session,
+  );
+
+  return { generatedStockId: stockEntry._id };
+}
+
+/** Reverse inventory side-effects for a dispatch record. */
+async function reverseRawMaterialDispatchImpact(
+  {
+    rawMaterialId,
+    quantity,
+    generatedStockId = null,
+    referenceId = null,
+  },
+  userId = null,
+  session = null,
+) {
+  const opts = session ? { session } : {};
+  const qty = Number(quantity || 0);
+  if (!qty || qty <= 0 || !generatedStockId) return;
+
+  const stockQ = RawMaterialStock.findById(generatedStockId);
+  if (session) stockQ.session(session);
+  const stock = await stockQ;
+  if (stock && !stock.isDeleted) {
+    await RawMaterialStock.findByIdAndUpdate(
+      generatedStockId,
+      { isDeleted: true },
+      opts,
+    );
+  }
+
+  const prevAvail = await getRawMaterialAvailable(rawMaterialId, session);
+  const updated = await adjustRawMaterial(
+    rawMaterialId,
+    { outDelta: -qty, availDelta: qty },
+    session,
+  );
+
+  await writeLedger(
+    {
+      transactionType: TX.ADJUSTMENT,
+      direction: DIR.IN,
+      rawMaterialId,
+      quantity: qty,
+      referenceType: "RawMaterialDispatch",
+      referenceId,
+      userId,
+      notes: "Raw material dispatch reversed",
+      previousBalance: prevAvail,
+      newBalance: Number(updated?.available_quantity ?? prevAvail + qty),
+    },
+    session,
+  );
+}
+
 async function withTransaction(fn) {
   const session = await mongoose.startSession();
   try {
@@ -630,6 +753,8 @@ module.exports = {
   findFinishedGoodsStore,
   executeStoreReceipt,
   reverseStoreReceipt,
+  applyRawMaterialDispatchImpact,
+  reverseRawMaterialDispatchImpact,
   validateBomAvailability,
   consumeBomForProduction,
   reverseBomConsumption,
