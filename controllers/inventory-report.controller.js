@@ -183,9 +183,33 @@ const productionReport = async (req, res) => {
       },
     ]);
 
+    const detailRows = await CakeProduction.find(match)
+      .populate("product_id", "name unit")
+      .populate("location_id", "name location_type store_id")
+      .populate({
+        path: "store_receipt_id",
+        populate: { path: "to_location_id", select: "name" },
+      })
+      .sort({ production_date: -1, createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    const items = detailRows.map((row) => ({
+      _id: row._id,
+      production_date: row.production_date,
+      productionArea:
+        row.location_id?.name ?? row.location ?? "Unassigned",
+      productName: row.product_id?.name ?? "Unknown",
+      quantity: row.cakes_produced,
+      storedAt:
+        row.store_receipt_id?.to_location_id?.name ??
+        (row.location_id ? `${row.location_id.name} (area)` : "—"),
+      notes: row.notes || "",
+    }));
+
     return successMessage(
       res,
-      { byLocation, byProduct: totals },
+      { byLocation, byProduct: totals, items },
       "Production report fetched.",
     );
   } catch (err) {

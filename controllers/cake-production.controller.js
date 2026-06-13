@@ -8,6 +8,7 @@ const {
   TX,
   DIR,
   INV_TYPE,
+  LOCATION_TYPE,
   getUserId,
   writeAudit,
   writeLedger,
@@ -31,6 +32,10 @@ const populateRefs = (q) =>
     .populate("product_stock_id")
     .populate("location_id")
     .populate({
+      path: "store_receipt_id",
+      populate: { path: "to_location_id", select: "name location_type" },
+    })
+    .populate({
       path: "raw_materials_consumed.raw_material_id",
       select: "name unit",
     })
@@ -38,6 +43,53 @@ const populateRefs = (q) =>
       path: "raw_material_stock_id",
       populate: { path: "raw_material_id" },
     });
+
+async function resolveProductionLocation({ location_id, location, required = false }) {
+  if (location_id) {
+    const loc = await DispatchLocation.findById(location_id).where({
+      isDeleted: false,
+    });
+    if (!loc) {
+      const err = new Error("Production area not found.");
+      err.status = 404;
+      throw err;
+    }
+    if (Number(loc.location_type || LOCATION_TYPE.PRODUCTION_AREA) !== LOCATION_TYPE.PRODUCTION_AREA) {
+      const err = new Error(
+        "Selected location must be a production area. Add one under Stores & Locations.",
+      );
+      err.status = 400;
+      throw err;
+    }
+    return loc;
+  }
+
+  if ((location ?? "").trim()) {
+    const loc = await getOrCreateLocation(location);
+    if (!loc) {
+      const err = new Error("Production area not found.");
+      err.status = 404;
+      throw err;
+    }
+    if (Number(loc.location_type || LOCATION_TYPE.PRODUCTION_AREA) !== LOCATION_TYPE.PRODUCTION_AREA) {
+      const err = new Error(
+        "Location must be a production area. Select from Stores & Locations.",
+      );
+      err.status = 400;
+      throw err;
+    }
+    return loc;
+  }
+
+  if (required) {
+    const err = new Error(
+      "Production area is required. Log production from a configured production area.",
+    );
+    err.status = 400;
+    throw err;
+  }
+  return null;
+}
 
 const list = async (req, res) => {
   try {
@@ -128,6 +180,14 @@ async function applyProductionImpact({
     consumptions = bomResult.consumptions;
     const rawMaterialsUsed = bomResult.rawMaterialsUsed;
 
+    let fgStore = null;
+    if (productionLocation?.store_id) {
+      fgStore = await findFinishedGoodsStore(productionLocation.store_id, session);
+    }
+
+    const stockLocationId = fgStore?._id ?? productionLocation?._id ?? null;
+    const stockInvType = fgStore ? INV_TYPE.STORE : INV_TYPE.PRODUCTION;
+
     const [createdStock] = await ProductStock.create(
       [
         {
@@ -136,13 +196,13 @@ async function applyProductionImpact({
             .toISOString()
             .slice(0, 10)}${
             productionLocation?.name ? ` at ${productionLocation.name}` : ""
-          }`,
+          }${fgStore?.name ? ` → ${fgStore.name}` : ""}`,
           quantity: cakes,
           price: 0,
           total_price: 0,
           raw_materials_used: rawMaterialsUsed,
-          location_id: productionLocation?._id ?? null,
-          inventory_type: INV_TYPE.PRODUCTION,
+          location_id: stockLocationId,
+          inventory_type: stockInvType,
           isDeleted: false,
         },
       ],
@@ -158,46 +218,55 @@ async function applyProductionImpact({
     );
 
     if (productionLocation?._id) {
-      await adjustLocationInventory(
-        productionLocation._id,
-        product._id,
-        cakes,
-        INV_TYPE.PRODUCTION,
-        session,
-      );
-
-      if (productionLocation.store_id) {
-        const fgStore = await findFinishedGoodsStore(productionLocation.store_id, session);
-        if (fgStore?._id) {
-          storeReceipt = await executeStoreReceipt({
-            fromLocationId: productionLocation._id,
-            toLocationId: fgStore._id,
-            productId: product._id,
-            quantity: cakes,
-            receiptDate: productionDate,
-            userId,
-            referenceType: "CakeProduction",
-            referenceId,
-            notes: `Auto from ${productionLocation.name}`,
-            cakeProductionId: referenceId,
-            session,
-          });
-        }
+      if (fgStore?._id) {
+        await adjustLocationInventory(
+          productionLocation._id,
+          product._id,
+          cakes,
+          INV_TYPE.PRODUCTION,
+          session,
+        );
+        storeReceipt = await executeStoreReceipt({
+          fromLocationId: productionLocation._id,
+          toLocationId: fgStore._id,
+          productId: product._id,
+          quantity: cakes,
+          receiptDate: productionDate,
+          userId,
+          referenceType: "CakeProduction",
+          referenceId,
+          notes: `Auto from ${productionLocation.name}`,
+          cakeProductionId: referenceId,
+          session,
+        });
+      } else {
+        await adjustLocationInventory(
+          productionLocation._id,
+          product._id,
+          cakes,
+          INV_TYPE.PRODUCTION,
+          session,
+        );
       }
     }
 
+    const inventoryLocationId = fgStore?._id ?? productionLocation?._id ?? null;
     await writeLedger(
       {
         transactionType: TX.PRODUCTION_ENTRY,
         direction: DIR.IN,
         productId: product._id,
         quantity: cakes,
-        locationId: productionLocation?._id ?? null,
-        storeId: productionLocation?.store_id ?? null,
+        locationId: inventoryLocationId,
+        storeId: fgStore?.store_id ?? productionLocation?.store_id ?? null,
         referenceType: "CakeProduction",
         referenceId,
         userId,
-        notes: `Produced ${cakes} × ${product.name}`,
+        notes: fgStore
+          ? `Produced ${cakes} × ${product.name} at ${productionLocation?.name ?? "?"} → ${fgStore.name}`
+          : `Produced ${cakes} × ${product.name}${
+              productionLocation?.name ? ` at ${productionLocation.name}` : ""
+            }`,
         previousBalance: prevAvail,
         newBalance: Number(updatedProduct?.available_quantity ?? prevAvail + cakes),
       },
@@ -257,18 +326,14 @@ const create = async (req, res) => {
     }
 
     let productionLocation = null;
-    if (location_id) {
-      productionLocation = await DispatchLocation.findById(location_id).where({
-        isDeleted: false,
+    try {
+      productionLocation = await resolveProductionLocation({
+        location_id,
+        location,
+        required: cakes > 0,
       });
-      if (!productionLocation) {
-        return createError(res, 404, "Production location not found.");
-      }
-    } else if ((location ?? "").trim()) {
-      productionLocation = await getOrCreateLocation(location);
-      if (!productionLocation) {
-        return createError(res, 404, "Production location not found.");
-      }
+    } catch (err) {
+      return createError(res, err.status || 400, err.message);
     }
 
     const userId = getUserId(req);
@@ -377,19 +442,23 @@ const update = async (req, res) => {
         (location_id === null || location_id === "") &&
         (location === null || location === "" || location === undefined)
       ) {
+        if ((updatePayload.cakes_produced ?? existing.cakes_produced ?? 0) > 0) {
+          return createError(res, 400, "Production area is required when quantity is greater than 0.");
+        }
         updatePayload.location_id = null;
         updatePayload.location = "";
       } else {
-        const productionLocation = location_id
-          ? await DispatchLocation.findById(location_id).where({
-              isDeleted: false,
-            })
-          : await getOrCreateLocation(location);
-        if (!productionLocation) {
-          return createError(res, 404, "Production location not found.");
+        try {
+          const productionLocation = await resolveProductionLocation({
+            location_id,
+            location,
+            required: true,
+          });
+          updatePayload.location_id = productionLocation._id;
+          updatePayload.location = productionLocation.name;
+        } catch (err) {
+          return createError(res, err.status || 400, err.message);
         }
-        updatePayload.location_id = productionLocation._id;
-        updatePayload.location = productionLocation.name;
       }
     }
     if (notes !== undefined) updatePayload.notes = notes;
@@ -409,6 +478,15 @@ const update = async (req, res) => {
           res,
           422,
           "Product has no BOM. Configure raw material recipe before updating production.",
+        );
+      }
+      const effectiveLocationId =
+        updatePayload.location_id ?? existing.location_id ?? null;
+      if (!effectiveLocationId) {
+        return createError(
+          res,
+          400,
+          "Production area is required when quantity is greater than 0.",
         );
       }
     }
