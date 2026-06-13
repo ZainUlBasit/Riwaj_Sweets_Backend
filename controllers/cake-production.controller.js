@@ -14,9 +14,7 @@ const {
   writeLedger,
   adjustProduct,
   adjustLocationInventory,
-  consumeBomForProduction,
   reverseBomConsumption,
-  validateBomAvailability,
   findFinishedGoodsStore,
   executeStoreReceipt,
   reverseStoreReceipt,
@@ -166,20 +164,6 @@ async function applyProductionImpact({
   let storeReceipt = null;
 
   if (cakes > 0) {
-    const bomResult = await consumeBomForProduction({
-      product,
-      unitsProduced: cakes,
-      referenceType,
-      referenceId,
-      locationId: productionLocation?._id ?? null,
-      storeId: productionLocation?.store_id ?? null,
-      userId,
-      notesPrefix: `Production ${new Date(productionDate).toISOString().slice(0, 10)}`,
-      session,
-    });
-    consumptions = bomResult.consumptions;
-    const rawMaterialsUsed = bomResult.rawMaterialsUsed;
-
     let fgStore = null;
     if (productionLocation?.store_id) {
       fgStore = await findFinishedGoodsStore(productionLocation.store_id, session);
@@ -200,7 +184,7 @@ async function applyProductionImpact({
           quantity: cakes,
           price: 0,
           total_price: 0,
-          raw_materials_used: rawMaterialsUsed,
+          raw_materials_used: [],
           location_id: stockLocationId,
           inventory_type: stockInvType,
           isDeleted: false,
@@ -307,23 +291,6 @@ const create = async (req, res) => {
       isDeleted: false,
     });
     if (!product) return createError(res, 404, "Product not found.");
-
-    if (cakes > 0) {
-      const validation = await validateBomAvailability(product, cakes);
-      if (validation.missing) {
-        return createError(
-          res,
-          422,
-          "Product has no BOM (bill of materials). Configure raw material recipe on the product before logging production.",
-        );
-      }
-      if (!validation.ok) {
-        const detail = validation.shortages
-          .map((s) => `${s.name}: need ${s.required}, available ${s.available}`)
-          .join("; ");
-        return createError(res, 409, `Insufficient raw material stock. ${detail}`);
-      }
-    }
 
     let productionLocation = null;
     try {
@@ -472,14 +439,6 @@ const update = async (req, res) => {
       updatePayload.cakes_produced ?? existing.cakes_produced ?? 0;
 
     if (finalCakes > 0) {
-      const validation = await validateBomAvailability(finalProduct, finalCakes);
-      if (validation.missing) {
-        return createError(
-          res,
-          422,
-          "Product has no BOM. Configure raw material recipe before updating production.",
-        );
-      }
       const effectiveLocationId =
         updatePayload.location_id ?? existing.location_id ?? null;
       if (!effectiveLocationId) {

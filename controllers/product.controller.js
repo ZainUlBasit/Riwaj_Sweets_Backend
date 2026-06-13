@@ -42,51 +42,15 @@ const parseNonNegativeNumber = (value, { fallback = 0 } = {}) => {
   return num;
 };
 
-const parseBom = (body) => {
-  const raw = body?.bom;
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw === "string") {
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-  return [];
-};
-
-const resolveRawMaterialIdFromEntry = (entry) => {
-  const raw = entry?.rawMaterialId ?? entry?.raw_material_id;
-  if (!raw) return null;
-  if (typeof raw === "object" && raw._id) return String(raw._id);
-  return String(raw);
-};
-
-const normalizeBom = (entries) =>
-  (Array.isArray(entries) ? entries : [])
-    .map((e) => ({
-      rawMaterialId: resolveRawMaterialIdFromEntry(e),
-      quantity_required_per_unit: Number(
-        e.quantity_required_per_unit ?? e.quantity_used ?? 0,
-      ),
-    }))
-    .filter(
-      (e) => e.rawMaterialId && e.quantity_required_per_unit > 0,
-    );
-
 const list = async (req, res) => {
   try {
     const items = await Product.find({ isDeleted: false })
       .populate("category_id")
       .populate("counter_id")
-      .populate("bom.rawMaterialId", "name unit")
       .sort({ createdAt: -1 });
     const deletedItems = await Product.find({ isDeleted: true })
       .populate("category_id")
       .populate("counter_id")
-      .populate("bom.rawMaterialId", "name unit")
       .sort({ createdAt: -1 });
     return successMessage(
       res,
@@ -109,7 +73,6 @@ const getOne = async (req, res) => {
     const product = await Product.findById(req.params.id)
       .populate("category_id")
       .populate("counter_id")
-      .populate("bom.rawMaterialId", "name unit")
       .where({ isDeleted: false });
     if (!product) return createError(res, 404, "Product not found.");
     return successMessage(res, product, "Product fetched successfully.");
@@ -170,7 +133,6 @@ const create = async (req, res) => {
       in_quantity: inQty,
       out_quantity: outQty,
       available_quantity: availQty,
-      bom: normalizeBom(parseBom(req.body)),
       isDeleted: false,
     };
     if (imageUrl) payload.image = imageUrl;
@@ -239,9 +201,6 @@ const update = async (req, res) => {
     }
     if (counter_id !== undefined) {
       updatePayload.counter_id = counter_id || null;
-    }
-    if (req.body.bom !== undefined) {
-      updatePayload.bom = normalizeBom(parseBom(req.body));
     }
 
     // Image handling:
