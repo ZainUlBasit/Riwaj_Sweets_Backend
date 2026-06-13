@@ -58,7 +58,7 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, description } = req.body || {};
+    const { name, description, store_id, location_type } = req.body || {};
     const normalized = normalizeName(name);
     if (!normalized) return createError(res, 400, "name is required.");
 
@@ -74,6 +74,8 @@ const create = async (req, res) => {
     const item = await DispatchLocation.create({
       name: normalized,
       description: description ?? "",
+      store_id: store_id || null,
+      location_type: location_type != null ? Number(location_type) : 2,
       isDeleted: false,
     });
 
@@ -96,7 +98,7 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, description } = req.body || {};
+    const { name, description, store_id, location_type } = req.body || {};
     const updatePayload = { isDeleted: false };
 
     if (name !== undefined) {
@@ -110,6 +112,8 @@ const update = async (req, res) => {
       updatePayload.name = normalized;
     }
     if (description !== undefined) updatePayload.description = description;
+    if (store_id !== undefined) updatePayload.store_id = store_id || null;
+    if (location_type !== undefined) updatePayload.location_type = Number(location_type);
 
     const item = await DispatchLocation.findOneAndUpdate(
       { _id: req.params.id, isDeleted: false },

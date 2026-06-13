@@ -42,6 +42,33 @@ const parseNonNegativeNumber = (value, { fallback = 0 } = {}) => {
   return num;
 };
 
+const parseBom = (body) => {
+  const raw = body?.bom;
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+};
+
+const normalizeBom = (entries) =>
+  (Array.isArray(entries) ? entries : [])
+    .map((e) => ({
+      rawMaterialId: e.rawMaterialId || e.raw_material_id,
+      quantity_required_per_unit: Number(
+        e.quantity_required_per_unit ?? e.quantity_used ?? 0,
+      ),
+    }))
+    .filter(
+      (e) => e.rawMaterialId && e.quantity_required_per_unit > 0,
+    );
+
 const list = async (req, res) => {
   try {
     const items = await Product.find({ isDeleted: false })
@@ -133,6 +160,7 @@ const create = async (req, res) => {
       in_quantity: inQty,
       out_quantity: outQty,
       available_quantity: availQty,
+      bom: normalizeBom(parseBom(req.body)),
       isDeleted: false,
     };
     if (imageUrl) payload.image = imageUrl;
@@ -201,6 +229,9 @@ const update = async (req, res) => {
     }
     if (counter_id !== undefined) {
       updatePayload.counter_id = counter_id || null;
+    }
+    if (req.body.bom !== undefined) {
+      updatePayload.bom = normalizeBom(parseBom(req.body));
     }
 
     // Image handling:

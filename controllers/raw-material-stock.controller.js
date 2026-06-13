@@ -2,10 +2,28 @@ const RawMaterialStock = require("../Models/RawMaterialStock");
 const RawMaterial = require("../Models/RawMaterial");
 const Supplier = require("../Models/Supplier");
 const { createError, successMessage } = require("../utils/ResponseMessage");
+const {
+  TX,
+  DIR,
+  getUserId,
+  writeAudit,
+  writeLedger,
+  getRawMaterialAvailable,
+  adjustRawMaterial,
+  withTransaction,
+} = require("../Services/inventoryService");
 
 const list = async (req, res) => {
   try {
-    const items = await RawMaterialStock.find({ isDeleted: false })
+    const filter = { isDeleted: false };
+    if (req.query.raw_material_id) {
+      filter.raw_material_id = req.query.raw_material_id;
+    }
+    if (req.query.purpose) {
+      filter.purpose = Number(req.query.purpose);
+    }
+
+    const items = await RawMaterialStock.find(filter)
       .populate("raw_material_id")
       .sort({ createdAt: -1 });
     const deletedItems = await RawMaterialStock.find({ isDeleted: true })
@@ -54,9 +72,12 @@ const create = async (req, res) => {
     if (!raw_material_id) {
       return createError(res, 400, "raw_material_id is required.");
     }
-    const qty = quantity ?? 0;
-    const prc = price ?? 0;
-    const totalPrice = total_price ?? qty * prc;
+    const qty = Number(quantity ?? 0);
+    if (!qty || qty <= 0) {
+      return createError(res, 400, "quantity must be greater than 0.");
+    }
+    const prc = Number(price ?? 0);
+    const totalPrice = total_price != null ? Number(total_price) : qty * prc;
 
     const rawMaterial = await RawMaterial.findById(raw_material_id).where({
       isDeleted: false,
@@ -65,23 +86,65 @@ const create = async (req, res) => {
       return createError(res, 404, "Raw material not found.");
     }
 
-    const item = await RawMaterialStock.create({
-      raw_material_id,
-      desc: desc ?? "",
-      quantity: qty,
-      price: prc,
-      total_price: totalPrice,
-      isDeleted: false,
-    });
+    const userId = getUserId(req);
 
-    // Raw Material bhi increase karo
-    await RawMaterial.findByIdAndUpdate(raw_material_id, {
-      $inc: { in_quantity: qty, available_quantity: qty },
-    });
+    const item = await withTransaction(async (session) => {
+      const opts = { session };
+      const prevAvail = Number(rawMaterial.available_quantity || 0);
 
-    // Us raw material ke supplier ka total_amount aur payable increase karo
-    await Supplier.findByIdAndUpdate(rawMaterial.supplier_id, {
-      $inc: { total_amount: totalPrice, payable: totalPrice },
+      const [created] = await RawMaterialStock.create(
+        [
+          {
+            raw_material_id,
+            desc: desc ?? "",
+            quantity: qty,
+            price: prc,
+            total_price: totalPrice,
+            purpose: 1,
+            isDeleted: false,
+          },
+        ],
+        opts,
+      );
+
+      const updated = await adjustRawMaterial(
+        raw_material_id,
+        { inDelta: qty, availDelta: qty },
+        session,
+      );
+
+      await Supplier.findByIdAndUpdate(
+        rawMaterial.supplier_id,
+        { $inc: { total_amount: totalPrice, payable: totalPrice } },
+        opts,
+      );
+
+      await writeLedger(
+        {
+          transactionType: TX.RAW_MATERIAL_STOCK_IN,
+          direction: DIR.IN,
+          rawMaterialId: raw_material_id,
+          quantity: qty,
+          referenceType: "RawMaterialStock",
+          referenceId: created._id,
+          userId,
+          notes: desc || "Raw material purchase",
+          previousBalance: prevAvail,
+          newBalance: Number(updated?.available_quantity ?? prevAvail + qty),
+        },
+        session,
+      );
+
+      await writeAudit({
+        entityType: "RawMaterialStock",
+        entityId: created._id,
+        action: "create",
+        newValue: created.toObject?.() ?? created,
+        userId,
+        session,
+      });
+
+      return created;
     });
 
     return successMessage(
@@ -101,31 +164,43 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { raw_material_id, desc, quantity, price, total_price } = req.body;
-
-    // Purani entry fetch karo (old supplier ko decrement karne ke liye)
     const oldItem = await RawMaterialStock.findById(req.params.id).where({
       isDeleted: false,
     });
     if (!oldItem)
       return createError(res, 404, "Raw material stock entry not found.");
 
+    if (Number(oldItem.purpose) === 2) {
+      return createError(
+        res,
+        400,
+        "Production consumption entries cannot be edited. Delete and re-create production instead.",
+      );
+    }
+
+    const { raw_material_id, desc, quantity, price, total_price } = req.body;
+    const userId = getUserId(req);
+
     const oldTotalPrice = oldItem.total_price || 0;
     const oldRawMaterial = await RawMaterial.findById(
       oldItem.raw_material_id,
-    ).where({
-      isDeleted: false,
-    });
+    ).where({ isDeleted: false });
     if (oldRawMaterial) {
       await Supplier.findByIdAndUpdate(oldRawMaterial.supplier_id, {
         $inc: { total_amount: -oldTotalPrice, payable: -oldTotalPrice },
       });
+      await adjustRawMaterial(oldItem.raw_material_id, {
+        inDelta: -oldItem.quantity,
+        availDelta: -oldItem.quantity,
+      });
     }
 
-    // Naya total_price (body se ya quantity * price)
-    const qty = quantity ?? oldItem.quantity ?? 0;
-    const prc = price ?? oldItem.price ?? 0;
-    const newTotalPrice = total_price ?? qty * prc;
+    const qty = Number(quantity ?? oldItem.quantity ?? 0);
+    if (!qty || qty <= 0) {
+      return createError(res, 400, "quantity must be greater than 0.");
+    }
+    const prc = Number(price ?? oldItem.price ?? 0);
+    const newTotalPrice = total_price != null ? Number(total_price) : qty * prc;
 
     const newRawMaterialId = raw_material_id ?? oldItem.raw_material_id;
     const newRawMaterial = await RawMaterial.findById(newRawMaterialId).where({
@@ -134,6 +209,8 @@ const update = async (req, res) => {
     if (!newRawMaterial) {
       return createError(res, 404, "Raw material not found.");
     }
+
+    const prevAvail = await getRawMaterialAvailable(newRawMaterialId);
 
     const item = await RawMaterialStock.findByIdAndUpdate(
       req.params.id,
@@ -148,21 +225,35 @@ const update = async (req, res) => {
       { new: true, runValidators: true },
     );
 
-    // Naye supplier ka total_amount aur payable increase karo (jaise create mein)
     await Supplier.findByIdAndUpdate(newRawMaterial.supplier_id, {
       $inc: { total_amount: newTotalPrice, payable: newTotalPrice },
     });
 
-    // Raw Material bhi increase karo
-    await RawMaterial.findByIdAndUpdate(newRawMaterialId, {
-      $inc: { in_quantity: qty, available_quantity: qty },
+    const updated = await adjustRawMaterial(newRawMaterialId, {
+      inDelta: qty,
+      availDelta: qty,
     });
-    // Purani raw material bhi decrease karo
-    await RawMaterial.findByIdAndUpdate(oldItem.raw_material_id, {
-      $inc: {
-        in_quantity: -oldItem.quantity,
-        available_quantity: -oldItem.quantity,
-      },
+
+    await writeLedger({
+      transactionType: TX.ADJUSTMENT,
+      direction: DIR.IN,
+      rawMaterialId: newRawMaterialId,
+      quantity: qty,
+      referenceType: "RawMaterialStock",
+      referenceId: item._id,
+      userId,
+      notes: "Purchase stock entry updated",
+      previousBalance: prevAvail,
+      newBalance: Number(updated?.available_quantity ?? prevAvail + qty),
+    });
+
+    await writeAudit({
+      entityType: "RawMaterialStock",
+      entityId: item._id,
+      action: "update",
+      previousValue: oldItem.toObject?.() ?? oldItem,
+      newValue: item.toObject?.() ?? item,
+      userId,
     });
 
     return successMessage(
@@ -188,28 +279,56 @@ const remove = async (req, res) => {
     if (!item)
       return createError(res, 404, "Raw material stock entry not found.");
 
+    if (Number(item.purpose) === 2) {
+      return createError(
+        res,
+        400,
+        "Use DELETE /raw-material-stock/production/:id for production consumption entries.",
+      );
+    }
+
+    const userId = getUserId(req);
     const totalPrice = item.total_price || 0;
     const rawMaterial = await RawMaterial.findById(item.raw_material_id).where({
       isDeleted: false,
     });
+
     if (rawMaterial) {
       await Supplier.findByIdAndUpdate(rawMaterial.supplier_id, {
         $inc: { total_amount: -totalPrice, payable: -totalPrice },
       });
+      const prevAvail = Number(rawMaterial.available_quantity || 0);
+      const updated = await adjustRawMaterial(item.raw_material_id, {
+        inDelta: -item.quantity,
+        availDelta: -item.quantity,
+      });
+      await writeLedger({
+        transactionType: TX.ADJUSTMENT,
+        direction: DIR.OUT,
+        rawMaterialId: item.raw_material_id,
+        quantity: item.quantity,
+        referenceType: "RawMaterialStock",
+        referenceId: item._id,
+        userId,
+        notes: "Purchase stock entry deleted",
+        previousBalance: prevAvail,
+        newBalance: Number(updated?.available_quantity ?? prevAvail - item.quantity),
+      });
     }
 
-    // Raw Material bhi decrease karo
-    await RawMaterial.findByIdAndUpdate(item.raw_material_id, {
-      $inc: { in_quantity: -item.quantity, available_quantity: -item.quantity },
-    });
-
-    // Soft-delete the stock entry. The active-doc filter above guarantees
-    // the inventory reversal runs at most once per entry.
     const deleted = await RawMaterialStock.findOneAndUpdate(
       { _id: req.params.id, isDeleted: false },
       { isDeleted: true },
-      { new: true }
+      { new: true },
     );
+
+    await writeAudit({
+      entityType: "RawMaterialStock",
+      entityId: item._id,
+      action: "delete",
+      previousValue: item.toObject?.() ?? item,
+      userId,
+    });
 
     return successMessage(
       res,
@@ -226,19 +345,6 @@ const remove = async (req, res) => {
   }
 };
 
-/**
- * POST /api/raw-material-stock/production
- *
- * Allocates raw material to production. Creates a stock entry with
- * `purpose: 2` (production), decrements `available_quantity` and increments
- * `out_quantity` on the parent RawMaterial. Does NOT touch supplier ledgers
- * (production allocation is not a new purchase).
- *
- * The existing `POST /` flow remains the canonical purchase path and is
- * untouched, so this is purely additive.
- *
- * Body: { raw_material_id, quantity, desc?, price?, total_price? }
- */
 const createProduction = async (req, res) => {
   try {
     const { raw_material_id, desc, quantity, price, total_price } = req.body;
@@ -251,6 +357,7 @@ const createProduction = async (req, res) => {
     }
     const prc = Number(price ?? 0);
     const totalPrice = total_price != null ? Number(total_price) : qty * prc;
+    const userId = getUserId(req);
 
     const rawMaterial = await RawMaterial.findById(raw_material_id).where({
       isDeleted: false,
@@ -277,10 +384,31 @@ const createProduction = async (req, res) => {
       isDeleted: false,
     });
 
-    // Production allocation: out_quantity ↑, available_quantity ↓.
-    // No supplier impact (this is not a purchase).
-    await RawMaterial.findByIdAndUpdate(raw_material_id, {
-      $inc: { out_quantity: qty, available_quantity: -qty },
+    const updated = await adjustRawMaterial(raw_material_id, {
+      outDelta: qty,
+      availDelta: -qty,
+    });
+
+    await writeLedger({
+      transactionType: TX.RAW_MATERIAL_ALLOCATION,
+      direction: DIR.OUT,
+      rawMaterialId: raw_material_id,
+      quantity: qty,
+      referenceType: "RawMaterialStock",
+      referenceId: item._id,
+      userId,
+      notes: desc || "Manual production allocation",
+      previousBalance: available,
+      newBalance: Number(updated?.available_quantity ?? available - qty),
+    });
+
+    await writeAudit({
+      entityType: "RawMaterialStock",
+      entityId: item._id,
+      action: "create",
+      newValue: item.toObject?.() ?? item,
+      userId,
+      notes: "Production allocation",
     });
 
     return successMessage(
@@ -298,14 +426,6 @@ const createProduction = async (req, res) => {
   }
 };
 
-/**
- * DELETE /api/raw-material-stock/production/:id
- *
- * Soft-deletes a production-purpose stock entry and reverses its inventory
- * impact (restores available_quantity, decrements out_quantity). Refuses to
- * touch entries with purpose=1 so the existing remove flow keeps owning
- * purchase reversals.
- */
 const removeProduction = async (req, res) => {
   try {
     const item = await RawMaterialStock.findById(req.params.id).where({
@@ -321,9 +441,11 @@ const removeProduction = async (req, res) => {
       );
     }
 
-    // Reverse the production allocation against RawMaterial.
-    await RawMaterial.findByIdAndUpdate(item.raw_material_id, {
-      $inc: { out_quantity: -item.quantity, available_quantity: item.quantity },
+    const userId = getUserId(req);
+    const prevAvail = await getRawMaterialAvailable(item.raw_material_id);
+    const updated = await adjustRawMaterial(item.raw_material_id, {
+      outDelta: -item.quantity,
+      availDelta: item.quantity,
     });
 
     const deleted = await RawMaterialStock.findOneAndUpdate(
@@ -331,6 +453,28 @@ const removeProduction = async (req, res) => {
       { isDeleted: true },
       { new: true },
     );
+
+    await writeLedger({
+      transactionType: TX.ADJUSTMENT,
+      direction: DIR.IN,
+      rawMaterialId: item.raw_material_id,
+      quantity: item.quantity,
+      referenceType: "RawMaterialStock",
+      referenceId: item._id,
+      userId,
+      notes: "Production allocation reversed",
+      previousBalance: prevAvail,
+      newBalance: Number(updated?.available_quantity ?? prevAvail + item.quantity),
+    });
+
+    await writeAudit({
+      entityType: "RawMaterialStock",
+      entityId: item._id,
+      action: "delete",
+      previousValue: item.toObject?.() ?? item,
+      userId,
+      notes: "Production allocation reversed",
+    });
 
     return successMessage(
       res,

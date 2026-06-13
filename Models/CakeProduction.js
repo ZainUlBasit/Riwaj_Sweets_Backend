@@ -65,6 +65,22 @@ const CakeProductionSchema = new Schema(
       default: null,
       index: true,
     },
+    /** Auto-generated consumption rows (BOM) — used to reverse on edit/delete. */
+    raw_materials_consumed: [
+      {
+        raw_material_id: {
+          type: Schema.Types.ObjectId,
+          ref: "RawMaterial",
+          required: true,
+        },
+        quantity: { type: Number, required: true, min: 0 },
+        stock_entry_id: {
+          type: Schema.Types.ObjectId,
+          ref: "RawMaterialStock",
+          default: null,
+        },
+      },
+    ],
     notes: {
       type: String,
       default: "",

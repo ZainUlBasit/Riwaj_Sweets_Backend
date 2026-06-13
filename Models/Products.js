@@ -57,6 +57,11 @@ const ProductSchema = new Schema(
       ref: "Counter",
       required: false,
     },
+    /** Bill of materials — raw material qty required per 1 unit of finished product. */
+    bom: {
+      type: [BomEntrySchema],
+      default: [],
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {

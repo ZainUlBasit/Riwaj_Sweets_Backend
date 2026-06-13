@@ -58,7 +58,7 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, supplier_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
+    const { name, supplier_id, price, unit } = req.body;
     const item = await RawMaterial.findByIdAndUpdate(
       req.params.id,
       {
@@ -66,9 +66,6 @@ const update = async (req, res) => {
         supplier_id,
         price,
         unit,
-        in_quantity,
-        out_quantity,
-        available_quantity,
         isDeleted: false,
       },
       { new: true, runValidators: true }

@@ -40,6 +40,19 @@ const ProductStockSchema = new Schema(
     total_price: requiredNumberWithDefault,
     // Is stock entry mein kaun kaun se raw materials kitni quantity use hue
     raw_materials_used: [RawMaterialUsedSchema],
+    /** Production area where this stock is held (null = global/unassigned). */
+    location_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "DispatchLocation",
+      default: null,
+      index: true,
+    },
+    /** 1 = production inventory, 2 = shop inventory */
+    inventory_type: {
+      type: Number,
+      enum: [1, 2],
+      default: 1,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {

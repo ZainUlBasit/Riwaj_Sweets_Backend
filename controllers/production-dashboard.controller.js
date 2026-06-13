@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const CakeProduction = require("../Models/CakeProduction");
 const RawMaterialStock = require("../Models/RawMaterialStock");
 const RawMaterialDispatch = require("../Models/RawMaterialDispatch");
+const InventoryLedger = require("../Models/InventoryLedger");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 
 /**
@@ -174,12 +175,27 @@ const getSummary = async (req, res) => {
     ]);
     const totalCakeOutput = Number(outputAgg?.[0]?.totalCakes || 0);
 
-    // ---- 5. Efficiency: output / input -----------------------------------
+    // ---- 5. Efficiency note (units may differ — cakes vs kg/litre) ------
     let efficiency = "N/A";
-    if (totalRawMaterialInput > 0) {
+    let efficiencyNote =
+      "Compares total cakes produced vs total raw material units consumed (mixed units).";
+    if (totalRawMaterialInput > 0 && totalCakeOutput > 0) {
       const ratio = totalCakeOutput / totalRawMaterialInput;
       efficiency = Number.isFinite(ratio) ? ratio.toFixed(2) : "N/A";
     }
+
+    // Consumption from ledger (more accurate than purpose=2 stock alone)
+    const consumptionAgg = await InventoryLedger.aggregate([
+      {
+        $match: {
+          isDeleted: false,
+          transaction_type: 2,
+          ...(hasRange ? { createdAt: range } : {}),
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$quantity" } } },
+    ]);
+    const totalRawMaterialConsumed = Number(consumptionAgg?.[0]?.total || 0);
 
     return successMessage(
       res,
@@ -188,8 +204,10 @@ const getSummary = async (req, res) => {
         rawMaterialDispatch: rawMaterialDispatchRaw,
         locationProductionOutput: locationProductionOutputRaw,
         totalRawMaterialInput,
+        totalRawMaterialConsumed,
         totalCakeOutput,
         efficiency,
+        efficiencyNote,
         range: hasRange
           ? {
               start_date: start_date ?? null,

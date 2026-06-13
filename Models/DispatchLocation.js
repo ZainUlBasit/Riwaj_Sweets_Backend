@@ -25,6 +25,25 @@ const DispatchLocationSchema = new Schema(
       default: "",
       trim: true,
     },
+    /** Parent store — optional for legacy rows. */
+    store_id: {
+      type: Schema.Types.ObjectId,
+      ref: "Store",
+      default: null,
+      index: true,
+    },
+    /**
+     * Location role within a store:
+     *   1 = raw material store (central RM storage)
+     *   2 = production area (default for legacy rows)
+     *   3 = shop / outlet
+     */
+    location_type: {
+      type: Number,
+      enum: [1, 2, 3],
+      default: 2,
+      index: true,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   { timestamps: true },
