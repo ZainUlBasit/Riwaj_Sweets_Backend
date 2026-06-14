@@ -5,6 +5,7 @@ const Product = require("../Models/Products");
 const InventoryLedger = require("../Models/InventoryLedger");
 const InventoryAuditLog = require("../Models/InventoryAuditLog");
 const LocationInventory = require("../Models/LocationInventory");
+const LocationRawMaterialInventory = require("../Models/LocationRawMaterialInventory");
 const DispatchLocation = require("../Models/DispatchLocation");
 const ProductStoreReceipt = require("../Models/ProductStoreReceipt");
 
@@ -49,6 +50,329 @@ async function findFinishedGoodsStore(storeId, session = null) {
   });
   if (session) q.session(session);
   return q;
+}
+
+async function findRmStoreForGodown(storeId, session = null) {
+  if (!storeId) return null;
+  const q = DispatchLocation.findOne({
+    store_id: storeId,
+    location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
+    isDeleted: false,
+  });
+  if (session) q.session(session);
+  return q;
+}
+
+async function getLocationRawMaterialQty(
+  locationId,
+  rawMaterialId,
+  session = null,
+) {
+  const q = LocationRawMaterialInventory.findOne({
+    location_id: locationId,
+    raw_material_id: rawMaterialId,
+    isDeleted: false,
+  });
+  if (session) q.session(session);
+  const row = await q;
+  return row ? Number(row.quantity || 0) : 0;
+}
+
+async function adjustLocationRawMaterialInventory(
+  locationId,
+  rawMaterialId,
+  delta,
+  session = null,
+) {
+  const opts = session ? { session } : {};
+  const filter = {
+    location_id: locationId,
+    raw_material_id: rawMaterialId,
+    isDeleted: false,
+  };
+  let row = await LocationRawMaterialInventory.findOne(filter);
+  if (session) row = await LocationRawMaterialInventory.findOne(filter).session(session);
+
+  if (!row) {
+    if (delta < 0) {
+      const err = new Error("Insufficient raw material at this location.");
+      err.status = 409;
+      throw err;
+    }
+    const [created] = await LocationRawMaterialInventory.create(
+      [
+        {
+          location_id: locationId,
+          raw_material_id: rawMaterialId,
+          quantity: delta,
+          isDeleted: false,
+        },
+      ],
+      opts,
+    );
+    return created;
+  }
+
+  const nextQty = Number(row.quantity || 0) + delta;
+  if (nextQty < 0) {
+    const err = new Error(
+      `Insufficient raw material at location. Available: ${row.quantity}, requested: ${Math.abs(delta)}.`,
+    );
+    err.status = 409;
+    throw err;
+  }
+
+  row.quantity = nextQty;
+  if (session) await row.save({ session });
+  else await row.save();
+  return row;
+}
+
+async function validateRmTransferLocations(fromLocationId, toLocationId, session = null) {
+  const fromQ = DispatchLocation.findById(fromLocationId).where({ isDeleted: false });
+  const toQ = DispatchLocation.findById(toLocationId).where({ isDeleted: false });
+  if (session) {
+    fromQ.session(session);
+    toQ.session(session);
+  }
+  const [fromLoc, toLoc] = await Promise.all([fromQ, toQ]);
+  if (!fromLoc) {
+    const err = new Error("RM Store (source) not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (!toLoc) {
+    const err = new Error("Production area (destination) not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (Number(fromLoc.location_type) !== LOCATION_TYPE.RAW_MATERIAL_STORE) {
+    const err = new Error("Source must be a Raw Material Store.");
+    err.status = 400;
+    throw err;
+  }
+  if (Number(toLoc.location_type) !== LOCATION_TYPE.PRODUCTION_AREA) {
+    const err = new Error("Destination must be a Production Area.");
+    err.status = 400;
+    throw err;
+  }
+  if (
+    fromLoc.store_id &&
+    toLoc.store_id &&
+    String(fromLoc.store_id) !== String(toLoc.store_id)
+  ) {
+    const err = new Error("RM Store and Production Area must belong to the same godown.");
+    err.status = 400;
+    throw err;
+  }
+  return { fromLoc, toLoc };
+}
+
+async function validateRmStoreLocation(locationId, session = null) {
+  const q = DispatchLocation.findById(locationId).where({ isDeleted: false });
+  if (session) q.session(session);
+  const loc = await q;
+  if (!loc) {
+    const err = new Error("RM Store location not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (Number(loc.location_type) !== LOCATION_TYPE.RAW_MATERIAL_STORE) {
+    const err = new Error("Selected location must be a Raw Material Store.");
+    err.status = 400;
+    throw err;
+  }
+  return loc;
+}
+
+/**
+ * Credit RM Store when a purchase is recorded.
+ */
+async function creditRmStoreOnPurchase({
+  rmStoreLocationId,
+  rawMaterialId,
+  quantity,
+  referenceType,
+  referenceId,
+  userId = null,
+  notes = "",
+  session = null,
+}) {
+  const qty = Number(quantity);
+  if (!rmStoreLocationId || !qty || qty <= 0) return null;
+
+  const loc = await validateRmStoreLocation(rmStoreLocationId, session);
+  const prevQty = await getLocationRawMaterialQty(
+    rmStoreLocationId,
+    rawMaterialId,
+    session,
+  );
+  await adjustLocationRawMaterialInventory(
+    rmStoreLocationId,
+    rawMaterialId,
+    qty,
+    session,
+  );
+
+  await writeLedger(
+    {
+      transactionType: TX.RAW_MATERIAL_STOCK_IN,
+      direction: DIR.IN,
+      rawMaterialId,
+      quantity: qty,
+      locationId: rmStoreLocationId,
+      storeId: loc.store_id ?? null,
+      referenceType,
+      referenceId,
+      userId,
+      notes: notes || "Purchase credited to RM Store",
+      previousBalance: prevQty,
+      newBalance: prevQty + qty,
+    },
+    session,
+  );
+
+  return loc;
+}
+
+/**
+ * Manually consume raw materials at a production area (no BOM).
+ */
+async function applyManualProductionConsumption({
+  rawMaterialsConsumed,
+  productionLocationId,
+  referenceType,
+  referenceId,
+  userId = null,
+  notesPrefix = "Production consumption",
+  session = null,
+}) {
+  if (!Array.isArray(rawMaterialsConsumed) || !rawMaterialsConsumed.length) {
+    return [];
+  }
+
+  const prodQ = DispatchLocation.findById(productionLocationId).where({
+    isDeleted: false,
+  });
+  if (session) prodQ.session(session);
+  const prodLoc = await prodQ;
+  if (!prodLoc) {
+    const err = new Error("Production area not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (Number(prodLoc.location_type) !== LOCATION_TYPE.PRODUCTION_AREA) {
+    const err = new Error("Consumption must be logged at a production area.");
+    err.status = 400;
+    throw err;
+  }
+
+  const consumptions = [];
+
+  for (const row of rawMaterialsConsumed) {
+    const rmId =
+      row.raw_material_id?._id ?? row.raw_material_id ?? row.rawMaterialId;
+    const qty = Number(row.quantity ?? 0);
+    if (!rmId || !qty || qty <= 0) continue;
+
+    const prevQty = await getLocationRawMaterialQty(
+      productionLocationId,
+      rmId,
+      session,
+    );
+    if (qty > prevQty) {
+      const rmQ = RawMaterial.findById(rmId).where({ isDeleted: false });
+      if (session) rmQ.session(session);
+      const rm = await rmQ;
+      const err = new Error(
+        `Insufficient raw material at production area${rm?.name ? ` (${rm.name})` : ""}. Available: ${prevQty}, requested: ${qty}.`,
+      );
+      err.status = 409;
+      throw err;
+    }
+
+    await adjustLocationRawMaterialInventory(
+      productionLocationId,
+      rmId,
+      -qty,
+      session,
+    );
+
+    await writeLedger(
+      {
+        transactionType: TX.RAW_MATERIAL_CONSUMPTION,
+        direction: DIR.OUT,
+        rawMaterialId: rmId,
+        quantity: qty,
+        locationId: productionLocationId,
+        storeId: prodLoc.store_id ?? null,
+        referenceType,
+        referenceId,
+        userId,
+        notes: notesPrefix,
+        previousBalance: prevQty,
+        newBalance: prevQty - qty,
+      },
+      session,
+    );
+
+    consumptions.push({ raw_material_id: rmId, quantity: qty, stock_entry_id: null });
+  }
+
+  return consumptions;
+}
+
+async function reverseManualProductionConsumption(
+  consumptions,
+  productionLocationId,
+  userId = null,
+  session = null,
+) {
+  if (!Array.isArray(consumptions) || !consumptions.length || !productionLocationId) {
+    return;
+  }
+
+  const prodQ = DispatchLocation.findById(productionLocationId).where({
+    isDeleted: false,
+  });
+  if (session) prodQ.session(session);
+  const prodLoc = await prodQ;
+
+  for (const row of consumptions) {
+    const rmId = row.raw_material_id?._id ?? row.raw_material_id;
+    const qty = Number(row.quantity || 0);
+    if (!rmId || qty <= 0) continue;
+
+    const prevQty = await getLocationRawMaterialQty(
+      productionLocationId,
+      rmId,
+      session,
+    );
+    await adjustLocationRawMaterialInventory(
+      productionLocationId,
+      rmId,
+      qty,
+      session,
+    );
+
+    await writeLedger(
+      {
+        transactionType: TX.ADJUSTMENT,
+        direction: DIR.IN,
+        rawMaterialId: rmId,
+        quantity: qty,
+        locationId: productionLocationId,
+        storeId: prodLoc?.store_id ?? null,
+        referenceType: "CakeProduction",
+        referenceId: null,
+        userId,
+        notes: "Production consumption reversed",
+        previousBalance: prevQty,
+        newBalance: prevQty + qty,
+      },
+      session,
+    );
+  }
 }
 
 function getUserId(req) {
@@ -438,11 +762,14 @@ async function reverseBomConsumption(consumptions, userId = null, session = null
 }
 
 /**
- * Apply inventory impact when raw material is dispatched to a location.
+ * Apply inventory impact when raw material is dispatched RM Store → Production Area.
+ * Legacy rows without fromLocationId still deduct global stock (generated_stock_id).
  */
 async function applyRawMaterialDispatchImpact({
   rawMaterialId,
   quantity,
+  fromLocationId = null,
+  toLocationId = null,
   locationId = null,
   storeId = null,
   referenceId,
@@ -456,6 +783,81 @@ async function applyRawMaterialDispatchImpact({
     const err = new Error("quantity must be greater than 0.");
     err.status = 400;
     throw err;
+  }
+
+  const destId = toLocationId || locationId;
+  if (fromLocationId && destId) {
+    const { fromLoc, toLoc } = await validateRmTransferLocations(
+      fromLocationId,
+      destId,
+      session,
+    );
+
+    const fromPrev = await getLocationRawMaterialQty(
+      fromLocationId,
+      rawMaterialId,
+      session,
+    );
+    if (qty > fromPrev) {
+      const err = new Error(
+        `Insufficient stock at RM Store. Available: ${fromPrev}, requested: ${qty}.`,
+      );
+      err.status = 409;
+      throw err;
+    }
+
+    await adjustLocationRawMaterialInventory(
+      fromLocationId,
+      rawMaterialId,
+      -qty,
+      session,
+    );
+    await adjustLocationRawMaterialInventory(
+      destId,
+      rawMaterialId,
+      qty,
+      session,
+    );
+
+    const toPrev = await getLocationRawMaterialQty(destId, rawMaterialId, session);
+
+    await writeLedger(
+      {
+        transactionType: TX.RAW_MATERIAL_DISPATCH,
+        direction: DIR.OUT,
+        rawMaterialId,
+        quantity: qty,
+        locationId: fromLocationId,
+        storeId: fromLoc.store_id ?? storeId ?? null,
+        referenceType: "RawMaterialDispatch",
+        referenceId,
+        userId,
+        notes: notes || `Dispatch to ${toLoc.name}`,
+        previousBalance: fromPrev,
+        newBalance: fromPrev - qty,
+      },
+      session,
+    );
+
+    await writeLedger(
+      {
+        transactionType: TX.RAW_MATERIAL_DISPATCH,
+        direction: DIR.IN,
+        rawMaterialId,
+        quantity: qty,
+        locationId: destId,
+        storeId: toLoc.store_id ?? storeId ?? null,
+        referenceType: "RawMaterialDispatch",
+        referenceId,
+        userId,
+        notes: notes || `Received from ${fromLoc.name}`,
+        previousBalance: toPrev - qty,
+        newBalance: toPrev,
+      },
+      session,
+    );
+
+    return { generatedStockId: null };
   }
 
   const prevAvail = await getRawMaterialAvailable(rawMaterialId, session);
@@ -494,7 +896,7 @@ async function applyRawMaterialDispatchImpact({
       direction: DIR.OUT,
       rawMaterialId,
       quantity: qty,
-      locationId,
+      locationId: destId,
       storeId,
       referenceType: "RawMaterialDispatch",
       referenceId,
@@ -514,6 +916,9 @@ async function reverseRawMaterialDispatchImpact(
   {
     rawMaterialId,
     quantity,
+    fromLocationId = null,
+    toLocationId = null,
+    locationId = null,
     generatedStockId = null,
     referenceId = null,
   },
@@ -522,7 +927,77 @@ async function reverseRawMaterialDispatchImpact(
 ) {
   const opts = session ? { session } : {};
   const qty = Number(quantity || 0);
-  if (!qty || qty <= 0 || !generatedStockId) return;
+  if (!qty || qty <= 0) return;
+
+  const destId = toLocationId || locationId;
+
+  if (fromLocationId && destId) {
+    const fromPrev = await getLocationRawMaterialQty(
+      fromLocationId,
+      rawMaterialId,
+      session,
+    );
+    await adjustLocationRawMaterialInventory(
+      fromLocationId,
+      rawMaterialId,
+      qty,
+      session,
+    );
+    await adjustLocationRawMaterialInventory(
+      destId,
+      rawMaterialId,
+      -qty,
+      session,
+    );
+
+    const fromLocQ = DispatchLocation.findById(fromLocationId);
+    const toLocQ = DispatchLocation.findById(destId);
+    if (session) {
+      fromLocQ.session(session);
+      toLocQ.session(session);
+    }
+    const [fromLoc, toLoc] = await Promise.all([fromLocQ, toLocQ]);
+
+    await writeLedger(
+      {
+        transactionType: TX.ADJUSTMENT,
+        direction: DIR.IN,
+        rawMaterialId,
+        quantity: qty,
+        locationId: fromLocationId,
+        storeId: fromLoc?.store_id ?? null,
+        referenceType: "RawMaterialDispatch",
+        referenceId,
+        userId,
+        notes: "Raw material dispatch reversed",
+        previousBalance: fromPrev,
+        newBalance: fromPrev + qty,
+      },
+      session,
+    );
+
+    const toPrev = await getLocationRawMaterialQty(destId, rawMaterialId, session);
+    await writeLedger(
+      {
+        transactionType: TX.ADJUSTMENT,
+        direction: DIR.OUT,
+        rawMaterialId,
+        quantity: qty,
+        locationId: destId,
+        storeId: toLoc?.store_id ?? null,
+        referenceType: "RawMaterialDispatch",
+        referenceId,
+        userId,
+        notes: "Raw material dispatch reversed",
+        previousBalance: toPrev + qty,
+        newBalance: toPrev,
+      },
+      session,
+    );
+    return;
+  }
+
+  if (!generatedStockId) return;
 
   const stockQ = RawMaterialStock.findById(generatedStockId);
   if (session) stockQ.session(session);
@@ -751,6 +1226,14 @@ module.exports = {
   adjustLocationInventory,
   getInventoryTypeForLocation,
   findFinishedGoodsStore,
+  findRmStoreForGodown,
+  getLocationRawMaterialQty,
+  adjustLocationRawMaterialInventory,
+  validateRmTransferLocations,
+  validateRmStoreLocation,
+  creditRmStoreOnPurchase,
+  applyManualProductionConsumption,
+  reverseManualProductionConsumption,
   executeStoreReceipt,
   reverseStoreReceipt,
   applyRawMaterialDispatchImpact,

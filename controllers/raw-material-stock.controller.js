@@ -1,6 +1,7 @@
 const RawMaterialStock = require("../Models/RawMaterialStock");
 const RawMaterial = require("../Models/RawMaterial");
 const Supplier = require("../Models/Supplier");
+const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const {
   TX,
@@ -10,6 +11,7 @@ const {
   writeLedger,
   getRawMaterialAvailable,
   adjustRawMaterial,
+  creditRmStoreOnPurchase,
   withTransaction,
 } = require("../Services/inventoryService");
 
@@ -68,7 +70,14 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { raw_material_id, desc, quantity, price, total_price } = req.body;
+    const {
+      raw_material_id,
+      desc,
+      quantity,
+      price,
+      total_price,
+      rm_store_location_id,
+    } = req.body;
     if (!raw_material_id) {
       return createError(res, 400, "raw_material_id is required.");
     }
@@ -84,6 +93,22 @@ const create = async (req, res) => {
     });
     if (!rawMaterial) {
       return createError(res, 404, "Raw material not found.");
+    }
+
+    if (rm_store_location_id) {
+      const loc = await DispatchLocation.findById(rm_store_location_id).where({
+        isDeleted: false,
+      });
+      if (!loc) {
+        return createError(res, 404, "RM Store location not found.");
+      }
+      if (Number(loc.location_type) !== 1) {
+        return createError(
+          res,
+          400,
+          "rm_store_location_id must be a Raw Material Store.",
+        );
+      }
     }
 
     const userId = getUserId(req);
@@ -118,6 +143,19 @@ const create = async (req, res) => {
         { $inc: { total_amount: totalPrice, payable: totalPrice } },
         opts,
       );
+
+      if (rm_store_location_id) {
+        await creditRmStoreOnPurchase({
+          rmStoreLocationId: rm_store_location_id,
+          rawMaterialId: raw_material_id,
+          quantity: qty,
+          referenceType: "RawMaterialStock",
+          referenceId: created._id,
+          userId,
+          notes: desc || "Raw material purchase",
+          session,
+        });
+      }
 
       await writeLedger(
         {

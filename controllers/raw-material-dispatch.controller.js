@@ -11,6 +11,7 @@ const {
   writeAudit,
   applyRawMaterialDispatchImpact,
   reverseRawMaterialDispatchImpact,
+  validateRmTransferLocations,
   withTransaction,
 } = require("../Services/inventoryService");
 
@@ -19,6 +20,7 @@ const populateRefs = (q) =>
     .populate("raw_material_id")
     .populate("raw_material_stock_id")
     .populate("generated_stock_id")
+    .populate("from_location_id")
     .populate("location_id");
 
 /**
@@ -96,6 +98,7 @@ const create = async (req, res) => {
     const {
       location,
       location_id,
+      from_location_id,
       raw_material_id,
       raw_material_stock_id,
       quantity,
@@ -103,8 +106,19 @@ const create = async (req, res) => {
       notes,
     } = req.body || {};
 
+    if (!from_location_id) {
+      return createError(
+        res,
+        400,
+        "from_location_id (RM Store) is required.",
+      );
+    }
     if (!location_id && (!location || !String(location).trim())) {
-      return createError(res, 400, "location is required.");
+      return createError(
+        res,
+        400,
+        "location_id (Production Area) is required.",
+      );
     }
     if (!raw_material_id) {
       return createError(res, 400, "raw_material_id is required.");
@@ -133,25 +147,39 @@ const create = async (req, res) => {
       }
     }
 
-    const dispatchLocation = location_id
+    const fromLocation = await DispatchLocation.findById(from_location_id).where({
+      isDeleted: false,
+    });
+    if (!fromLocation) {
+      return createError(res, 404, "RM Store not found.");
+    }
+
+    const toLocation = location_id
       ? await DispatchLocation.findById(location_id).where({ isDeleted: false })
       : await getOrCreateLocation(location);
-    if (!dispatchLocation) {
-      return createError(res, 404, "Dispatch location not found.");
+    if (!toLocation) {
+      return createError(res, 404, "Production area not found.");
+    }
+
+    try {
+      await validateRmTransferLocations(fromLocation._id, toLocation._id);
+    } catch (err) {
+      return createError(res, err.status || 400, err.message);
     }
 
     const userId = getUserId(req);
     const dispatchNotes =
       notes?.trim() ||
-      `Dispatch to ${dispatchLocation.name}${raw_material_stock_id ? " (batch ref)" : ""}`;
+      `RM Store → ${toLocation.name}${raw_material_stock_id ? " (batch ref)" : ""}`;
 
     const item = await withTransaction(async (session) => {
       const opts = { session };
       const [created] = await RawMaterialDispatch.create(
         [
           {
-            location_id: dispatchLocation._id,
-            location: dispatchLocation.name,
+            from_location_id: fromLocation._id,
+            location_id: toLocation._id,
+            location: toLocation.name,
             raw_material_id,
             raw_material_stock_id: raw_material_stock_id || null,
             quantity: qty,
@@ -163,19 +191,17 @@ const create = async (req, res) => {
         opts,
       );
 
-      const { generatedStockId } = await applyRawMaterialDispatchImpact({
+      await applyRawMaterialDispatchImpact({
         rawMaterialId: raw_material_id,
         quantity: qty,
-        locationId: dispatchLocation._id,
-        storeId: dispatchLocation.store_id ?? null,
+        fromLocationId: fromLocation._id,
+        toLocationId: toLocation._id,
+        storeId: fromLocation.store_id ?? toLocation.store_id ?? null,
         referenceId: created._id,
         userId,
         notes: dispatchNotes,
         session,
       });
-
-      created.generated_stock_id = generatedStockId;
-      await created.save(opts);
 
       await writeAudit({
         entityType: "RawMaterialDispatch",
@@ -216,6 +242,7 @@ const update = async (req, res) => {
     const {
       location,
       location_id,
+      from_location_id,
       raw_material_id,
       raw_material_stock_id,
       quantity,
@@ -225,9 +252,20 @@ const update = async (req, res) => {
 
     const updatePayload = { isDeleted: false };
 
+    if (from_location_id !== undefined) {
+      if (!from_location_id) {
+        return createError(res, 400, "from_location_id (RM Store) cannot be empty.");
+      }
+      const fromLoc = await DispatchLocation.findById(from_location_id).where({
+        isDeleted: false,
+      });
+      if (!fromLoc) return createError(res, 404, "RM Store not found.");
+      updatePayload.from_location_id = fromLoc._id;
+    }
+
     if (location_id !== undefined || location !== undefined) {
       if (!location_id && !String(location ?? "").trim()) {
-        return createError(res, 400, "location cannot be empty.");
+        return createError(res, 400, "Production area cannot be empty.");
       }
       const dispatchLocation = location_id
         ? await DispatchLocation.findById(location_id).where({
@@ -235,7 +273,7 @@ const update = async (req, res) => {
           })
         : await getOrCreateLocation(location);
       if (!dispatchLocation) {
-        return createError(res, 404, "Dispatch location not found.");
+        return createError(res, 404, "Production area not found.");
       }
       updatePayload.location_id = dispatchLocation._id;
       updatePayload.location = dispatchLocation.name;
@@ -272,10 +310,36 @@ const update = async (req, res) => {
 
     const userId = getUserId(req);
 
+    const finalFromId =
+      updatePayload.from_location_id ?? existing.from_location_id ?? null;
+    const finalToId =
+      updatePayload.location_id ?? existing.location_id ?? null;
+
+    if (finalFromId && finalToId) {
+      try {
+        await validateRmTransferLocations(finalFromId, finalToId);
+      } catch (err) {
+        return createError(res, err.status || 400, err.message);
+      }
+    }
+
     const item = await withTransaction(async (session) => {
       const opts = { session };
 
-      if (existing.generated_stock_id) {
+      if (existing.from_location_id && existing.location_id) {
+        await reverseRawMaterialDispatchImpact(
+          {
+            rawMaterialId: existing.raw_material_id,
+            quantity: existing.quantity,
+            fromLocationId: existing.from_location_id,
+            toLocationId: existing.location_id,
+            generatedStockId: existing.generated_stock_id,
+            referenceId: existing._id,
+          },
+          userId,
+          session,
+        );
+      } else if (existing.generated_stock_id) {
         await reverseRawMaterialDispatchImpact(
           {
             rawMaterialId: existing.raw_material_id,
@@ -297,6 +361,11 @@ const update = async (req, res) => {
       const finalLocation = updatePayload.location_id
         ? await DispatchLocation.findById(updatePayload.location_id).session(session)
         : await DispatchLocation.findById(existing.location_id).session(session);
+      const finalFromLocation = updatePayload.from_location_id
+        ? await DispatchLocation.findById(updatePayload.from_location_id).session(session)
+        : existing.from_location_id
+          ? await DispatchLocation.findById(existing.from_location_id).session(session)
+          : null;
 
       const finalMaterialId = updatePayload.raw_material_id ?? existing.raw_material_id;
       const finalQty = updatePayload.quantity ?? existing.quantity;
@@ -305,19 +374,33 @@ const update = async (req, res) => {
         existing.notes ??
         `Dispatch to ${finalLocation?.name ?? existing.location}`;
 
-      const { generatedStockId } = await applyRawMaterialDispatchImpact({
-        rawMaterialId: finalMaterialId,
-        quantity: finalQty,
-        locationId: finalLocation?._id ?? existing.location_id,
-        storeId: finalLocation?.store_id ?? null,
-        referenceId: updated._id,
-        userId,
-        notes: dispatchNotes,
-        session,
-      });
-
-      updated.generated_stock_id = generatedStockId;
-      await updated.save(opts);
+      if (finalFromLocation?._id && finalLocation?._id) {
+        await applyRawMaterialDispatchImpact({
+          rawMaterialId: finalMaterialId,
+          quantity: finalQty,
+          fromLocationId: finalFromLocation._id,
+          toLocationId: finalLocation._id,
+          storeId:
+            finalFromLocation.store_id ?? finalLocation.store_id ?? null,
+          referenceId: updated._id,
+          userId,
+          notes: dispatchNotes,
+          session,
+        });
+      } else if (finalLocation?._id) {
+        const { generatedStockId } = await applyRawMaterialDispatchImpact({
+          rawMaterialId: finalMaterialId,
+          quantity: finalQty,
+          locationId: finalLocation._id,
+          storeId: finalLocation.store_id ?? null,
+          referenceId: updated._id,
+          userId,
+          notes: dispatchNotes,
+          session,
+        });
+        updated.generated_stock_id = generatedStockId;
+        await updated.save(opts);
+      }
 
       await writeAudit({
         entityType: "RawMaterialDispatch",
@@ -354,7 +437,20 @@ const remove = async (req, res) => {
     const userId = getUserId(req);
 
     const item = await withTransaction(async (session) => {
-      if (existing.generated_stock_id) {
+      if (existing.from_location_id && existing.location_id) {
+        await reverseRawMaterialDispatchImpact(
+          {
+            rawMaterialId: existing.raw_material_id,
+            quantity: existing.quantity,
+            fromLocationId: existing.from_location_id,
+            toLocationId: existing.location_id,
+            generatedStockId: existing.generated_stock_id,
+            referenceId: existing._id,
+          },
+          userId,
+          session,
+        );
+      } else if (existing.generated_stock_id) {
         await reverseRawMaterialDispatchImpact(
           {
             rawMaterialId: existing.raw_material_id,

@@ -70,6 +70,8 @@ const corsOptions = {
     "refreshtoken",
     "counter-token",
     "countertoken",
+    "shop-token",
+    "shoptoken",
   ],
   optionsSuccessStatus: 200, // Some legacy browsers choke on 204
 };
@@ -234,6 +236,11 @@ app.use("/api/category", CategoryRoutes);
 // ===================================================
 const CounterRoutes = require("../routes/counter.routes");
 app.use("/api/counter", CounterRoutes);
+// ===================================================
+// Shop Routes (outlet login + POS)
+// ===================================================
+const ShopRoutes = require("../routes/shop.routes");
+app.use("/api/shop", ShopRoutes);
 // ===================================================
 // Cake Design Routes
 // ===================================================

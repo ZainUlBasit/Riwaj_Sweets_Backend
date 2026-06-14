@@ -15,6 +15,8 @@ const {
   adjustProduct,
   adjustLocationInventory,
   reverseBomConsumption,
+  applyManualProductionConsumption,
+  reverseManualProductionConsumption,
   findFinishedGoodsStore,
   executeStoreReceipt,
   reverseStoreReceipt,
@@ -153,6 +155,7 @@ async function applyProductionImpact({
   cakes,
   productionDate,
   productionLocation,
+  rawMaterialsConsumed = [],
   userId,
   referenceType,
   referenceId,
@@ -162,6 +165,18 @@ async function applyProductionImpact({
   let productStock = null;
   let consumptions = [];
   let storeReceipt = null;
+
+  if (productionLocation?._id && rawMaterialsConsumed?.length) {
+    consumptions = await applyManualProductionConsumption({
+      rawMaterialsConsumed,
+      productionLocationId: productionLocation._id,
+      referenceType,
+      referenceId,
+      userId,
+      notesPrefix: `Production: ${product.name}`,
+      session,
+    });
+  }
 
   if (cakes > 0) {
     let fgStore = null;
@@ -270,6 +285,7 @@ const create = async (req, res) => {
       location_id,
       location,
       notes,
+      raw_materials_consumed,
     } = req.body || {};
 
     if (!production_date) {
@@ -327,6 +343,7 @@ const create = async (req, res) => {
         cakes,
         productionDate: production_date,
         productionLocation,
+        rawMaterialsConsumed: raw_materials_consumed,
         userId,
         referenceType: "CakeProduction",
         referenceId: created._id,
@@ -376,6 +393,7 @@ const update = async (req, res) => {
       location_id,
       location,
       notes,
+      raw_materials_consumed,
     } = req.body || {};
 
     const existing = await CakeProduction.findById(req.params.id);
@@ -480,6 +498,10 @@ const update = async (req, res) => {
         cakes: finalCakes,
         productionDate: updatePayload.production_date ?? existing.production_date,
         productionLocation,
+        rawMaterialsConsumed:
+          raw_materials_consumed !== undefined
+            ? raw_materials_consumed
+            : existing.raw_materials_consumed,
         userId,
         referenceType: "CakeProduction",
         referenceId: updated._id,
@@ -565,8 +587,20 @@ const remove = async (req, res) => {
 async function reverseProductionImpact(record, userId = null, session = null) {
   const opts = session ? { session } : {};
 
-  if (record?.raw_materials_consumed?.length) {
-    await reverseBomConsumption(record.raw_materials_consumed, userId, session);
+  if (record?.raw_materials_consumed?.length && record?.location_id) {
+    const hasStockEntries = record.raw_materials_consumed.some(
+      (row) => row.stock_entry_id,
+    );
+    if (hasStockEntries) {
+      await reverseBomConsumption(record.raw_materials_consumed, userId, session);
+    } else {
+      await reverseManualProductionConsumption(
+        record.raw_materials_consumed,
+        record.location_id,
+        userId,
+        session,
+      );
+    }
   }
 
   if (record?.store_receipt_id) {

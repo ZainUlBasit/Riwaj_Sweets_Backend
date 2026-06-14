@@ -10,7 +10,8 @@ const Schema = mongoose.Schema;
 /**
  * RawMaterialDispatch — record of raw material sent to a location.
  *
- *   location_id            Stable DispatchLocation master reference.
+ *   from_location_id       RM Store (type 1) — source of the transfer.
+ *   location_id            Production area (type 2) — destination.
  *   location               Snapshot / legacy destination name.
  *   raw_material_id        Which raw material was dispatched (required).
  *   raw_material_stock_id  Optional — exact source batch.
@@ -25,6 +26,12 @@ const Schema = mongoose.Schema;
  */
 const RawMaterialDispatchSchema = new Schema(
   {
+    from_location_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "DispatchLocation",
+      default: null,
+      index: true,
+    },
     location_id: {
       type: mongoose.Types.ObjectId,
       ref: "DispatchLocation",

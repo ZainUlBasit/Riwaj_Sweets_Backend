@@ -1,6 +1,35 @@
 const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 
+const LOCATION_TYPE = {
+  RAW_MATERIAL_STORE: 1,
+  PRODUCTION_AREA: 2,
+  SHOP: 3,
+  FINISHED_GOODS_STORE: 4,
+};
+
+const SINGLETON_TYPES = [
+  LOCATION_TYPE.RAW_MATERIAL_STORE,
+  LOCATION_TYPE.FINISHED_GOODS_STORE,
+];
+
+const getSingletonLabel = (type) => {
+  if (type === LOCATION_TYPE.RAW_MATERIAL_STORE) return "Raw Material Store";
+  if (type === LOCATION_TYPE.FINISHED_GOODS_STORE) return "Product Store";
+  return "location";
+};
+
+async function assertSingletonLocation(storeId, locationType, excludeId = null) {
+  if (!storeId || !SINGLETON_TYPES.includes(Number(locationType))) return null;
+  const filter = {
+    store_id: storeId,
+    location_type: Number(locationType),
+    isDeleted: false,
+  };
+  if (excludeId) filter._id = { $ne: excludeId };
+  return DispatchLocation.findOne(filter);
+}
+
 const normalizeName = (name) => String(name ?? "").trim();
 
 const findByName = (name) =>
@@ -71,11 +100,23 @@ const create = async (req, res) => {
       );
     }
 
+    const locType = location_type != null ? Number(location_type) : 2;
+    if (store_id) {
+      const duplicate = await assertSingletonLocation(store_id, locType);
+      if (duplicate) {
+        return createError(
+          res,
+          409,
+          `This godown already has a ${getSingletonLabel(locType)}. Only one is allowed per godown.`,
+        );
+      }
+    }
+
     const item = await DispatchLocation.create({
       name: normalized,
       description: description ?? "",
       store_id: store_id || null,
-      location_type: location_type != null ? Number(location_type) : 2,
+      location_type: locType,
       isDeleted: false,
     });
 
@@ -114,6 +155,35 @@ const update = async (req, res) => {
     if (description !== undefined) updatePayload.description = description;
     if (store_id !== undefined) updatePayload.store_id = store_id || null;
     if (location_type !== undefined) updatePayload.location_type = Number(location_type);
+
+    const current = await DispatchLocation.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!current) return createError(res, 404, "Dispatch location not found.");
+
+    const effectiveStoreId =
+      updatePayload.store_id !== undefined
+        ? updatePayload.store_id
+        : current.store_id;
+    const effectiveType =
+      updatePayload.location_type !== undefined
+        ? updatePayload.location_type
+        : current.location_type;
+
+    if (effectiveStoreId) {
+      const duplicate = await assertSingletonLocation(
+        effectiveStoreId,
+        effectiveType,
+        req.params.id,
+      );
+      if (duplicate) {
+        return createError(
+          res,
+          409,
+          `This godown already has a ${getSingletonLabel(effectiveType)}. Only one is allowed per godown.`,
+        );
+      }
+    }
 
     const item = await DispatchLocation.findOneAndUpdate(
       { _id: req.params.id, isDeleted: false },

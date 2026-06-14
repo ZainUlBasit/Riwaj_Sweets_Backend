@@ -118,6 +118,19 @@ const OrderSchema = new Schema(
       default: null,
     },
 
+    shop_id: {
+      type: Schema.Types.ObjectId,
+      ref: "Shop",
+      default: null,
+      index: true,
+    },
+    shop_location_id: {
+      type: Schema.Types.ObjectId,
+      ref: "DispatchLocation",
+      default: null,
+      index: true,
+    },
+
     customer_info: {
       name: { type: String, default: "" },
       phone: { type: String, default: "" },

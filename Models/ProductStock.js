@@ -47,10 +47,10 @@ const ProductStockSchema = new Schema(
       default: null,
       index: true,
     },
-    /** 1 = production inventory, 2 = shop inventory */
+    /** 1 = production, 2 = shop, 3 = product store */
     inventory_type: {
       type: Number,
-      enum: [1, 2],
+      enum: [1, 2, 3],
       default: 1,
     },
     isDeleted: requiredBooleanWithDefaultFalse,
