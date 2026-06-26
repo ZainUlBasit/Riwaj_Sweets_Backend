@@ -22,6 +22,7 @@ const {
   reverseStoreReceipt,
   withTransaction,
 } = require("../Services/inventoryService");
+const { assertRmManagerStoreAccess, applyStoreLocationFilter } = require("../utils/storeScope");
 
 const escapeRegex = (value = "") =>
   String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -105,14 +106,16 @@ const list = async (req, res) => {
     else if (location)
       baseFilter.location = new RegExp(`^${escapeRegex(location)}$`, "i");
 
+    const scopedFilter = await applyStoreLocationFilter(req, baseFilter, "location_id");
+
     const items = await populateRefs(
-      CakeProduction.find({ ...baseFilter, isDeleted: false }).sort({
+      CakeProduction.find({ ...scopedFilter, isDeleted: false }).sort({
         production_date: -1,
         createdAt: -1,
       }),
     );
     const deletedItems = await populateRefs(
-      CakeProduction.find({ ...baseFilter, isDeleted: true }).sort({
+      CakeProduction.find({ ...scopedFilter, isDeleted: true }).sort({
         production_date: -1,
         createdAt: -1,
       }),
@@ -317,6 +320,14 @@ const create = async (req, res) => {
       });
     } catch (err) {
       return createError(res, err.status || 400, err.message);
+    }
+
+    if (productionLocation?._id) {
+      try {
+        await assertRmManagerStoreAccess(req, [productionLocation._id]);
+      } catch (err) {
+        return createError(res, err.status || 403, err.message);
+      }
     }
 
     const userId = getUserId(req);

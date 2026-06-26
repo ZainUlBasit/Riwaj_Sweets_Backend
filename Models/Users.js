@@ -14,7 +14,14 @@ const UsersSchema = new Schema(
     password: requiredString,
     role: {
       type: Number,
-      enum: [1, 2, 3, 4, 5], // 1 Admin, 2 Cashier, 3 Saleman, 4 Cake Designer, 5 Cake Order Manager
+      enum: [1, 2, 3, 4, 5, 6], // 1 Admin … 5 Cake Order Manager, 6 RM Manager
+    },
+    /** Assigned store for RM Manager (role 6). */
+    store_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "Store",
+      default: null,
+      index: true,
     },
     isDeleted: requiredBooleanWithDefaultFalse,
   },

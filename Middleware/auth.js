@@ -67,7 +67,8 @@ const VerifyUserCookie = (req, res, next) => {
  * Operator-precedence fix: previous expression `!req.user.role === 1` evaluated
  * as `(!req.user.role) === 1` (always falsy). Use a strict equality check.
  *
- * Roles enum (Users.role): 1: Admin, 2: Cashier, 3: Saleman.
+ * Roles enum (Users.role): 1: Admin, 2: Cashier, 3: Saleman, 4: Cake Designer,
+ * 5: Cake Order Manager, 6: RM Manager.
  */
 const VerifyAdmin = (req, res, next) => {
   if (!req.user || Number(req.user.role) !== 1) {

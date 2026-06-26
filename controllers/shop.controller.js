@@ -16,7 +16,6 @@ const {
   LOCATION_TYPE,
   writeLedger,
   adjustLocationInventory,
-  adjustProduct,
   getLocationInventoryQty,
   withTransaction,
 } = require("../Services/inventoryService");
@@ -329,25 +328,11 @@ const inventory = async (req, res) => {
       }))
       .filter((row) => row.quantity > 0);
 
-    // Legacy fallback: no shop location stock yet — use global product availability
-    if (items.length === 0) {
-      const legacy = products
-        .filter((p) => Number(p.available_quantity || 0) > 0)
-        .map((product) => ({
-          product,
-          quantity: Number(product.available_quantity || 0),
-          source: "global",
-        }));
-      return successMessage(
-        res,
-        { items: legacy, mode: legacy.length ? "global_fallback" : "empty" },
-        legacy.length
-          ? "Showing global stock — transfer to shop for location tracking."
-          : "Shop inventory fetched.",
-      );
-    }
-
-    return successMessage(res, { items, mode: "location" }, "Shop inventory fetched.");
+    return successMessage(
+      res,
+      { items, mode: items.length ? "location" : "empty" },
+      "Shop inventory fetched.",
+    );
   } catch (err) {
     console.error("Shop inventory error:", err);
     return createError(res, 500, err.message || "Failed to load inventory.");
@@ -427,18 +412,11 @@ const posSale = async (req, res) => {
         product._id,
         INV_TYPE.SHOP,
       );
-      const globalQty = Number(product.available_quantity || 0);
-      let stockSource = "location";
-      if (locationQty >= qty) {
-        stockSource = "location";
-      } else if (globalQty >= qty) {
-        stockSource = "global";
-      } else {
-        const best = Math.max(locationQty, globalQty);
+      if (locationQty < qty) {
         return createError(
           res,
           409,
-          `Insufficient stock for "${product.name}". Available: ${best}, requested: ${qty}.`,
+          `Insufficient shop stock for "${product.name}". Available: ${locationQty}, requested: ${qty}. Transfer stock from main store first.`,
         );
       }
       const unitPrice = round2(raw.unit_price ?? product.price ?? 0);
@@ -448,7 +426,6 @@ const posSale = async (req, res) => {
         quantity: qty,
         unit_price: unitPrice,
         total_price: round2(unitPrice * qty),
-        stockSource,
       });
     }
 
@@ -475,65 +452,36 @@ const posSale = async (req, res) => {
       const opts = { session };
 
       for (const item of resolvedItems) {
-        if (item.stockSource === "location") {
-          const prevQty = await getLocationInventoryQty(
-            shop.location_id,
-            item.product_id,
-            INV_TYPE.SHOP,
-            session,
-          );
-          await adjustLocationInventory(
-            shop.location_id,
-            item.product_id,
-            -item.quantity,
-            INV_TYPE.SHOP,
-            session,
-          );
-          await writeLedger(
-            {
-              transactionType: TX.PRODUCT_SALE,
-              direction: DIR.OUT,
-              productId: item.product_id,
-              quantity: item.quantity,
-              locationId: shop.location_id,
-              storeId: null,
-              referenceType: "ShopSale",
-              referenceId: shop._id,
-              userId: null,
-              notes: `Shop sale: ${shop.name}`,
-              previousBalance: prevQty,
-              newBalance: prevQty - item.quantity,
-            },
-            session,
-          );
-        } else {
-          const productQ = Product.findById(item.product_id);
-          if (session) productQ.session(session);
-          const product = await productQ;
-          const prevAvail = Number(product?.available_quantity || 0);
-          await adjustProduct(
-            item.product_id,
-            { outDelta: item.quantity, availDelta: -item.quantity },
-            session,
-          );
-          await writeLedger(
-            {
-              transactionType: TX.PRODUCT_SALE,
-              direction: DIR.OUT,
-              productId: item.product_id,
-              quantity: item.quantity,
-              locationId: shop.location_id,
-              storeId: null,
-              referenceType: "ShopSale",
-              referenceId: shop._id,
-              userId: null,
-              notes: `Shop sale (global stock): ${shop.name}`,
-              previousBalance: prevAvail,
-              newBalance: prevAvail - item.quantity,
-            },
-            session,
-          );
-        }
+        const prevQty = await getLocationInventoryQty(
+          shop.location_id,
+          item.product_id,
+          INV_TYPE.SHOP,
+          session,
+        );
+        await adjustLocationInventory(
+          shop.location_id,
+          item.product_id,
+          -item.quantity,
+          INV_TYPE.SHOP,
+          session,
+        );
+        await writeLedger(
+          {
+            transactionType: TX.PRODUCT_SALE,
+            direction: DIR.OUT,
+            productId: item.product_id,
+            quantity: item.quantity,
+            locationId: shop.location_id,
+            storeId: null,
+            referenceType: "ShopSale",
+            referenceId: shop._id,
+            userId: null,
+            notes: `Shop sale: ${shop.name}`,
+            previousBalance: prevQty,
+            newBalance: prevQty - item.quantity,
+          },
+          session,
+        );
       }
 
       const [created] = await Order.create(

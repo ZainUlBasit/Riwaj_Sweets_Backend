@@ -42,8 +42,19 @@ function authControllers() {
 
       // check useremail (only non-deleted users can login)
       const { email, password } = req.body;
-      const user = await User.findOne({ email, isDeleted: false });
+      const user = await User.findOne({ email, isDeleted: false }).populate(
+        "store_id",
+        "name",
+      );
       if (!user) return createError(res, 422, "No such email registered!");
+
+      if (Number(user.role) === 6 && !user.store_id) {
+        return createError(
+          res,
+          403,
+          "RM Manager account has no store assigned. Contact admin.",
+        );
+      }
 
       // check user password using bcrypt
       const isMatch = await bcrypt.compare(password, user.password);
@@ -51,8 +62,11 @@ function authControllers() {
         return createError(res, 403, "email or password doesn't match!");
       const jwtBody = {
         _id: user._id,
-        role: user.role, // 1: Admin, 2: Cashier, 3: Saleman
+        role: user.role, // 1: Admin … 6: RM Manager
       };
+      if (user.store_id) {
+        jwtBody.store_id = String(user.store_id._id ?? user.store_id);
+      }
       const { accessToken, refreshToken } = JwtService.generateToken(jwtBody);
 
       var token = await jwt.sign({ ...jwtBody }, privateKey);
@@ -93,7 +107,7 @@ function authControllers() {
       return successMessage(
         res,
         {
-          user: user,
+          user: userDto(user),
           token: token,
           accesstoken: accessToken,
           refreshtoken: refreshToken,
@@ -442,19 +456,19 @@ function authControllers() {
       const userExist = await User.findOne({
         _id: userData._id,
         isDeleted: false,
-      });
+      }).populate("store_id", "name");
       if (!userExist) {
         return createError(res, 404, "Invalid User!");
       }
 
       const jwtBody = {
         _id: userData._id,
-        role: userData.role,
+        role: userExist.role,
       };
-      const { accessToken, refreshToken } = JwtService.generateToken({
-        _id: userData._id,
-        role: userData.role,
-      });
+      if (userExist.store_id) {
+        jwtBody.store_id = String(userExist.store_id._id ?? userExist.store_id);
+      }
+      const { accessToken, refreshToken } = JwtService.generateToken(jwtBody);
       try {
         const result = await JwtService.updateRefreshToken(
           userData._id,
@@ -471,7 +485,7 @@ function authControllers() {
       return successMessage(
         res,
         {
-          user: userExist,
+          user: userdata,
           token: token,
           accesstoken: accessToken,
           refreshtoken: refreshToken,

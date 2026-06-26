@@ -417,6 +417,7 @@ const finishedGoodsStock = async (req, res) => {
         $match: {
           "location.location_type": LOCATION_TYPE.FINISHED_GOODS_STORE,
           "location.isDeleted": false,
+          quantity: { $gt: 0 },
         },
       },
       {
@@ -553,6 +554,57 @@ const rmDispatchReport = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/inventory-reports/shop-stock
+ * Current finished goods at shop locations (location_type = 3).
+ */
+const shopStock = async (req, res) => {
+  try {
+    const rows = await LocationInventory.aggregate([
+      { $match: { isDeleted: false, inventory_type: INV_TYPE.SHOP } },
+      {
+        $lookup: {
+          from: "dispatchlocations",
+          localField: "location_id",
+          foreignField: "_id",
+          as: "location",
+        },
+      },
+      {
+        $lookup: {
+          from: "products",
+          localField: "product_id",
+          foreignField: "_id",
+          as: "product",
+        },
+      },
+      { $unwind: { path: "$location", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$product", preserveNullAndEmptyArrays: true } },
+      {
+        $match: {
+          "location.location_type": LOCATION_TYPE.SHOP,
+          "location.isDeleted": false,
+          quantity: { $gt: 0 },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          locationName: { $ifNull: ["$location.name", "Unknown"] },
+          productName: { $ifNull: ["$product.name", "Unknown"] },
+          quantity: 1,
+        },
+      },
+      { $sort: { locationName: 1, productName: 1 } },
+    ]);
+
+    return successMessage(res, { items: rows }, "Shop stock fetched.");
+  } catch (err) {
+    console.error("InventoryReport shopStock error:", err);
+    return createError(res, 500, err.message || "Failed to fetch shop stock.");
+  }
+};
+
 module.exports = {
   currentStock,
   materialLedger,
@@ -561,5 +613,6 @@ module.exports = {
   transferReport,
   storeReceiptReport,
   finishedGoodsStock,
+  shopStock,
   rmDispatchReport,
 };

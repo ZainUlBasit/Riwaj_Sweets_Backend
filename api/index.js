@@ -257,6 +257,11 @@ app.use("/api/cake-order", CakeOrderRoutes);
 const CakeStaffRoutes = require("../routes/cake-staff.routes");
 app.use("/api/cake-staff", CakeStaffRoutes);
 // ===================================================
+// RM Manager staff (web portal users scoped to a store)
+// ===================================================
+const RmStaffRoutes = require("../routes/rm-staff.routes");
+app.use("/api/rm-staff", RmStaffRoutes);
+// ===================================================
 // Product Routes
 // ===================================================
 const ProductRoutes = require("../routes/product.routes");

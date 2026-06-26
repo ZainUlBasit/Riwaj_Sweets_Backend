@@ -15,6 +15,7 @@ const {
   getInventoryTypeForLocation,
   withTransaction,
 } = require("../Services/inventoryService");
+const { assertRmManagerStoreAccess, applyStoreLocationFilter } = require("../utils/storeScope");
 
 const populateRefs = (q) =>
   q
@@ -34,11 +35,13 @@ const list = async (req, res) => {
     if (req.query.product_id) filter.product_id = req.query.product_id;
     if (req.query.to_location_id) filter.to_location_id = req.query.to_location_id;
 
+    const scopedFilter = await applyStoreLocationFilter(req, filter, "from_location_id");
+
     const items = await populateRefs(
-      ProductTransfer.find(filter).sort({ transfer_date: -1, createdAt: -1 }),
+      ProductTransfer.find(scopedFilter).sort({ transfer_date: -1, createdAt: -1 }),
     );
     const deletedItems = await populateRefs(
-      ProductTransfer.find({ isDeleted: true }).sort({ transfer_date: -1 }),
+      ProductTransfer.find({ ...scopedFilter, isDeleted: true }).sort({ transfer_date: -1 }),
     );
 
     return successMessage(
@@ -118,6 +121,8 @@ const create = async (req, res) => {
         "From location must be a main store (finished goods). Receive products from production first.",
       );
     }
+
+    await assertRmManagerStoreAccess(req, [from_location_id, to_location_id]);
 
     const fromInvType = getInventoryTypeForLocation(fromType);
     const toInvType = getInventoryTypeForLocation(toType);

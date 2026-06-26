@@ -12,6 +12,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 router.use(verifyToken);
 router.get("/", controller.list);
+router.get("/location-stock", controller.locationStock);
 router.get("/:id", controller.getOne);
 router.post("/", upload.single("image"), controller.create);
 router.patch("/:id", upload.single("image"), controller.update);

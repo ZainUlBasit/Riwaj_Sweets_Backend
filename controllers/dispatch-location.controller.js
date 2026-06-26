@@ -1,5 +1,6 @@
 const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
+const { getAssignedStoreId } = require("../utils/storeScope");
 
 const LOCATION_TYPE = {
   RAW_MATERIAL_STORE: 1,
@@ -38,14 +39,22 @@ const findByName = (name) =>
     isDeleted: false,
   });
 
-const list = async (_req, res) => {
+const list = async (req, res) => {
   try {
     await syncLegacyDispatchLocations();
 
-    const items = await DispatchLocation.find({ isDeleted: false }).sort({
+    const filter = { isDeleted: false };
+    const scopedStore =
+      getAssignedStoreId(req) ||
+      (req.query.store_id ? String(req.query.store_id) : null);
+    if (scopedStore) filter.store_id = scopedStore;
+
+    const items = await DispatchLocation.find(filter).sort({
       name: 1,
     });
-    const deletedItems = await DispatchLocation.find({ isDeleted: true }).sort({
+    const deletedFilter = { isDeleted: true };
+    if (scopedStore) deletedFilter.store_id = scopedStore;
+    const deletedItems = await DispatchLocation.find(deletedFilter).sort({
       name: 1,
     });
 

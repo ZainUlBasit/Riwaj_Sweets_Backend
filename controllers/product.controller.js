@@ -1,5 +1,8 @@
 const Product = require("../Models/Products");
+const LocationInventory = require("../Models/LocationInventory");
+const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
+const { LOCATION_TYPE } = require("../Services/inventoryService");
 
 // Cloudinary configuration for product image uploads. Same env vars as
 // cake-design (CLOUD_NAME / API_KEY / API_SECRET) so a single Cloudinary
@@ -42,16 +45,73 @@ const parseNonNegativeNumber = (value, { fallback = 0 } = {}) => {
   return num;
 };
 
+/** Aggregates per-product qty in main stores vs shops from LocationInventory. */
+async function buildLocationStockMaps() {
+  const rows = await LocationInventory.aggregate([
+    { $match: { isDeleted: false, quantity: { $gt: 0 } } },
+    {
+      $lookup: {
+        from: "dispatchlocations",
+        localField: "location_id",
+        foreignField: "_id",
+        as: "location",
+      },
+    },
+    { $unwind: { path: "$location", preserveNullAndEmptyArrays: false } },
+    { $match: { "location.isDeleted": false } },
+    {
+      $group: {
+        _id: {
+          product_id: "$product_id",
+          location_type: "$location.location_type",
+        },
+        totalQty: { $sum: "$quantity" },
+      },
+    },
+  ]);
+
+  const mainStore = new Map();
+  const shop = new Map();
+  for (const row of rows) {
+    const pid = String(row._id.product_id);
+    const locType = Number(row._id.location_type);
+    const qty = Number(row.totalQty || 0);
+    if (locType === LOCATION_TYPE.FINISHED_GOODS_STORE) {
+      mainStore.set(pid, (mainStore.get(pid) || 0) + qty);
+    } else if (locType === LOCATION_TYPE.SHOP) {
+      shop.set(pid, (shop.get(pid) || 0) + qty);
+    }
+  }
+  return { mainStore, shop };
+}
+
+const attachLocationStock = (product, mainStore, shop) => {
+  const doc = product.toObject ? product.toObject() : { ...product };
+  const pid = String(doc._id);
+  doc.main_store_quantity = mainStore.get(pid) || 0;
+  doc.shop_quantity = shop.get(pid) || 0;
+  return doc;
+};
+
 const list = async (req, res) => {
   try {
-    const items = await Product.find({ isDeleted: false })
-      .populate("category_id")
-      .populate("counter_id")
-      .sort({ createdAt: -1 });
-    const deletedItems = await Product.find({ isDeleted: true })
-      .populate("category_id")
-      .populate("counter_id")
-      .sort({ createdAt: -1 });
+    const [{ mainStore, shop }, rawItems, rawDeleted] = await Promise.all([
+      buildLocationStockMaps(),
+      Product.find({ isDeleted: false })
+        .populate("category_id")
+        .populate("counter_id")
+        .sort({ createdAt: -1 }),
+      Product.find({ isDeleted: true })
+        .populate("category_id")
+        .populate("counter_id")
+        .sort({ createdAt: -1 }),
+    ]);
+
+    const items = rawItems.map((p) => attachLocationStock(p, mainStore, shop));
+    const deletedItems = rawDeleted.map((p) =>
+      attachLocationStock(p, mainStore, shop),
+    );
+
     return successMessage(
       res,
       {
@@ -65,6 +125,61 @@ const list = async (req, res) => {
   } catch (err) {
     console.error("Product list error:", err);
     return createError(res, 500, err.message || "Failed to fetch products.");
+  }
+};
+
+/**
+ * GET /api/product/location-stock?location_id=
+ * Products with quantity at a specific dispatch location (main store, shop, etc.).
+ */
+const locationStock = async (req, res) => {
+  try {
+    const { location_id: locationId } = req.query || {};
+    if (!locationId) {
+      return createError(res, 400, "location_id is required.");
+    }
+
+    const location = await DispatchLocation.findById(locationId).where({
+      isDeleted: false,
+    });
+    if (!location) return createError(res, 404, "Location not found.");
+
+    const invRows = await LocationInventory.find({
+      location_id: locationId,
+      isDeleted: false,
+      quantity: { $gt: 0 },
+    })
+      .populate({
+        path: "product_id",
+        populate: [{ path: "category_id" }, { path: "counter_id" }],
+      })
+      .sort({ updatedAt: -1 });
+
+    const items = invRows
+      .filter((row) => row.product_id && !row.product_id.isDeleted)
+      .map((row) => ({
+        product: row.product_id,
+        quantity: Number(row.quantity || 0),
+        location_id: locationId,
+        location_type: location.location_type,
+        location_name: location.name,
+      }));
+
+    return successMessage(
+      res,
+      {
+        items,
+        location: {
+          _id: location._id,
+          name: location.name,
+          location_type: location.location_type,
+        },
+      },
+      "Location product stock fetched.",
+    );
+  } catch (err) {
+    console.error("Product locationStock error:", err);
+    return createError(res, 500, err.message || "Failed to fetch location stock.");
   }
 };
 
@@ -255,4 +370,4 @@ const remove = async (req, res) => {
   }
 };
 
-module.exports = { list, getOne, create, update, remove };
+module.exports = { list, getOne, create, update, remove, locationStock };

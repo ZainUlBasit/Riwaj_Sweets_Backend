@@ -14,6 +14,7 @@ const {
   validateRmTransferLocations,
   withTransaction,
 } = require("../Services/inventoryService");
+const { assertRmManagerStoreAccess, applyStoreLocationFilter } = require("../utils/storeScope");
 
 const populateRefs = (q) =>
   q
@@ -49,14 +50,20 @@ const list = async (req, res) => {
     }
     if (raw_material_id) baseFilter.raw_material_id = raw_material_id;
 
+    const scopedFilter = await applyStoreLocationFilter(
+      req,
+      baseFilter,
+      "location_id",
+    );
+
     const items = await populateRefs(
-      RawMaterialDispatch.find({ ...baseFilter, isDeleted: false }).sort({
+      RawMaterialDispatch.find({ ...scopedFilter, isDeleted: false }).sort({
         dispatch_date: -1,
         createdAt: -1,
       }),
     );
     const deletedItems = await populateRefs(
-      RawMaterialDispatch.find({ ...baseFilter, isDeleted: true }).sort({
+      RawMaterialDispatch.find({ ...scopedFilter, isDeleted: true }).sort({
         dispatch_date: -1,
         createdAt: -1,
       }),
@@ -165,6 +172,15 @@ const create = async (req, res) => {
       await validateRmTransferLocations(fromLocation._id, toLocation._id);
     } catch (err) {
       return createError(res, err.status || 400, err.message);
+    }
+
+    try {
+      await assertRmManagerStoreAccess(req, [
+        fromLocation._id,
+        toLocation._id,
+      ]);
+    } catch (err) {
+      return createError(res, err.status || 403, err.message);
     }
 
     const userId = getUserId(req);
