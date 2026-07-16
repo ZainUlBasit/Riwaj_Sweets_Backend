@@ -605,6 +605,22 @@ const batchReceive = async (req, res) => {
       return createError(res, 400, "Payment amount cannot be negative.");
     }
 
+    const totalOutstanding = round2(
+      orders.reduce(
+        (sum, o) => sum + Math.max(0, round2(o.total - o.paid_amount)),
+        0,
+      ),
+    );
+
+    // Delivery requires every selected order to be fully paid (cash counter flow).
+    if (shouldDeliver && paymentAmount + 0.01 < totalOutstanding) {
+      return createError(
+        res,
+        400,
+        `Full cash payment required before delivery. Outstanding: Rs ${totalOutstanding}.`,
+      );
+    }
+
     if (shouldDeliver) {
       const requiredByProduct = new Map();
       for (const order of orders) {
@@ -661,6 +677,14 @@ const batchReceive = async (req, res) => {
 
       order.payment_status = computePaymentStatus(order.paid_amount, order.total);
       order.payment_flag = paymentFlagFromStatus(order.payment_status);
+
+      if (shouldDeliver && order.payment_status !== PAYMENT_STATUS.PAID) {
+        return createError(
+          res,
+          409,
+          `Order #${order.order_number || order._id} must be fully paid before delivery.`,
+        );
+      }
 
       if (shouldDeliver) {
         for (const item of order.items) {
