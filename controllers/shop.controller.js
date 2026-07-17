@@ -666,7 +666,29 @@ const posSale = async (req, res) => {
       payment,
       customer_info,
       notes,
+      client_sale_id,
+      local_id,
     } = req.body || {};
+
+    const clientSaleId = String(client_sale_id || local_id || "").trim() || null;
+
+    // Idempotent retry: if desktop lost the response mid-sync, return same order
+    if (clientSaleId) {
+      const existing = await Order.findOne({
+        shop_id: shop._id,
+        client_sale_id: clientSaleId,
+        isDeleted: false,
+      })
+        .populate("items.product_id")
+        .populate("sale_invoice_id");
+      if (existing) {
+        return successMessage(
+          res,
+          existing,
+          "Sale already synced (idempotent).",
+        );
+      }
+    }
 
     if (!Array.isArray(rawItems) || rawItems.length === 0) {
       return createError(res, 400, "At least one item is required.");
@@ -799,6 +821,7 @@ const posSale = async (req, res) => {
                 : [],
             shop_id: shop._id,
             shop_location_id: shop.location_id,
+            client_sale_id: clientSaleId,
             customer_info: {
               name: customer_info?.name?.trim() || "",
               phone: customer_info?.phone?.trim() || "",
@@ -827,6 +850,29 @@ const posSale = async (req, res) => {
 
     return successMessage(res, populated, "Sale completed successfully.");
   } catch (err) {
+    // Unique race on client_sale_id — treat as idempotent success
+    if (err?.code === 11000 && (err?.keyPattern?.client_sale_id || err?.message?.includes("client_sale_id"))) {
+      const shop = req.shop;
+      const clientSaleId = String(
+        req.body?.client_sale_id || req.body?.local_id || "",
+      ).trim();
+      if (clientSaleId) {
+        const existing = await Order.findOne({
+          shop_id: shop._id,
+          client_sale_id: clientSaleId,
+          isDeleted: false,
+        })
+          .populate("items.product_id")
+          .populate("sale_invoice_id");
+        if (existing) {
+          return successMessage(
+            res,
+            existing,
+            "Sale already synced (idempotent).",
+          );
+        }
+      }
+    }
     console.error("Shop posSale error:", err);
     return createError(
       res,

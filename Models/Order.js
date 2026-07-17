@@ -131,6 +131,14 @@ const OrderSchema = new Schema(
       index: true,
     },
 
+    /** Desktop offline POS idempotency key — prevents duplicate sales on retry */
+    client_sale_id: {
+      type: String,
+      default: null,
+      index: true,
+      sparse: true,
+    },
+
     customer_info: {
       name: { type: String, default: "" },
       phone: { type: String, default: "" },
@@ -152,5 +160,16 @@ OrderSchema.plugin(AutoIncrement, {
   inc_field: "order_number",
   start_seq: 1,
 });
+
+OrderSchema.index(
+  { shop_id: 1, client_sale_id: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      client_sale_id: { $type: "string" },
+      isDeleted: false,
+    },
+  },
+);
 
 module.exports = mongoose.model("Order", OrderSchema);
