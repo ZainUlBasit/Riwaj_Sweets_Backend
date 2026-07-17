@@ -17,6 +17,7 @@ global.rootDirectory = path.resolve(__dirname);
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://www.riwajsweets.com",
   "http://localhost:3000",
+  "http://localhost:1420", // Tauri shop desktop (vite)
   "http://localhost:5173",
   "http://localhost:5171",
   "http://localhost:5174",
@@ -24,11 +25,15 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:5176",
   "http://localhost:5179",
   "http://127.0.0.1:3000",
+  "http://127.0.0.1:1420",
   "http://127.0.0.1:5173",
   "http://127.0.0.1:5174",
   "http://127.0.0.1:5175",
   "http://127.0.0.1:5176",
   "http://127.0.0.1:5179",
+  "tauri://localhost",
+  "http://tauri.localhost",
+  "https://tauri.localhost",
 ];
 
 const envOrigins = (process.env.CORS_ORIGINS || "")
@@ -36,22 +41,29 @@ const envOrigins = (process.env.CORS_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const allowedOrigins = envOrigins.length > 0 ? envOrigins : DEFAULT_ALLOWED_ORIGINS;
+const allowedOrigins = [
+  ...DEFAULT_ALLOWED_ORIGINS,
+  ...envOrigins.filter((o) => !DEFAULT_ALLOWED_ORIGINS.includes(o)),
+];
 
 const isLocalhostOrigin = (origin) =>
   /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 
+const isTauriOrigin = (origin) =>
+  /^tauri:\/\//.test(origin) ||
+  /^https?:\/\/tauri\.localhost(?::\d+)?$/.test(origin);
+
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, Postman)
+    // Allow requests with no origin (mobile apps, curl, Postman, some desktop shells)
     if (!origin) return callback(null, true);
 
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    // In development, be more permissive for any localhost/127.0.0.1 origin
-    if (process.env.NODE_ENV !== "production" && isLocalhostOrigin(origin)) {
+    // Desktop / local Vite always allowed (Tauri shop POS + local ERP)
+    if (isLocalhostOrigin(origin) || isTauriOrigin(origin)) {
       return callback(null, true);
     }
 
