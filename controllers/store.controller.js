@@ -53,15 +53,54 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, description } = req.body || {};
+    const { name, description, setup_defaults = true } = req.body || {};
     if (!name?.trim()) return createError(res, 400, "Store name is required.");
 
     const userId = getUserId(req);
+    const storeName = name.trim();
     const store = await Store.create({
-      name: name.trim(),
+      name: storeName,
       description: description?.trim() || "",
       isDeleted: false,
     });
+
+    let locations = [];
+    if (setup_defaults !== false) {
+      const defaults = [
+        {
+          name: `${storeName} — Production`,
+          location_type: LOCATION_TYPE.PRODUCTION_AREA,
+          description: "Production / manufacturing area",
+        },
+        {
+          name: `${storeName} — Product Store`,
+          location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+          description: "Finished goods main store",
+        },
+      ];
+
+      // RM Store is a single central location for the whole system.
+      // Only create one if none exists yet.
+      const existingRm = await DispatchLocation.findOne({
+        location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
+        isDeleted: false,
+      });
+      if (!existingRm) {
+        defaults.unshift({
+          name: "Central RM Store",
+          location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
+          description: "Central raw material store (system-wide)",
+        });
+      }
+
+      locations = await DispatchLocation.insertMany(
+        defaults.map((d) => ({
+          ...d,
+          store_id: store._id,
+          isDeleted: false,
+        })),
+      );
+    }
 
     await writeAudit({
       entityType: "Store",
@@ -71,7 +110,13 @@ const create = async (req, res) => {
       userId,
     });
 
-    return successMessage(res, store, "Store created successfully.");
+    return successMessage(
+      res,
+      { ...store.toObject(), locations },
+      setup_defaults !== false
+        ? "Godown created with RM Store, Production, and Product Store."
+        : "Store created successfully.",
+    );
   } catch (err) {
     console.error("Store create error:", err);
     if (err.code === 11000) {

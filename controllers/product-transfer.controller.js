@@ -70,171 +70,266 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const {
-      from_location_id,
-      to_location_id,
-      product_id,
-      quantity,
-      transfer_date,
-      notes,
-    } = req.body || {};
+    const body = req.body || {};
+    const transfer_date = body.transfer_date;
+    const notes = body.notes ?? "";
+    const from_location_id = body.from_location_id;
 
-    if (!from_location_id || !to_location_id || !product_id) {
-      return createError(
-        res,
-        400,
-        "from_location_id, to_location_id and product_id are required.",
-      );
-    }
-    if (String(from_location_id) === String(to_location_id)) {
-      return createError(res, 400, "From and to locations must be different.");
+    // Batch: { from_location_id, transfer_date, notes, lines: [{ to_location_id, product_id, quantity }] }
+    // Single (legacy): { from_location_id, to_location_id, product_id, quantity, ... }
+    let lines = Array.isArray(body.lines) ? body.lines : null;
+    if (!lines) {
+      if (body.to_location_id && body.product_id) {
+        lines = [
+          {
+            to_location_id: body.to_location_id,
+            product_id: body.product_id,
+            quantity: body.quantity,
+          },
+        ];
+      } else {
+        lines = [];
+      }
     }
 
-    const qty = Number(quantity);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      return createError(res, 400, "quantity must be greater than 0.");
+    if (!from_location_id) {
+      return createError(res, 400, "from_location_id (Product Store) is required.");
     }
     if (!transfer_date) {
       return createError(res, 400, "transfer_date is required.");
     }
+    if (!lines.length) {
+      return createError(res, 400, "Add at least one shop transfer line.");
+    }
 
-    const [fromLoc, toLoc, product] = await Promise.all([
-      DispatchLocation.findById(from_location_id).where({ isDeleted: false }),
-      DispatchLocation.findById(to_location_id).where({ isDeleted: false }),
-      Product.findById(product_id).where({ isDeleted: false }),
-    ]);
-
+    const fromLoc = await DispatchLocation.findById(from_location_id).where({
+      isDeleted: false,
+    });
     if (!fromLoc) return createError(res, 404, "From location not found.");
-    if (!toLoc) return createError(res, 404, "To location not found.");
-    if (!product) return createError(res, 404, "Product not found.");
 
     const fromType = Number(fromLoc.location_type || LOCATION_TYPE.PRODUCTION_AREA);
-    const toType = Number(toLoc.location_type || LOCATION_TYPE.PRODUCTION_AREA);
-
-    if (toType !== LOCATION_TYPE.SHOP) {
-      return createError(res, 400, "To location must be a shop.");
-    }
     if (fromType !== LOCATION_TYPE.FINISHED_GOODS_STORE) {
       return createError(
         res,
         400,
-        "From location must be a main store (finished goods). Receive products from production first.",
+        "From location must be a Product Store (finished goods).",
       );
     }
 
-    await assertRmManagerStoreAccess(req, [from_location_id, to_location_id]);
+    const normalized = [];
+    for (let i = 0; i < lines.length; i++) {
+      const row = lines[i] || {};
+      const toId = row.to_location_id;
+      const productId = row.product_id;
+      const qty = Number(row.quantity);
+      if (!toId || !productId) {
+        return createError(
+          res,
+          400,
+          `Line ${i + 1}: shop and product are required.`,
+        );
+      }
+      if (String(from_location_id) === String(toId)) {
+        return createError(res, 400, `Line ${i + 1}: from and to must differ.`);
+      }
+      if (!Number.isFinite(qty) || qty <= 0) {
+        return createError(
+          res,
+          400,
+          `Line ${i + 1}: quantity must be greater than 0.`,
+        );
+      }
+      normalized.push({
+        to_location_id: toId,
+        product_id: productId,
+        quantity: qty,
+      });
+    }
+
+    // Aggregate qty needed per product from Product Store
+    const neededByProduct = new Map();
+    for (const row of normalized) {
+      const key = String(row.product_id);
+      neededByProduct.set(
+        key,
+        (neededByProduct.get(key) || 0) + row.quantity,
+      );
+    }
+
+    const shopIds = [...new Set(normalized.map((r) => String(r.to_location_id)))];
+    const productIds = [...neededByProduct.keys()];
+
+    const [shops, products] = await Promise.all([
+      DispatchLocation.find({
+        _id: { $in: shopIds },
+        isDeleted: false,
+      }),
+      Product.find({ _id: { $in: productIds }, isDeleted: false }),
+    ]);
+
+    const shopMap = new Map(shops.map((s) => [String(s._id), s]));
+    const productMap = new Map(products.map((p) => [String(p._id), p]));
+
+    for (const id of shopIds) {
+      const shop = shopMap.get(id);
+      if (!shop) return createError(res, 404, `Shop not found (${id}).`);
+      if (Number(shop.location_type) !== LOCATION_TYPE.SHOP) {
+        return createError(res, 400, `"${shop.name}" is not a shop.`);
+      }
+    }
+    for (const id of productIds) {
+      if (!productMap.has(id)) {
+        return createError(res, 404, `Product not found (${id}).`);
+      }
+    }
+
+    await assertRmManagerStoreAccess(req, [
+      from_location_id,
+      ...shopIds,
+    ]);
 
     const fromInvType = getInventoryTypeForLocation(fromType);
-    const toInvType = getInventoryTypeForLocation(toType);
+    const toInvType = getInventoryTypeForLocation(LOCATION_TYPE.SHOP);
 
-    const availableAtFrom = await getLocationInventoryQty(
-      from_location_id,
-      product_id,
-      fromInvType,
-    );
-    if (qty > availableAtFrom) {
-      return createError(
-        res,
-        409,
-        `Insufficient stock at ${fromLoc.name}. Available: ${availableAtFrom}, requested: ${qty}.`,
+    for (const [productId, needQty] of neededByProduct.entries()) {
+      const available = await getLocationInventoryQty(
+        from_location_id,
+        productId,
+        fromInvType,
       );
+      if (needQty > available) {
+        const product = productMap.get(productId);
+        return createError(
+          res,
+          409,
+          `Insufficient stock of "${product?.name || productId}" at ${fromLoc.name}. Available: ${available}, requested: ${needQty}.`,
+        );
+      }
     }
 
     const userId = getUserId(req);
 
-    const populated = await withTransaction(async (session) => {
-      const opts = { session };
+    const createdIds = await withTransaction(async (session) => {
+      const ids = [];
+      // Track remaining availability as we deduct across lines
+      const remaining = new Map();
+      for (const [productId, needQty] of neededByProduct.entries()) {
+        const available = await getLocationInventoryQty(
+          from_location_id,
+          productId,
+          fromInvType,
+          session,
+        );
+        remaining.set(productId, available);
+      }
 
-      await adjustLocationInventory(
-        from_location_id,
-        product_id,
-        -qty,
-        fromInvType,
-        session,
-      );
-      await adjustLocationInventory(
-        to_location_id,
-        product_id,
-        qty,
-        toInvType,
-        session,
-      );
+      for (const row of normalized) {
+        const toLoc = shopMap.get(String(row.to_location_id));
+        const productId = row.product_id;
+        const qty = row.quantity;
+        const prevFrom = remaining.get(String(productId)) ?? 0;
 
-      const [item] = await ProductTransfer.create(
-        [
+        await adjustLocationInventory(
+          from_location_id,
+          productId,
+          -qty,
+          fromInvType,
+          session,
+        );
+        await adjustLocationInventory(
+          row.to_location_id,
+          productId,
+          qty,
+          toInvType,
+          session,
+        );
+        remaining.set(String(productId), prevFrom - qty);
+
+        const [item] = await ProductTransfer.create(
+          [
+            {
+              from_location_id,
+              to_location_id: row.to_location_id,
+              product_id: productId,
+              quantity: qty,
+              transfer_date: new Date(transfer_date),
+              notes: notes ?? "",
+              created_by: userId,
+              isDeleted: false,
+            },
+          ],
+          { session },
+        );
+
+        await writeLedger(
           {
-            from_location_id,
-            to_location_id,
-            product_id,
+            transactionType: TX.SHOP_TRANSFER,
+            direction: DIR.OUT,
+            productId,
             quantity: qty,
-            transfer_date: new Date(transfer_date),
-            notes: notes ?? "",
-            created_by: userId,
-            isDeleted: false,
+            locationId: from_location_id,
+            storeId: fromLoc.store_id,
+            referenceType: "ProductTransfer",
+            referenceId: item._id,
+            userId,
+            notes: `Transfer out → ${toLoc.name}`,
+            previousBalance: prevFrom,
+            newBalance: prevFrom - qty,
           },
-        ],
-        opts,
-      );
+          session,
+        );
 
-      await writeLedger(
-        {
-          transactionType: TX.SHOP_TRANSFER,
-          direction: DIR.OUT,
-          productId: product_id,
-          quantity: qty,
-          locationId: from_location_id,
-          storeId: fromLoc.store_id,
-          referenceType: "ProductTransfer",
-          referenceId: item._id,
+        const toPrev = await getLocationInventoryQty(
+          row.to_location_id,
+          productId,
+          toInvType,
+          session,
+        );
+        await writeLedger(
+          {
+            transactionType: TX.SHOP_TRANSFER,
+            direction: DIR.IN,
+            productId,
+            quantity: qty,
+            locationId: row.to_location_id,
+            storeId: toLoc.store_id,
+            referenceType: "ProductTransfer",
+            referenceId: item._id,
+            userId,
+            notes: `Transfer in ← ${fromLoc.name}`,
+            previousBalance: toPrev - qty,
+            newBalance: toPrev,
+          },
+          session,
+        );
+
+        await writeAudit({
+          entityType: "ProductTransfer",
+          entityId: item._id,
+          action: "create",
+          newValue: item.toObject?.() ?? item,
           userId,
-          notes: `Transfer out → ${toLoc.name}`,
-          previousBalance: availableAtFrom,
-          newBalance: availableAtFrom - qty,
-        },
-        session,
-      );
+          session,
+        });
 
-      const toPrev = await getLocationInventoryQty(
-        to_location_id,
-        product_id,
-        toInvType,
-        session,
-      );
-      await writeLedger(
-        {
-          transactionType: TX.SHOP_TRANSFER,
-          direction: DIR.IN,
-          productId: product_id,
-          quantity: qty,
-          locationId: to_location_id,
-          storeId: toLoc.store_id,
-          referenceType: "ProductTransfer",
-          referenceId: item._id,
-          userId,
-          notes: `Transfer in ← ${fromLoc.name}`,
-          previousBalance: toPrev - qty,
-          newBalance: toPrev,
-        },
-        session,
-      );
-
-      await writeAudit({
-        entityType: "ProductTransfer",
-        entityId: item._id,
-        action: "create",
-        newValue: item.toObject?.() ?? item,
-        userId,
-        session,
-      });
-
-      return item;
+        ids.push(item._id);
+      }
+      return ids;
     });
 
-    const populatedResult = await populateRefs(ProductTransfer.findById(populated._id));
+    const populatedResult = await populateRefs(
+      ProductTransfer.find({ _id: { $in: createdIds } }),
+    );
+
     return successMessage(
       res,
-      populatedResult || populated,
-      "Product transfer recorded successfully.",
+      {
+        items: populatedResult,
+        count: createdIds.length,
+      },
+      createdIds.length > 1
+        ? `${createdIds.length} shop transfers recorded successfully.`
+        : "Product transfer recorded successfully.",
     );
   } catch (err) {
     console.error("ProductTransfer create error:", err);

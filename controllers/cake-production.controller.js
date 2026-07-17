@@ -27,6 +27,43 @@ const { assertRmManagerStoreAccess, applyStoreLocationFilter } = require("../uti
 const escapeRegex = (value = "") =>
   String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const round3 = (n) => Math.round((Number(n) || 0) * 1000) / 1000;
+
+/** Build consumption lines from product.bom × quantity produced. */
+const buildBomConsumptionLines = (product, cakes) => {
+  const qty = Number(cakes || 0);
+  if (!qty || qty <= 0 || !Array.isArray(product?.bom) || !product.bom.length) {
+    return [];
+  }
+  return product.bom
+    .map((entry) => {
+      const rmId = entry.rawMaterialId?._id ?? entry.rawMaterialId;
+      const perUnit = Number(entry.quantity_required_per_unit || 0);
+      if (!rmId || perUnit <= 0) return null;
+      return {
+        raw_material_id: rmId,
+        quantity: round3(perUnit * qty),
+      };
+    })
+    .filter(Boolean);
+};
+
+/** Merge BOM lines with optional extra manual lines (sum by raw_material_id). */
+const mergeConsumptionLines = (bomLines = [], extraLines = []) => {
+  const map = new Map();
+  for (const row of [...bomLines, ...extraLines]) {
+    const rmId = row.raw_material_id?._id ?? row.raw_material_id ?? row.rawMaterialId;
+    const qty = Number(row.quantity || 0);
+    if (!rmId || qty <= 0) continue;
+    const key = String(rmId);
+    map.set(key, {
+      raw_material_id: rmId,
+      quantity: round3((map.get(key)?.quantity || 0) + qty),
+    });
+  }
+  return Array.from(map.values());
+};
+
 const populateRefs = (q) =>
   q
     .populate("product_id")
@@ -169,9 +206,21 @@ async function applyProductionImpact({
   let consumptions = [];
   let storeReceipt = null;
 
-  if (productionLocation?._id && rawMaterialsConsumed?.length) {
+  if (productionLocation?._id && cakes > 0) {
+    const bomLines = buildBomConsumptionLines(product, cakes);
+    const extraLines = Array.isArray(rawMaterialsConsumed)
+      ? rawMaterialsConsumed
+      : [];
+    const merged = mergeConsumptionLines(bomLines, extraLines);
+    if (!merged.length) {
+      const err = new Error(
+        `Product "${product.name}" has no recipe (BOM) and no extra RM lines. Add a recipe on the product, or log extra raw materials used.`,
+      );
+      err.status = 400;
+      throw err;
+    }
     consumptions = await applyManualProductionConsumption({
-      rawMaterialsConsumed,
+      rawMaterialsConsumed: merged,
       productionLocationId: productionLocation._id,
       referenceType,
       referenceId,
@@ -504,15 +553,15 @@ const update = async (req, res) => {
           ? await DispatchLocation.findById(existing.location_id).session(session)
           : null;
 
+      // Extras only — BOM is always recomputed from product recipe × qty.
+      // Never reuse existing.raw_materials_consumed (already includes BOM).
       const { productStock, consumptions, storeReceipt } = await applyProductionImpact({
         product: finalProduct,
         cakes: finalCakes,
         productionDate: updatePayload.production_date ?? existing.production_date,
         productionLocation,
         rawMaterialsConsumed:
-          raw_materials_consumed !== undefined
-            ? raw_materials_consumed
-            : existing.raw_materials_consumed,
+          raw_materials_consumed !== undefined ? raw_materials_consumed : [],
         userId,
         referenceType: "CakeProduction",
         referenceId: updated._id,

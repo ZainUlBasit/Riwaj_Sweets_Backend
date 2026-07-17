@@ -23,7 +23,7 @@ const RawMaterialStockSchema = new Schema(
     total_price: requiredNumberWithDefault,
     // purpose tags an inventory movement.
     //   1 = purchase   (default; inflow from a supplier — existing behavior)
-    //   2 = production (outflow allocated for cake production)
+    //   2 = production (outflow allocated for cake production — legacy)
     // Default = 1 keeps every existing document semantically correct
     // without a migration.
     purpose: {
@@ -31,6 +31,13 @@ const RawMaterialStockSchema = new Schema(
       enum: [1, 2],
       default: 1,
       required: true,
+      index: true,
+    },
+    /** RM Store location credited on purchase (type 1). Used for reverse on edit/delete. */
+    rm_store_location_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "DispatchLocation",
+      default: null,
       index: true,
     },
     isDeleted: requiredBooleanWithDefaultFalse,

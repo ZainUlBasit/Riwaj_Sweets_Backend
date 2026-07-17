@@ -1,8 +1,41 @@
 const Product = require("../Models/Products");
+const Category = require("../Models/Category");
 const LocationInventory = require("../Models/LocationInventory");
 const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const { LOCATION_TYPE } = require("../Services/inventoryService");
+
+const UNIT_LABEL_TO_ID = {
+  kg: 1,
+  bag: 2,
+  piece: 3,
+  liter: 4,
+  litre: 4,
+  ounce: 5,
+  pound: 6,
+  gallon: 7,
+  quart: 8,
+  pint: 9,
+  cup: 10,
+};
+
+const resolveUnit = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return value >= 1 && value <= 10 ? value : null;
+  }
+  const raw = String(value).trim();
+  const asNum = Number(raw);
+  if (Number.isInteger(asNum) && asNum >= 1 && asNum <= 10) return asNum;
+  const key = raw.toLowerCase();
+  return UNIT_LABEL_TO_ID[key] ?? null;
+};
+
+const normalizeHeaderKey = (key) =>
+  String(key || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
 
 // Cloudinary configuration for product image uploads. Same env vars as
 // cake-design (CLOUD_NAME / API_KEY / API_SECRET) so a single Cloudinary
@@ -43,6 +76,38 @@ const parseNonNegativeNumber = (value, { fallback = 0 } = {}) => {
   const num = Number(value);
   if (!Number.isFinite(num) || num < 0) return null;
   return num;
+};
+
+/** Parse BOM from JSON body or multipart string. Returns array or null on bad input. */
+const parseBom = (raw) => {
+  if (raw === undefined) return undefined;
+  if (raw === null || raw === "") return [];
+  let arr = raw;
+  if (typeof raw === "string") {
+    try {
+      arr = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!Array.isArray(arr)) return null;
+
+  const out = [];
+  const seen = new Set();
+  for (const row of arr) {
+    const rmId = row?.rawMaterialId || row?.raw_material_id;
+    const qty = Number(row?.quantity_required_per_unit ?? row?.quantity);
+    if (!rmId || !Number.isFinite(qty) || qty < 0) return null;
+    if (qty === 0) continue;
+    const key = String(rmId);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      rawMaterialId: rmId,
+      quantity_required_per_unit: qty,
+    });
+  }
+  return out;
 };
 
 /** Aggregates per-product qty in main stores vs shops from LocationInventory. */
@@ -100,10 +165,12 @@ const list = async (req, res) => {
       Product.find({ isDeleted: false })
         .populate("category_id")
         .populate("counter_id")
+        .populate("bom.rawMaterialId")
         .sort({ createdAt: -1 }),
       Product.find({ isDeleted: true })
         .populate("category_id")
         .populate("counter_id")
+        .populate("bom.rawMaterialId")
         .sort({ createdAt: -1 }),
     ]);
 
@@ -188,6 +255,7 @@ const getOne = async (req, res) => {
     const product = await Product.findById(req.params.id)
       .populate("category_id")
       .populate("counter_id")
+      .populate("bom.rawMaterialId")
       .where({ isDeleted: false });
     if (!product) return createError(res, 404, "Product not found.");
     return successMessage(res, product, "Product fetched successfully.");
@@ -208,6 +276,7 @@ const create = async (req, res) => {
       out_quantity,
       available_quantity,
       counter_id,
+      bom,
     } = req.body;
 
     if (!name || !category_id || !unit) {
@@ -223,6 +292,15 @@ const create = async (req, res) => {
         res,
         400,
         "Price and quantities must be non-negative numbers.",
+      );
+    }
+
+    const parsedBom = parseBom(bom);
+    if (bom !== undefined && parsedBom === null) {
+      return createError(
+        res,
+        400,
+        "Invalid bom. Expected [{ rawMaterialId, quantity_required_per_unit }].",
       );
     }
 
@@ -254,9 +332,14 @@ const create = async (req, res) => {
     if (counter_id !== undefined && counter_id !== null && counter_id !== "") {
       payload.counter_id = counter_id;
     }
+    if (parsedBom !== undefined) payload.bom = parsedBom;
 
     const product = await Product.create(payload);
-    return successMessage(res, product, "Product created successfully.");
+    const populated = await Product.findById(product._id)
+      .populate("category_id")
+      .populate("counter_id")
+      .populate("bom.rawMaterialId");
+    return successMessage(res, populated || product, "Product created successfully.");
   } catch (err) {
     console.error("Product create error:", err);
     return createError(res, 500, err.message || "Failed to create product.");
@@ -275,6 +358,7 @@ const update = async (req, res) => {
       available_quantity,
       counter_id,
       remove_image,
+      bom,
     } = req.body;
 
     const updatePayload = { isDeleted: false };
@@ -317,6 +401,17 @@ const update = async (req, res) => {
     if (counter_id !== undefined) {
       updatePayload.counter_id = counter_id || null;
     }
+    if (bom !== undefined) {
+      const parsedBom = parseBom(bom);
+      if (parsedBom === null) {
+        return createError(
+          res,
+          400,
+          "Invalid bom. Expected [{ rawMaterialId, quantity_required_per_unit }].",
+        );
+      }
+      updatePayload.bom = parsedBom;
+    }
 
     // Image handling:
     //   - new file uploaded -> replace `image` with new Cloudinary URL
@@ -346,7 +441,10 @@ const update = async (req, res) => {
       req.params.id,
       updatePayload,
       { new: true, runValidators: true },
-    );
+    )
+      .populate("category_id")
+      .populate("counter_id")
+      .populate("bom.rawMaterialId");
     if (!product) return createError(res, 404, "Product not found.");
     return successMessage(res, product, "Product updated successfully.");
   } catch (err) {
@@ -370,4 +468,172 @@ const remove = async (req, res) => {
   }
 };
 
-module.exports = { list, getOne, create, update, remove, locationStock };
+/**
+ * POST /api/product/import
+ *
+ * Body: { products: Array<{ name, category|category_name, unit, price?, ... }> }
+ * Resolves category by name (creates if missing). Optional `id`/`product_code`
+ * sets Products.id for barcode item codes.
+ */
+const importBulk = async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.products) ? req.body.products : null;
+    if (!rows || rows.length === 0) {
+      return createError(res, 400, "products array is required.");
+    }
+    if (rows.length > 500) {
+      return createError(res, 400, "Maximum 500 products per import.");
+    }
+
+    const categories = await Category.find({ isDeleted: false });
+    const categoryByName = new Map(
+      categories.map((c) => [String(c.name).trim().toLowerCase(), c]),
+    );
+
+    const created = [];
+    const errors = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const rowNum = i + 1;
+      const raw = rows[i] || {};
+      // Accept both normalized keys and common Excel header aliases.
+      const get = (...keys) => {
+        for (const k of keys) {
+          if (raw[k] !== undefined && raw[k] !== null && raw[k] !== "") {
+            return raw[k];
+          }
+          const nk = normalizeHeaderKey(k);
+          for (const [rk, rv] of Object.entries(raw)) {
+            if (normalizeHeaderKey(rk) === nk && rv !== undefined && rv !== null && rv !== "") {
+              return rv;
+            }
+          }
+        }
+        return undefined;
+      };
+
+      try {
+        const name = String(get("name", "product_name", "product") || "").trim();
+        const categoryName = String(
+          get("category", "category_name") || "",
+        ).trim();
+        const unit = resolveUnit(get("unit", "unit_id", "uom"));
+        const priceNum = parseNonNegativeNumber(get("price", "sale_price"), {
+          fallback: 0,
+        });
+        const inQty = parseNonNegativeNumber(
+          get("in_quantity", "in_qty", "stock_in"),
+          { fallback: 0 },
+        );
+        const outQty = parseNonNegativeNumber(
+          get("out_quantity", "out_qty", "stock_out"),
+          { fallback: 0 },
+        );
+        const availQty = parseNonNegativeNumber(
+          get("available_quantity", "available_qty", "stock", "qty"),
+          { fallback: 0 },
+        );
+        const productCodeRaw = get("id", "product_code", "item_code", "code");
+
+        if (!name) {
+          errors.push({ row: rowNum, message: "Name is required." });
+          continue;
+        }
+        if (!categoryName) {
+          errors.push({ row: rowNum, message: "Category is required." });
+          continue;
+        }
+        if (unit == null) {
+          errors.push({
+            row: rowNum,
+            message:
+              "Unit is required (1-10 or Kg/Bag/Piece/Liter/Ounce/Pound/Gallon/Quart/Pint/Cup).",
+          });
+          continue;
+        }
+        if ([priceNum, inQty, outQty, availQty].some((v) => v === null)) {
+          errors.push({
+            row: rowNum,
+            message: "Price and quantities must be non-negative numbers.",
+          });
+          continue;
+        }
+
+        let category = categoryByName.get(categoryName.toLowerCase());
+        if (!category) {
+          category = await Category.create({
+            name: categoryName,
+            isDeleted: false,
+          });
+          categoryByName.set(categoryName.toLowerCase(), category);
+        }
+
+        const payload = {
+          name,
+          category_id: category._id,
+          unit,
+          price: priceNum,
+          in_quantity: inQty,
+          out_quantity: outQty,
+          available_quantity: availQty,
+          isDeleted: false,
+        };
+
+        if (productCodeRaw !== undefined) {
+          const code = Number(productCodeRaw);
+          if (!Number.isInteger(code) || code <= 0) {
+            errors.push({
+              row: rowNum,
+              message: "id/product_code must be a positive integer.",
+            });
+            continue;
+          }
+          const existing = await Product.findOne({
+            id: code,
+            isDeleted: false,
+          }).select("_id");
+          if (existing) {
+            errors.push({
+              row: rowNum,
+              message: `Product code ${code} already exists.`,
+            });
+            continue;
+          }
+          payload.id = code;
+        }
+
+        const product = await Product.create(payload);
+        created.push(product);
+      } catch (rowErr) {
+        errors.push({
+          row: rowNum,
+          message: rowErr.message || "Failed to import row.",
+        });
+      }
+    }
+
+    return successMessage(
+      res,
+      {
+        created_count: created.length,
+        error_count: errors.length,
+        created,
+        errors,
+      },
+      `Imported ${created.length} product(s). ${errors.length} row(s) failed.`,
+    );
+  } catch (err) {
+    console.error("Product importBulk error:", err);
+    return createError(res, 500, err.message || "Failed to import products.");
+  }
+};
+
+module.exports = {
+  list,
+  getOne,
+  create,
+  update,
+  remove,
+  locationStock,
+  importBulk,
+};

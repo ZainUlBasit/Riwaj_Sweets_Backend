@@ -9,10 +9,9 @@ const LOCATION_TYPE = {
   FINISHED_GOODS_STORE: 4,
 };
 
-const SINGLETON_TYPES = [
-  LOCATION_TYPE.RAW_MATERIAL_STORE,
-  LOCATION_TYPE.FINISHED_GOODS_STORE,
-];
+// Product Store is unique per godown. RM Store is unique for the WHOLE system
+// (one central raw-material store; production areas can be many).
+const PER_GODOWN_SINGLETON_TYPES = [LOCATION_TYPE.FINISHED_GOODS_STORE];
 
 const getSingletonLabel = (type) => {
   if (type === LOCATION_TYPE.RAW_MATERIAL_STORE) return "Raw Material Store";
@@ -20,11 +19,24 @@ const getSingletonLabel = (type) => {
   return "location";
 };
 
+/** Per-godown singleton (Product Store). */
 async function assertSingletonLocation(storeId, locationType, excludeId = null) {
-  if (!storeId || !SINGLETON_TYPES.includes(Number(locationType))) return null;
+  if (!storeId || !PER_GODOWN_SINGLETON_TYPES.includes(Number(locationType))) {
+    return null;
+  }
   const filter = {
     store_id: storeId,
     location_type: Number(locationType),
+    isDeleted: false,
+  };
+  if (excludeId) filter._id = { $ne: excludeId };
+  return DispatchLocation.findOne(filter);
+}
+
+/** Global singleton — the single RM Store for the entire system. */
+async function findGlobalRmStore(excludeId = null) {
+  const filter = {
+    location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
     isDeleted: false,
   };
   if (excludeId) filter._id = { $ne: excludeId };
@@ -49,12 +61,16 @@ const list = async (req, res) => {
       (req.query.store_id ? String(req.query.store_id) : null);
     if (scopedStore) filter.store_id = scopedStore;
 
-    const items = await DispatchLocation.find(filter).sort({
+    const items = await DispatchLocation.find(filter)
+      .populate("store_id", "name")
+      .sort({
       name: 1,
     });
     const deletedFilter = { isDeleted: true };
     if (scopedStore) deletedFilter.store_id = scopedStore;
-    const deletedItems = await DispatchLocation.find(deletedFilter).sort({
+    const deletedItems = await DispatchLocation.find(deletedFilter)
+      .populate("store_id", "name")
+      .sort({
       name: 1,
     });
 
@@ -110,7 +126,17 @@ const create = async (req, res) => {
     }
 
     const locType = location_type != null ? Number(location_type) : 2;
-    if (store_id) {
+
+    if (locType === LOCATION_TYPE.RAW_MATERIAL_STORE) {
+      const existingRm = await findGlobalRmStore();
+      if (existingRm) {
+        return createError(
+          res,
+          409,
+          `Only one RM Store is allowed in the whole system ("${existingRm.name}"). Production areas can be many.`,
+        );
+      }
+    } else if (store_id) {
       const duplicate = await assertSingletonLocation(store_id, locType);
       if (duplicate) {
         return createError(
@@ -179,7 +205,16 @@ const update = async (req, res) => {
         ? updatePayload.location_type
         : current.location_type;
 
-    if (effectiveStoreId) {
+    if (Number(effectiveType) === LOCATION_TYPE.RAW_MATERIAL_STORE) {
+      const existingRm = await findGlobalRmStore(req.params.id);
+      if (existingRm) {
+        return createError(
+          res,
+          409,
+          `Only one RM Store is allowed in the whole system ("${existingRm.name}").`,
+        );
+      }
+    } else if (effectiveStoreId) {
       const duplicate = await assertSingletonLocation(
         effectiveStoreId,
         effectiveType,
@@ -292,4 +327,5 @@ module.exports = {
   update,
   remove,
   getOrCreateLocation,
+  findGlobalRmStore,
 };

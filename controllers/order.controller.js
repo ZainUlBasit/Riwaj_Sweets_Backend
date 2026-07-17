@@ -23,6 +23,14 @@ const generateBarcodeLookup = () => {
 };
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const round3 = (n) => Math.round((Number(n) || 0) * 1000) / 1000;
+
+const PRODUCT_BARCODE_LENGTH = 13;
+const PRODUCT_CODE_START = 1;
+const PRODUCT_CODE_END = 7;
+const MEASURE_START = 7;
+const MEASURE_END = 12;
+const PIECE_UNIT = 3;
 
 const computePaymentStatus = (paid, total) => {
   if (paid <= 0) return PAYMENT_STATUS.UNPAID;
@@ -112,6 +120,80 @@ const parseBarcode = (code) => {
     // Not JSON: treat as lookup code.
   }
   return { lookup: raw, raw };
+};
+
+const parseProductBarcode = (barcode) => {
+  const raw = String(barcode || "").trim();
+  if (!/^\d+$/.test(raw) || raw.length !== PRODUCT_BARCODE_LENGTH) {
+    throw Object.assign(new Error("Barcode must be exactly 13 digits."), {
+      status: 400,
+    });
+  }
+
+  const productSegment = raw.slice(PRODUCT_CODE_START, PRODUCT_CODE_END);
+  const productCode = Number(productSegment.slice(-4));
+  const measure = raw.slice(MEASURE_START, MEASURE_END);
+  const whole = Number(measure.slice(0, 2));
+  const fraction = Number(measure.slice(2, 5));
+
+  if (!Number.isInteger(productCode) || productCode <= 0) {
+    throw Object.assign(new Error("Invalid product code in barcode."), {
+      status: 400,
+    });
+  }
+  if (!Number.isInteger(whole) || !Number.isInteger(fraction)) {
+    throw Object.assign(new Error("Invalid quantity/weight in barcode."), {
+      status: 400,
+    });
+  }
+
+  return { raw, productCode, whole, fraction };
+};
+
+const resolveProductBarcodeItem = async (barcode) => {
+  const parsed = parseProductBarcode(barcode);
+  const product = await Product.findOne({
+    id: parsed.productCode,
+    isDeleted: false,
+  }).populate("category_id");
+
+  if (!product) {
+    throw Object.assign(
+      new Error(`Product not found for item code ${parsed.productCode}.`),
+      { status: 404 },
+    );
+  }
+
+  let quantity;
+  if (Number(product.unit) === PIECE_UNIT) {
+    if (parsed.whole <= 0 || parsed.whole > 99) {
+      throw Object.assign(
+        new Error("Piece quantity must be between 1 and 99."),
+        { status: 400 },
+      );
+    }
+    quantity = parsed.whole;
+  } else {
+    quantity = round3(parsed.whole + parsed.fraction / 1000);
+    if (quantity <= 0) {
+      throw Object.assign(new Error("Weight must be greater than 0."), {
+        status: 400,
+      });
+    }
+  }
+
+  const unitPrice = round2(product.price ?? 0);
+  return {
+    barcode: parsed.raw,
+    product,
+    product_id: product._id,
+    product_code: product.id,
+    name: product.name,
+    unit: product.unit,
+    quantity,
+    unit_price: unitPrice,
+    total_price: round2(quantity * unitPrice),
+  };
 };
 
 /**
@@ -259,6 +341,132 @@ const scanBarcode = async (req, res) => {
   } catch (err) {
     console.error("Order scanBarcode error:", err);
     return createError(res, 500, err.message || "Failed to scan barcode.");
+  }
+};
+
+const scanProductBarcode = async (req, res) => {
+  try {
+    const item = await resolveProductBarcodeItem(req.body?.barcode || req.body?.code);
+    return successMessage(
+      res,
+      { item },
+      "Product barcode scanned successfully.",
+    );
+  } catch (err) {
+    if (err.status) return createError(res, err.status, err.message);
+    console.error("Order scanProductBarcode error:", err);
+    return createError(res, 500, err.message || "Failed to scan product barcode.");
+  }
+};
+
+const cashSale = async (req, res) => {
+  try {
+    const { items: rawItems, customer_info, notes, discount = 0 } = req.body || {};
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      return createError(res, 400, "At least one scanned item is required.");
+    }
+
+    const resolved = [];
+    for (const raw of rawItems) {
+      if (!raw?.barcode) {
+        return createError(res, 400, "Each item needs a scanned barcode.");
+      }
+      const item = await resolveProductBarcodeItem(raw.barcode);
+      resolved.push({
+        product_id: item.product_id,
+        name: item.name,
+        quantity: item.quantity,
+        unit_price: item.unit_price,
+        total_price: item.total_price,
+      });
+    }
+
+    const requiredByProduct = new Map();
+    for (const item of resolved) {
+      const key = String(item.product_id);
+      requiredByProduct.set(
+        key,
+        (requiredByProduct.get(key) || 0) + Number(item.quantity || 0),
+      );
+    }
+
+    for (const [productId, requiredQty] of requiredByProduct.entries()) {
+      const product = await Product.findById(productId).where({ isDeleted: false });
+      if (!product) {
+        return createError(res, 404, "One or more products no longer exist.");
+      }
+      const available = Number(product.available_quantity || 0);
+      if (available < requiredQty) {
+        return createError(
+          res,
+          409,
+          `Insufficient stock for "${product.name}". Available: ${available}, requested: ${round3(requiredQty)}.`,
+        );
+      }
+    }
+
+    const subtotal = round2(
+      resolved.reduce((sum, item) => sum + Number(item.total_price || 0), 0),
+    );
+    const discountAmt = round2(Math.max(0, Number(discount) || 0));
+    if (discountAmt > subtotal) {
+      return createError(res, 400, "Discount cannot be greater than subtotal.");
+    }
+    const total = round2(Math.max(0, subtotal - discountAmt));
+    const barcodeLookup = generateBarcodeLookup();
+    const order = await Order.create({
+      barcode: barcodeLookup,
+      barcode_lookup: barcodeLookup,
+      items: resolved,
+      subtotal,
+      discount: discountAmt,
+      total,
+      status: ORDER_STATUS.DELIVERED,
+      payment_status: PAYMENT_STATUS.PAID,
+      payment_flag: "paid",
+      paid_amount: total,
+      payments:
+        total > 0
+          ? [
+              {
+                amount: total,
+                method: "cash",
+                paid_at: new Date(),
+                note: "Cash counter barcode sale",
+              },
+            ]
+          : [],
+      customer_info: {
+        name: customer_info?.name ?? "",
+        phone: customer_info?.phone ?? "",
+      },
+      notes: notes ?? "Cash counter barcode sale",
+      billed_at: new Date(),
+      delivered_at: new Date(),
+      isDeleted: false,
+    });
+
+    for (const item of resolved) {
+      await Product.findByIdAndUpdate(item.product_id, {
+        $inc: {
+          available_quantity: -item.quantity,
+          out_quantity: item.quantity,
+        },
+      });
+    }
+
+    const invoice = await createFromOrder(order);
+    if (invoice?._id) {
+      order.sale_invoice_id = invoice._id;
+      await order.save();
+    }
+
+    const populated = await populate(Order.findById(order._id));
+    return successMessage(res, populated, "Cash sale completed successfully.");
+  } catch (err) {
+    if (err.status) return createError(res, err.status, err.message);
+    console.error("Order cashSale error:", err);
+    return createError(res, 500, err.message || "Failed to complete cash sale.");
   }
 };
 
@@ -749,6 +957,9 @@ module.exports = {
   getOne,
   getByBarcode,
   scanBarcode,
+  scanProductBarcode,
+  cashSale,
+  resolveProductBarcodeItem,
   create,
   bill,
   addPayment,

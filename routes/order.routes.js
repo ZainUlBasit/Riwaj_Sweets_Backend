@@ -71,6 +71,8 @@ router.use(verifyToken);
 router.get("/", controller.list);
 router.get("/by-barcode/:code", controller.getByBarcode);
 router.post("/scan", controller.scanBarcode);
+router.post("/scan-product-barcode", controller.scanProductBarcode);
+router.post("/cash-sale", controller.cashSale);
 router.get("/:id", controller.getOne);
 router.post("/", controller.create);
 router.post("/batch-receive", controller.batchReceive);

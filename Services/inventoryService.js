@@ -21,6 +21,7 @@ const TX = {
   ADJUSTMENT: 8,
   STORE_RECEIPT: 9,
   RAW_MATERIAL_DISPATCH: 10,
+  RAW_MATERIAL_WASTAGE: 11,
 };
 
 const DIR = { IN: 1, OUT: 2 };
@@ -156,15 +157,7 @@ async function validateRmTransferLocations(fromLocationId, toLocationId, session
     err.status = 400;
     throw err;
   }
-  if (
-    fromLoc.store_id &&
-    toLoc.store_id &&
-    String(fromLoc.store_id) !== String(toLoc.store_id)
-  ) {
-    const err = new Error("RM Store and Production Area must belong to the same godown.");
-    err.status = 400;
-    throw err;
-  }
+  // Single central RM Store can dispatch to production areas in any godown.
   return { fromLoc, toLoc };
 }
 
@@ -236,6 +229,64 @@ async function creditRmStoreOnPurchase({
 }
 
 /**
+ * Reverse a purchase credit at RM Store (edit/delete purchase).
+ */
+async function debitRmStoreOnPurchaseReverse({
+  rmStoreLocationId,
+  rawMaterialId,
+  quantity,
+  referenceType,
+  referenceId,
+  userId = null,
+  notes = "",
+  session = null,
+}) {
+  const qty = Number(quantity);
+  if (!rmStoreLocationId || !qty || qty <= 0) return null;
+
+  const loc = await validateRmStoreLocation(rmStoreLocationId, session);
+  const prevQty = await getLocationRawMaterialQty(
+    rmStoreLocationId,
+    rawMaterialId,
+    session,
+  );
+  if (qty > prevQty) {
+    const err = new Error(
+      `Cannot reverse purchase: RM Store only has ${prevQty} remaining (need ${qty}). Transfer or consumption may have already used this stock.`,
+    );
+    err.status = 409;
+    throw err;
+  }
+
+  await adjustLocationRawMaterialInventory(
+    rmStoreLocationId,
+    rawMaterialId,
+    -qty,
+    session,
+  );
+
+  await writeLedger(
+    {
+      transactionType: TX.ADJUSTMENT,
+      direction: DIR.OUT,
+      rawMaterialId,
+      quantity: qty,
+      locationId: rmStoreLocationId,
+      storeId: loc.store_id ?? null,
+      referenceType,
+      referenceId,
+      userId,
+      notes: notes || "Purchase reversed at RM Store",
+      previousBalance: prevQty,
+      newBalance: prevQty - qty,
+    },
+    session,
+  );
+
+  return loc;
+}
+
+/**
  * Manually consume raw materials at a production area (no BOM).
  */
 async function applyManualProductionConsumption({
@@ -298,6 +349,13 @@ async function applyManualProductionConsumption({
       session,
     );
 
+    // Keep global RM totals in sync (purchase credits global; consumption must debit it).
+    await adjustRawMaterial(
+      rmId,
+      { outDelta: qty, availDelta: -qty },
+      session,
+    );
+
     await writeLedger(
       {
         transactionType: TX.RAW_MATERIAL_CONSUMPTION,
@@ -355,6 +413,12 @@ async function reverseManualProductionConsumption(
       session,
     );
 
+    await adjustRawMaterial(
+      rmId,
+      { outDelta: -qty, availDelta: qty },
+      session,
+    );
+
     await writeLedger(
       {
         transactionType: TX.ADJUSTMENT,
@@ -373,6 +437,101 @@ async function reverseManualProductionConsumption(
       session,
     );
   }
+}
+
+/**
+ * Record RM wastage / spoilage at a location (RM store or production area).
+ * Deducts from LocationRawMaterialInventory and writes a wastage ledger entry.
+ */
+async function recordRmWastage({
+  locationId,
+  rawMaterialId,
+  quantity,
+  notes = "",
+  userId = null,
+  session = null,
+}) {
+  const qty = Number(quantity || 0);
+  if (!locationId || !rawMaterialId || !Number.isFinite(qty) || qty <= 0) {
+    const err = new Error("location_id, raw_material_id and quantity > 0 are required.");
+    err.status = 400;
+    throw err;
+  }
+
+  const locQ = DispatchLocation.findById(locationId).where({ isDeleted: false });
+  if (session) locQ.session(session);
+  const loc = await locQ;
+  if (!loc) {
+    const err = new Error("Location not found.");
+    err.status = 404;
+    throw err;
+  }
+  const locType = Number(loc.location_type);
+  if (
+    locType !== LOCATION_TYPE.RAW_MATERIAL_STORE &&
+    locType !== LOCATION_TYPE.PRODUCTION_AREA
+  ) {
+    const err = new Error(
+      "Wastage can only be recorded at an RM Store or Production Area.",
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  const rmQ = RawMaterial.findById(rawMaterialId).where({ isDeleted: false });
+  if (session) rmQ.session(session);
+  const rm = await rmQ;
+  if (!rm) {
+    const err = new Error("Raw material not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  const prevQty = await getLocationRawMaterialQty(locationId, rawMaterialId, session);
+  if (qty > prevQty) {
+    const err = new Error(
+      `Insufficient stock for wastage of "${rm.name}". Available: ${prevQty}, requested: ${qty}.`,
+    );
+    err.status = 409;
+    throw err;
+  }
+
+  await adjustLocationRawMaterialInventory(locationId, rawMaterialId, -qty, session);
+
+  await adjustRawMaterial(
+    rawMaterialId,
+    { outDelta: qty, availDelta: -qty },
+    session,
+  );
+
+  await writeLedger(
+    {
+      transactionType: TX.RAW_MATERIAL_WASTAGE,
+      direction: DIR.OUT,
+      rawMaterialId,
+      quantity: qty,
+      locationId,
+      storeId: loc.store_id ?? null,
+      referenceType: "RmWastage",
+      referenceId: null,
+      userId,
+      notes: notes?.trim() || `Wastage: ${rm.name}`,
+      previousBalance: prevQty,
+      newBalance: prevQty - qty,
+    },
+    session,
+  );
+
+  return {
+    location_id: loc._id,
+    location_name: loc.name,
+    raw_material_id: rm._id,
+    raw_material_name: rm.name,
+    quantity: qty,
+    previous_quantity: prevQty,
+    remaining_quantity: prevQty - qty,
+    notes: notes?.trim() || "",
+  };
 }
 
 function getUserId(req) {
@@ -1232,8 +1391,10 @@ module.exports = {
   validateRmTransferLocations,
   validateRmStoreLocation,
   creditRmStoreOnPurchase,
+  debitRmStoreOnPurchaseReverse,
   applyManualProductionConsumption,
   reverseManualProductionConsumption,
+  recordRmWastage,
   executeStoreReceipt,
   reverseStoreReceipt,
   applyRawMaterialDispatchImpact,

@@ -7,6 +7,7 @@ const Product = require("../Models/Products");
 const DispatchLocation = require("../Models/DispatchLocation");
 const LocationInventory = require("../Models/LocationInventory");
 const { createFromOrder } = require("./sale-invoice.controller");
+const { resolveProductBarcodeItem } = require("./order.controller");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const { SHOP_SECRET } = require("../Middleware/shopAuth");
 const {
@@ -17,6 +18,7 @@ const {
   writeLedger,
   adjustLocationInventory,
   getLocationInventoryQty,
+  adjustProduct,
   withTransaction,
 } = require("../Services/inventoryService");
 
@@ -25,6 +27,7 @@ const ORDER_STATUS = { PENDING: 1, BILLED: 2, DELIVERED: 3, CANCELLED: 4 };
 const PAYMENT_STATUS = { UNPAID: 1, PARTIAL: 2, PAID: 3 };
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const round3 = (n) => Math.round((Number(n) || 0) * 1000) / 1000;
 
 const populateShop = (q) =>
   q.populate({
@@ -339,13 +342,74 @@ const inventory = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/shop/sync/catalog
+ * Full catalog + shop location qty for desktop offline cache.
+ * Includes zero-qty products so barcodes still resolve offline.
+ */
+const syncCatalog = async (req, res) => {
+  try {
+    const shop = req.shop;
+    const locationId = shop.location_id;
+
+    const [products, invRows] = await Promise.all([
+      Product.find({ isDeleted: false })
+        .select("_id id name unit price category_id available_quantity")
+        .sort({ name: 1 })
+        .lean(),
+      LocationInventory.find({
+        location_id: locationId,
+        inventory_type: INV_TYPE.SHOP,
+        isDeleted: false,
+      }).lean(),
+    ]);
+
+    const qtyByProduct = new Map(
+      invRows.map((row) => [String(row.product_id), Number(row.quantity || 0)]),
+    );
+
+    const items = products.map((product) => ({
+      product_id: String(product._id),
+      product_code: Number(product.id),
+      name: product.name,
+      unit: Number(product.unit),
+      price: Number(product.price || 0),
+      category_id: product.category_id ? String(product.category_id) : null,
+      quantity: qtyByProduct.get(String(product._id)) || 0,
+    }));
+
+    return successMessage(
+      res,
+      {
+        shop_id: String(shop._id),
+        location_id: locationId ? String(locationId) : null,
+        synced_at: new Date().toISOString(),
+        items,
+      },
+      "Shop catalog synced.",
+    );
+  } catch (err) {
+    console.error("Shop syncCatalog error:", err);
+    return createError(res, 500, err.message || "Failed to sync catalog.");
+  }
+};
+
 const todaySales = async (req, res) => {
   try {
     const shop = req.shop;
-    const start = new Date();
+    const { start_date, end_date } = req.query || {};
+    const start = start_date ? new Date(`${start_date}T00:00:00`) : new Date();
     start.setHours(0, 0, 0, 0);
-    const end = new Date();
+    const end = end_date ? new Date(`${end_date}T23:59:59.999`) : new Date();
     end.setHours(23, 59, 59, 999);
+
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      start > end
+    ) {
+      return createError(res, 400, "Valid date range is required.");
+    }
 
     const items = await Order.find({
       shop_id: shop._id,
@@ -359,21 +423,233 @@ const todaySales = async (req, res) => {
     const summary = items.reduce(
       (acc, order) => {
         acc.count += 1;
-        acc.total += Number(order.total || 0);
+        acc.bill_total += Number(order.subtotal || 0);
+        acc.discount += Number(order.discount || 0);
+        acc.net_total += Number(order.total || 0);
         acc.paid += Number(order.paid_amount || 0);
+        // legacy aliases
+        acc.total += Number(order.total || 0);
         return acc;
       },
-      { count: 0, total: 0, paid: 0 },
+      { count: 0, bill_total: 0, discount: 0, net_total: 0, paid: 0, total: 0 },
     );
 
     return successMessage(
       res,
-      { items, summary: { ...summary, total: round2(summary.total), paid: round2(summary.paid) } },
-      "Today's sales fetched.",
+      {
+        items,
+        start_date: start_date || null,
+        end_date: end_date || null,
+        summary: {
+          count: summary.count,
+          bill_total: round2(summary.bill_total),
+          discount: round2(summary.discount),
+          net_total: round2(summary.net_total),
+          paid: round2(summary.paid),
+          total: round2(summary.total),
+        },
+      },
+      "Shop sales fetched.",
     );
   } catch (err) {
     console.error("Shop todaySales error:", err);
     return createError(res, 500, err.message || "Failed to load sales.");
+  }
+};
+
+const scanProductBarcode = async (req, res) => {
+  try {
+    const shop = req.shop;
+    const item = await resolveProductBarcodeItem(
+      req.body?.barcode || req.body?.code,
+    );
+    const available_qty = await getLocationInventoryQty(
+      shop.location_id,
+      item.product_id,
+      INV_TYPE.SHOP,
+    );
+    return successMessage(
+      res,
+      {
+        item: {
+          ...item,
+          product: undefined,
+          available_qty,
+          available_quantity: available_qty,
+        },
+      },
+      "Product barcode scanned successfully.",
+    );
+  } catch (err) {
+    if (err.status) return createError(res, err.status, err.message);
+    console.error("Shop scanProductBarcode error:", err);
+    return createError(res, 500, err.message || "Failed to scan product barcode.");
+  }
+};
+
+/**
+ * POST /api/shop/cash-sale
+ * Barcode cash sale — deducts shop location inventory and creates delivered order.
+ */
+const cashBarcodeSale = async (req, res) => {
+  try {
+    const shop = req.shop;
+    const { items: rawItems, customer_info, notes, discount = 0 } = req.body || {};
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      return createError(res, 400, "At least one scanned item is required.");
+    }
+
+    const resolved = [];
+    for (const raw of rawItems) {
+      if (!raw?.barcode) {
+        return createError(res, 400, "Each item needs a scanned barcode.");
+      }
+      const item = await resolveProductBarcodeItem(raw.barcode);
+      resolved.push({
+        product_id: item.product_id,
+        name: item.name,
+        quantity: item.quantity,
+        unit_price: item.unit_price,
+        total_price: item.total_price,
+      });
+    }
+
+    const requiredByProduct = new Map();
+    for (const item of resolved) {
+      const key = String(item.product_id);
+      requiredByProduct.set(
+        key,
+        (requiredByProduct.get(key) || 0) + Number(item.quantity || 0),
+      );
+    }
+
+    for (const [productId, requiredQty] of requiredByProduct.entries()) {
+      const product = await Product.findById(productId).where({ isDeleted: false });
+      if (!product) {
+        return createError(res, 404, "One or more products no longer exist.");
+      }
+      const available = await getLocationInventoryQty(
+        shop.location_id,
+        product._id,
+        INV_TYPE.SHOP,
+      );
+      if (available < requiredQty) {
+        return createError(
+          res,
+          409,
+          `Insufficient shop stock for "${product.name}". Available: ${available}, requested: ${round3(requiredQty)}.`,
+        );
+      }
+    }
+
+    const subtotal = round2(
+      resolved.reduce((sum, item) => sum + Number(item.total_price || 0), 0),
+    );
+    const discountAmt = round2(Math.max(0, Number(discount) || 0));
+    if (discountAmt > subtotal) {
+      return createError(res, 400, "Discount cannot be greater than subtotal.");
+    }
+    const total = round2(Math.max(0, subtotal - discountAmt));
+    const barcode = generateBarcodeLookup();
+
+    const order = await withTransaction(async (session) => {
+      const opts = { session };
+
+      for (const item of resolved) {
+        const prevQty = await getLocationInventoryQty(
+          shop.location_id,
+          item.product_id,
+          INV_TYPE.SHOP,
+          session,
+        );
+        await adjustLocationInventory(
+          shop.location_id,
+          item.product_id,
+          -item.quantity,
+          INV_TYPE.SHOP,
+          session,
+        );
+        await adjustProduct(
+          item.product_id,
+          { outDelta: item.quantity, availDelta: -item.quantity },
+          session,
+        );
+        await writeLedger(
+          {
+            transactionType: TX.PRODUCT_SALE,
+            direction: DIR.OUT,
+            productId: item.product_id,
+            quantity: item.quantity,
+            locationId: shop.location_id,
+            storeId: null,
+            referenceType: "ShopBarcodeSale",
+            referenceId: shop._id,
+            userId: null,
+            notes: `Shop barcode sale: ${shop.name}`,
+            previousBalance: prevQty,
+            newBalance: prevQty - item.quantity,
+          },
+          session,
+        );
+      }
+
+      const [created] = await Order.create(
+        [
+          {
+            barcode,
+            barcode_lookup: barcode,
+            items: resolved,
+            subtotal,
+            discount: discountAmt,
+            total,
+            status: ORDER_STATUS.DELIVERED,
+            payment_status: PAYMENT_STATUS.PAID,
+            payment_flag: "paid",
+            paid_amount: total,
+            payments:
+              total > 0
+                ? [
+                    {
+                      amount: total,
+                      method: "cash",
+                      paid_at: new Date(),
+                      note: "Shop barcode cash sale",
+                    },
+                  ]
+                : [],
+            shop_id: shop._id,
+            shop_location_id: shop.location_id,
+            customer_info: {
+              name: customer_info?.name?.trim() || "",
+              phone: customer_info?.phone?.trim() || "",
+            },
+            notes: notes?.trim() || "Shop barcode cash sale",
+            billed_at: new Date(),
+            delivered_at: new Date(),
+            isDeleted: false,
+          },
+        ],
+        opts,
+      );
+
+      return created;
+    });
+
+    const invoice = await createFromOrder(order);
+    if (invoice?._id) {
+      order.sale_invoice_id = invoice._id;
+      await order.save();
+    }
+
+    const populated = await Order.findById(order._id)
+      .populate("items.product_id")
+      .populate("sale_invoice_id");
+
+    return successMessage(res, populated, "Shop cash sale completed successfully.");
+  } catch (err) {
+    if (err.status) return createError(res, err.status, err.message);
+    console.error("Shop cashBarcodeSale error:", err);
+    return createError(res, 500, err.message || "Failed to complete shop cash sale.");
   }
 };
 
@@ -432,7 +708,10 @@ const posSale = async (req, res) => {
     const subtotal = round2(
       resolvedItems.reduce((sum, item) => sum + item.total_price, 0),
     );
-    const discountAmt = round2(Math.max(0, discount));
+    const discountAmt = round2(Math.max(0, Number(discount) || 0));
+    if (discountAmt > subtotal) {
+      return createError(res, 400, "Discount cannot be greater than subtotal.");
+    }
     const total = round2(Math.max(0, subtotal - discountAmt));
     const paidAmount = round2(payment?.amount ?? total);
     if (paidAmount < 0) {
@@ -463,6 +742,11 @@ const posSale = async (req, res) => {
           item.product_id,
           -item.quantity,
           INV_TYPE.SHOP,
+          session,
+        );
+        await adjustProduct(
+          item.product_id,
+          { outDelta: item.quantity, availDelta: -item.quantity },
           session,
         );
         await writeLedger(
@@ -561,6 +845,9 @@ module.exports = {
   login,
   me,
   inventory,
+  syncCatalog,
   todaySales,
+  scanProductBarcode,
+  cashBarcodeSale,
   posSale,
 };
