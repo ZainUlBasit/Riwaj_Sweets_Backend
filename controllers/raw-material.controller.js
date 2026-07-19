@@ -1,5 +1,13 @@
 const RawMaterial = require("../Models/RawMaterial");
 const { createError, successMessage } = require("../utils/ResponseMessage");
+const {
+  TX,
+  DIR,
+  getUserId,
+  writeAudit,
+  writeLedger,
+  withTransaction,
+} = require("../Services/inventoryService");
 
 const list = async (req, res) => {
   try {
@@ -35,20 +43,69 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, supplier_id, price, unit, in_quantity, out_quantity, available_quantity } = req.body;
+    const { name, supplier_id, price, unit, opening_quantity } = req.body;
     if (!name || !supplier_id || unit == null) {
       return createError(res, 400, "Name, supplier_id and unit are required.");
     }
-    const item = await RawMaterial.create({
-      name,
-      supplier_id,
-      price: price ?? 0,
-      unit,
-      in_quantity: in_quantity ?? 0,
-      out_quantity: out_quantity ?? 0,
-      available_quantity: available_quantity ?? 0,
-      isDeleted: false,
+    const openingQty = Number(opening_quantity ?? 0);
+    if (!Number.isFinite(openingQty) || openingQty < 0) {
+      return createError(
+        res,
+        400,
+        "opening_quantity must be a non-negative number.",
+      );
+    }
+
+    const userId = getUserId(req);
+    const item = await withTransaction(async (session) => {
+      const [created] = await RawMaterial.create(
+        [
+          {
+            name,
+            supplier_id,
+            price: price ?? 0,
+            unit,
+            opening_quantity: openingQty,
+            in_quantity: openingQty,
+            out_quantity: 0,
+            available_quantity: openingQty,
+            isDeleted: false,
+          },
+        ],
+        { session },
+      );
+
+      if (openingQty > 0) {
+        await writeLedger(
+          {
+            transactionType: TX.ADJUSTMENT,
+            direction: DIR.IN,
+            rawMaterialId: created._id,
+            quantity: openingQty,
+            referenceType: "RawMaterial",
+            referenceId: created._id,
+            userId,
+            notes: "Opening quantity",
+            previousBalance: 0,
+            newBalance: openingQty,
+          },
+          session,
+        );
+      }
+
+      await writeAudit({
+        entityType: "RawMaterial",
+        entityId: created._id,
+        action: "create",
+        newValue: created.toObject(),
+        userId,
+        notes: `Raw material created with opening quantity ${openingQty}.`,
+        session,
+      });
+
+      return created;
     });
+
     return successMessage(res, item, "Raw material created successfully.");
   } catch (err) {
     console.error("RawMaterial create error:", err);
