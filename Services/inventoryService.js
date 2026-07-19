@@ -143,7 +143,7 @@ async function validateRmTransferLocations(fromLocationId, toLocationId, session
     throw err;
   }
   if (!toLoc) {
-    const err = new Error("Production area (destination) not found.");
+    const err = new Error("Destination location not found.");
     err.status = 404;
     throw err;
   }
@@ -152,12 +152,16 @@ async function validateRmTransferLocations(fromLocationId, toLocationId, session
     err.status = 400;
     throw err;
   }
-  if (Number(toLoc.location_type) !== LOCATION_TYPE.PRODUCTION_AREA) {
-    const err = new Error("Destination must be a Production Area.");
+  const allowedDestinationTypes = [
+    LOCATION_TYPE.PRODUCTION_AREA,
+    LOCATION_TYPE.SHOP,
+  ];
+  if (!allowedDestinationTypes.includes(Number(toLoc.location_type))) {
+    const err = new Error("Destination must be a Production Area or Shop.");
     err.status = 400;
     throw err;
   }
-  // Single central RM Store can dispatch to production areas in any godown.
+  // Single central RM Store can dispatch to production areas or shops.
   return { fromLoc, toLoc };
 }
 

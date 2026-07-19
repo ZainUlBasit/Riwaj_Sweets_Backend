@@ -608,7 +608,7 @@ const shopStock = async (req, res) => {
 
 /**
  * GET /api/inventory-reports/location-rm-stock
- * Remaining raw material balances at RM stores / production areas.
+ * Remaining raw material balances at RM stores, production areas, and shops.
  * Query: location_id? (optional — all locations if omitted)
  */
 const locationRmStock = async (req, res) => {
@@ -632,20 +632,26 @@ const locationRmStock = async (req, res) => {
       const locFilter = {
         isDeleted: false,
         location_type: {
-          $in: [LOCATION_TYPE.RAW_MATERIAL_STORE, LOCATION_TYPE.PRODUCTION_AREA],
+          $in: [
+            LOCATION_TYPE.RAW_MATERIAL_STORE,
+            LOCATION_TYPE.PRODUCTION_AREA,
+            LOCATION_TYPE.SHOP,
+          ],
         },
       };
       const storeId = getAssignedStoreId(req);
       let locations;
       if (storeId) {
-        // Own godown production areas + system-wide RM Store
+        // Own godown production areas/shops + system-wide RM Store
         locations = await DispatchLocation.find({
           isDeleted: false,
           $or: [
             { location_type: LOCATION_TYPE.RAW_MATERIAL_STORE },
             {
               store_id: storeId,
-              location_type: LOCATION_TYPE.PRODUCTION_AREA,
+              location_type: {
+                $in: [LOCATION_TYPE.PRODUCTION_AREA, LOCATION_TYPE.SHOP],
+              },
             },
           ],
         }).select("_id");

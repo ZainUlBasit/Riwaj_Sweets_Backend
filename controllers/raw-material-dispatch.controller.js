@@ -124,7 +124,7 @@ const create = async (req, res) => {
       return createError(
         res,
         400,
-        "location_id (Production Area) is required.",
+        "location_id (Production Area or Shop) is required.",
       );
     }
     if (!raw_material_id) {
@@ -165,7 +165,7 @@ const create = async (req, res) => {
       ? await DispatchLocation.findById(location_id).where({ isDeleted: false })
       : await getOrCreateLocation(location);
     if (!toLocation) {
-      return createError(res, 404, "Production area not found.");
+      return createError(res, 404, "Destination location not found.");
     }
 
     try {
@@ -281,7 +281,7 @@ const update = async (req, res) => {
 
     if (location_id !== undefined || location !== undefined) {
       if (!location_id && !String(location ?? "").trim()) {
-        return createError(res, 400, "Production area cannot be empty.");
+        return createError(res, 400, "Destination location cannot be empty.");
       }
       const dispatchLocation = location_id
         ? await DispatchLocation.findById(location_id).where({
@@ -289,7 +289,7 @@ const update = async (req, res) => {
           })
         : await getOrCreateLocation(location);
       if (!dispatchLocation) {
-        return createError(res, 404, "Production area not found.");
+        return createError(res, 404, "Destination location not found.");
       }
       updatePayload.location_id = dispatchLocation._id;
       updatePayload.location = dispatchLocation.name;
