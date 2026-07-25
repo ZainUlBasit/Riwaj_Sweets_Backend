@@ -53,6 +53,22 @@ const ProductStockSchema = new Schema(
       enum: [1, 2, 3],
       default: 1,
     },
+    /**
+     * How finished goods entered Product Store:
+     * 1 = self_production, 2 = supplier (direct purchase)
+     */
+    source: {
+      type: Number,
+      enum: [1, 2],
+      default: 1,
+      index: true,
+    },
+    supplier_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "Supplier",
+      default: null,
+      index: true,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {

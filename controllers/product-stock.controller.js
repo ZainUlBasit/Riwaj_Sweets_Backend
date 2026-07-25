@@ -1,18 +1,48 @@
 const ProductStock = require("../Models/ProductStock");
 const Product = require("../Models/Products");
 const RawMaterial = require("../Models/RawMaterial");
+const Supplier = require("../Models/Supplier");
+const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const {
   TX,
   DIR,
+  INV_TYPE,
+  LOCATION_TYPE,
   getUserId,
   writeAudit,
   writeLedger,
   getRawMaterialAvailable,
   adjustRawMaterial,
   adjustProduct,
+  adjustLocationInventory,
+  getLocationInventoryQty,
   withTransaction,
 } = require("../Services/inventoryService");
+
+const STOCK_SOURCE = { SELF_PRODUCTION: 1, SUPPLIER: 2 };
+
+async function resolveProductStoreLocation(locationId, session = null) {
+  if (!locationId) {
+    const err = new Error("Product Store (location_id) is required.");
+    err.status = 400;
+    throw err;
+  }
+  const q = DispatchLocation.findById(locationId).where({ isDeleted: false });
+  if (session) q.session(session);
+  const loc = await q;
+  if (!loc) {
+    const err = new Error("Product Store location not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (Number(loc.location_type) !== LOCATION_TYPE.FINISHED_GOODS_STORE) {
+    const err = new Error("location_id must be a Product Store.");
+    err.status = 400;
+    throw err;
+  }
+  return loc;
+}
 
 async function applyRawMaterialUsage(rawMaterialsUsed, multiplier = 1, userId = null, referenceId = null, session = null) {
   if (!Array.isArray(rawMaterialsUsed)) return;
@@ -81,11 +111,13 @@ const list = async (req, res) => {
     const items = await ProductStock.find(filter)
       .populate("product_id")
       .populate("location_id")
+      .populate("supplier_id")
       .populate("raw_materials_used.raw_material_id")
       .sort({ createdAt: -1 });
     const deletedItems = await ProductStock.find({ isDeleted: true })
       .populate("product_id")
       .populate("location_id")
+      .populate("supplier_id")
       .populate("raw_materials_used.raw_material_id")
       .sort({ createdAt: -1 });
     return successMessage(
@@ -116,8 +148,17 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { product_id, desc, quantity, price, total_price, raw_materials_used, location_id, inventory_type } =
-      req.body;
+    const {
+      product_id,
+      desc,
+      quantity,
+      price,
+      total_price,
+      raw_materials_used,
+      location_id,
+      source,
+      supplier_id,
+    } = req.body;
     if (!product_id) {
       return createError(res, 400, "product_id is required.");
     }
@@ -125,11 +166,52 @@ const create = async (req, res) => {
     if (qty <= 0) {
       return createError(res, 400, "quantity must be greater than 0.");
     }
-    const product = await Product.findById(product_id).where({ isDeleted: false });
+
+    const sourceNum = Number(source ?? STOCK_SOURCE.SELF_PRODUCTION);
+    if (
+      sourceNum !== STOCK_SOURCE.SELF_PRODUCTION &&
+      sourceNum !== STOCK_SOURCE.SUPPLIER
+    ) {
+      return createError(
+        res,
+        400,
+        "source must be 1 (Self Production) or 2 (Supplier).",
+      );
+    }
+    if (sourceNum === STOCK_SOURCE.SUPPLIER && !supplier_id) {
+      return createError(
+        res,
+        400,
+        "supplier_id is required when source is Supplier.",
+      );
+    }
+
+    const product = await Product.findById(product_id).where({
+      isDeleted: false,
+    });
     if (!product) return createError(res, 404, "Product not found.");
 
+    let supplier = null;
+    if (sourceNum === STOCK_SOURCE.SUPPLIER) {
+      supplier = await Supplier.findById(supplier_id).where({
+        isDeleted: false,
+      });
+      if (!supplier) return createError(res, 404, "Supplier not found.");
+    }
+
+    const storeLoc = await resolveProductStoreLocation(location_id);
     const userId = getUserId(req);
     const rmUsed = Array.isArray(raw_materials_used) ? raw_materials_used : [];
+    const unitPrice = Number(price ?? 0);
+    const totalPrice =
+      total_price != null ? Number(total_price) : qty * unitPrice;
+    const sourceLabel =
+      sourceNum === STOCK_SOURCE.SUPPLIER
+        ? `Supplier: ${supplier.name}`
+        : "Self Production";
+    const notes =
+      desc?.trim() ||
+      `Product Store stock-in (${sourceLabel}) → ${storeLoc.name}`;
 
     const item = await withTransaction(async (session) => {
       const opts = { session };
@@ -140,11 +222,14 @@ const create = async (req, res) => {
             product_id,
             desc: desc ?? "",
             quantity: qty,
-            price: price ?? 0,
-            total_price: total_price ?? qty * (price ?? 0),
+            price: unitPrice,
+            total_price: totalPrice,
             raw_materials_used: rmUsed,
-            location_id: location_id || null,
-            inventory_type: inventory_type ?? 1,
+            location_id: storeLoc._id,
+            inventory_type: INV_TYPE.STORE,
+            source: sourceNum,
+            supplier_id:
+              sourceNum === STOCK_SOURCE.SUPPLIER ? supplier._id : null,
             isDeleted: false,
           },
         ],
@@ -160,19 +245,42 @@ const create = async (req, res) => {
         session,
       );
 
+      const prevStoreQty = await getLocationInventoryQty(
+        storeLoc._id,
+        product_id,
+        INV_TYPE.STORE,
+        session,
+      );
+      await adjustLocationInventory(
+        storeLoc._id,
+        product_id,
+        qty,
+        INV_TYPE.STORE,
+        session,
+      );
+
+      if (sourceNum === STOCK_SOURCE.SUPPLIER && totalPrice > 0) {
+        await Supplier.findByIdAndUpdate(
+          supplier._id,
+          { $inc: { total_amount: totalPrice, payable: totalPrice } },
+          opts,
+        );
+      }
+
       await writeLedger(
         {
           transactionType: TX.PRODUCT_STOCK_IN,
           direction: DIR.IN,
           productId: product_id,
           quantity: qty,
-          locationId: location_id || null,
+          locationId: storeLoc._id,
+          storeId: storeLoc.store_id ?? null,
           referenceType: "ProductStock",
           referenceId: created._id,
           userId,
-          notes: desc || "Manual product stock-in",
-          previousBalance: prevProdAvail,
-          newBalance: Number(updatedProduct?.available_quantity ?? prevProdAvail + qty),
+          notes,
+          previousBalance: prevStoreQty,
+          newBalance: prevStoreQty + qty,
         },
         session,
       );
@@ -183,16 +291,30 @@ const create = async (req, res) => {
         action: "create",
         newValue: created.toObject?.() ?? created,
         userId,
+        notes: `Product totals: ${prevProdAvail} → ${Number(updatedProduct?.available_quantity ?? prevProdAvail + qty)}. ${notes}`,
         session,
       });
 
       return created;
     });
 
-    return successMessage(res, item, "Product stock entry created successfully.");
+    const populated = await ProductStock.findById(item._id)
+      .populate("product_id")
+      .populate("location_id")
+      .populate("supplier_id");
+
+    return successMessage(
+      res,
+      populated || item,
+      "Product stock added to Product Store.",
+    );
   } catch (err) {
     console.error("ProductStock create error:", err);
-    return createError(res, err.status || 500, err.message || "Failed to create product stock.");
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to create product stock.",
+    );
   }
 };
 
@@ -289,47 +411,117 @@ const remove = async (req, res) => {
 
     const userId = getUserId(req);
     const qty = Number(item.quantity ?? 0);
+    const totalPrice = Number(item.total_price ?? 0);
 
-    await applyRawMaterialUsage(item.raw_materials_used || [], -1, userId, item._id);
+    const deleted = await withTransaction(async (session) => {
+      const opts = { session };
 
-    const product = await Product.findById(item.product_id);
-    const prevAvail = Number(product?.available_quantity || 0);
-    const updatedProduct = await adjustProduct(item.product_id, {
-      inDelta: -qty,
-      availDelta: -qty,
+      await applyRawMaterialUsage(
+        item.raw_materials_used || [],
+        -1,
+        userId,
+        item._id,
+        session,
+      );
+
+      const product = await Product.findById(item.product_id).session(session);
+      const prevAvail = Number(product?.available_quantity || 0);
+      const updatedProduct = await adjustProduct(
+        item.product_id,
+        { inDelta: -qty, availDelta: -qty },
+        session,
+      );
+
+      if (item.location_id && qty > 0) {
+        const invType = Number(item.inventory_type) || INV_TYPE.STORE;
+        const prevLoc = await getLocationInventoryQty(
+          item.location_id,
+          item.product_id,
+          invType,
+          session,
+        );
+        await adjustLocationInventory(
+          item.location_id,
+          item.product_id,
+          -qty,
+          invType,
+          session,
+        );
+        await writeLedger(
+          {
+            transactionType: TX.ADJUSTMENT,
+            direction: DIR.OUT,
+            productId: item.product_id,
+            quantity: qty,
+            locationId: item.location_id,
+            referenceType: "ProductStock",
+            referenceId: item._id,
+            userId,
+            notes: "Product stock entry deleted (location reverse)",
+            previousBalance: prevLoc,
+            newBalance: prevLoc - qty,
+          },
+          session,
+        );
+      }
+
+      if (
+        Number(item.source) === STOCK_SOURCE.SUPPLIER &&
+        item.supplier_id &&
+        totalPrice > 0
+      ) {
+        await Supplier.findByIdAndUpdate(
+          item.supplier_id,
+          { $inc: { total_amount: -totalPrice, payable: -totalPrice } },
+          opts,
+        );
+      }
+
+      const softDeleted = await ProductStock.findOneAndUpdate(
+        { _id: req.params.id, isDeleted: false },
+        { isDeleted: true },
+        { new: true, session },
+      );
+
+      await writeLedger(
+        {
+          transactionType: TX.ADJUSTMENT,
+          direction: DIR.OUT,
+          productId: item.product_id,
+          quantity: qty,
+          locationId: item.location_id || null,
+          referenceType: "ProductStock",
+          referenceId: item._id,
+          userId,
+          notes: "Product stock entry deleted",
+          previousBalance: prevAvail,
+          newBalance: Number(
+            updatedProduct?.available_quantity ?? prevAvail - qty,
+          ),
+        },
+        session,
+      );
+
+      await writeAudit({
+        entityType: "ProductStock",
+        entityId: softDeleted._id,
+        action: "delete",
+        previousValue: item.toObject?.() ?? item,
+        userId,
+        session,
+      });
+
+      return softDeleted;
     });
 
-    const deleted = await ProductStock.findOneAndUpdate(
-      { _id: req.params.id, isDeleted: false },
-      { isDeleted: true },
-      { new: true },
-    );
-
-    await writeLedger({
-      transactionType: TX.ADJUSTMENT,
-      direction: DIR.OUT,
-      productId: item.product_id,
-      quantity: qty,
-      referenceType: "ProductStock",
-      referenceId: item._id,
-      userId,
-      notes: "Product stock entry deleted",
-      previousBalance: prevAvail,
-      newBalance: Number(updatedProduct?.available_quantity ?? prevAvail - qty),
-    });
-
-    await writeAudit({
-      entityType: "ProductStock",
-      entityId: item._id,
-      action: "delete",
-      previousValue: item.toObject?.() ?? item,
-      userId,
-    });
-
-    return successMessage(res, deleted || item, "Product stock deleted successfully.");
+    return successMessage(res, deleted, "Product stock deleted successfully.");
   } catch (err) {
     console.error("ProductStock remove error:", err);
-    return createError(res, err.status || 500, err.message || "Failed to delete product stock.");
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to delete product stock.",
+    );
   }
 };
 
