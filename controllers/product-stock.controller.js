@@ -320,85 +320,238 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { product_id, desc, quantity, price, total_price, raw_materials_used, location_id, inventory_type } =
-      req.body;
+    const {
+      product_id,
+      desc,
+      quantity,
+      price,
+      total_price,
+      raw_materials_used,
+      location_id,
+      source,
+      supplier_id,
+    } = req.body;
+
     const oldItem = await ProductStock.findById(req.params.id).where({
       isDeleted: false,
     });
     if (!oldItem) return createError(res, 404, "Product stock entry not found.");
 
-    const userId = getUserId(req);
-    const oldQty = Number(oldItem.quantity ?? 0);
-    const newQty = quantity != null ? Number(quantity) : oldQty;
+    const newQty = quantity != null ? Number(quantity) : Number(oldItem.quantity ?? 0);
     if (newQty <= 0) {
       return createError(res, 400, "quantity must be greater than 0.");
     }
-    const newProductId = product_id ?? oldItem.product_id;
 
-    await applyRawMaterialUsage(oldItem.raw_materials_used || [], -1, userId, oldItem._id);
-
-    await adjustProduct(oldItem.product_id, {
-      inDelta: -oldQty,
-      availDelta: -oldQty,
-    });
-
-    const updatePayload = {
-      product_id: newProductId,
-      desc: desc !== undefined ? desc : oldItem.desc,
-      quantity: newQty,
-      price: price !== undefined ? price : oldItem.price,
-      total_price:
-        total_price !== undefined
-          ? total_price
-          : newQty * (price ?? oldItem.price ?? 0),
-      isDeleted: false,
-    };
-    if (Array.isArray(raw_materials_used)) {
-      updatePayload.raw_materials_used = raw_materials_used;
-    }
-    if (location_id !== undefined) updatePayload.location_id = location_id || null;
-    if (inventory_type !== undefined) updatePayload.inventory_type = inventory_type;
-
-    const item = await ProductStock.findByIdAndUpdate(
-      req.params.id,
-      updatePayload,
-      { new: true, runValidators: true },
+    const sourceNum = Number(
+      source != null ? source : oldItem.source ?? STOCK_SOURCE.SELF_PRODUCTION,
     );
+    if (
+      sourceNum !== STOCK_SOURCE.SELF_PRODUCTION &&
+      sourceNum !== STOCK_SOURCE.SUPPLIER
+    ) {
+      return createError(
+        res,
+        400,
+        "source must be 1 (Self Production) or 2 (Supplier).",
+      );
+    }
 
-    const rmUsed = updatePayload.raw_materials_used ?? oldItem.raw_materials_used ?? [];
-    await applyRawMaterialUsage(rmUsed, 1, userId, item._id);
+    const finalSupplierId =
+      sourceNum === STOCK_SOURCE.SUPPLIER
+        ? supplier_id !== undefined
+          ? supplier_id
+          : oldItem.supplier_id
+        : null;
 
-    const updatedProduct = await adjustProduct(newProductId, {
-      inDelta: newQty,
-      availDelta: newQty,
+    if (sourceNum === STOCK_SOURCE.SUPPLIER && !finalSupplierId) {
+      return createError(
+        res,
+        400,
+        "supplier_id is required when source is Supplier.",
+      );
+    }
+
+    const newProductId = product_id ?? oldItem.product_id;
+    const product = await Product.findById(newProductId).where({
+      isDeleted: false,
+    });
+    if (!product) return createError(res, 404, "Product not found.");
+
+    let supplier = null;
+    if (sourceNum === STOCK_SOURCE.SUPPLIER) {
+      supplier = await Supplier.findById(finalSupplierId).where({
+        isDeleted: false,
+      });
+      if (!supplier) return createError(res, 404, "Supplier not found.");
+    }
+
+    const finalLocationId =
+      location_id !== undefined ? location_id : oldItem.location_id;
+    const storeLoc = await resolveProductStoreLocation(finalLocationId);
+
+    const userId = getUserId(req);
+    const oldQty = Number(oldItem.quantity ?? 0);
+    const oldTotal = Number(oldItem.total_price ?? 0);
+    const unitPrice =
+      price !== undefined ? Number(price) : Number(oldItem.price ?? 0);
+    const totalPrice =
+      total_price !== undefined ? Number(total_price) : newQty * unitPrice;
+    const sourceLabel =
+      sourceNum === STOCK_SOURCE.SUPPLIER
+        ? `Supplier: ${supplier.name}`
+        : "Self Production";
+    const notes =
+      (desc !== undefined ? desc : oldItem.desc)?.trim() ||
+      `Product Store stock update (${sourceLabel}) → ${storeLoc.name}`;
+
+    const item = await withTransaction(async (session) => {
+      const opts = { session };
+
+      await applyRawMaterialUsage(
+        oldItem.raw_materials_used || [],
+        -1,
+        userId,
+        oldItem._id,
+        session,
+      );
+
+      await adjustProduct(
+        oldItem.product_id,
+        { inDelta: -oldQty, availDelta: -oldQty },
+        session,
+      );
+
+      // Reverse old Product Store balance
+      if (oldItem.location_id && oldQty > 0) {
+        const oldInvType = Number(oldItem.inventory_type) || INV_TYPE.STORE;
+        await adjustLocationInventory(
+          oldItem.location_id,
+          oldItem.product_id,
+          -oldQty,
+          oldInvType,
+          session,
+        );
+      }
+
+      // Reverse old supplier payable if it was a supplier purchase
+      if (
+        Number(oldItem.source) === STOCK_SOURCE.SUPPLIER &&
+        oldItem.supplier_id &&
+        oldTotal > 0
+      ) {
+        await Supplier.findByIdAndUpdate(
+          oldItem.supplier_id,
+          { $inc: { total_amount: -oldTotal, payable: -oldTotal } },
+          opts,
+        );
+      }
+
+      const updatePayload = {
+        product_id: newProductId,
+        desc: desc !== undefined ? desc : oldItem.desc,
+        quantity: newQty,
+        price: unitPrice,
+        total_price: totalPrice,
+        location_id: storeLoc._id,
+        inventory_type: INV_TYPE.STORE,
+        source: sourceNum,
+        supplier_id:
+          sourceNum === STOCK_SOURCE.SUPPLIER ? supplier._id : null,
+        isDeleted: false,
+      };
+      if (Array.isArray(raw_materials_used)) {
+        updatePayload.raw_materials_used = raw_materials_used;
+      }
+
+      const updated = await ProductStock.findByIdAndUpdate(
+        req.params.id,
+        updatePayload,
+        { new: true, runValidators: true, session },
+      );
+
+      const rmUsed =
+        updatePayload.raw_materials_used ??
+        oldItem.raw_materials_used ??
+        [];
+      await applyRawMaterialUsage(rmUsed, 1, userId, updated._id, session);
+
+      const updatedProduct = await adjustProduct(
+        newProductId,
+        { inDelta: newQty, availDelta: newQty },
+        session,
+      );
+
+      const prevStoreQty = await getLocationInventoryQty(
+        storeLoc._id,
+        newProductId,
+        INV_TYPE.STORE,
+        session,
+      );
+      await adjustLocationInventory(
+        storeLoc._id,
+        newProductId,
+        newQty,
+        INV_TYPE.STORE,
+        session,
+      );
+
+      if (sourceNum === STOCK_SOURCE.SUPPLIER && totalPrice > 0) {
+        await Supplier.findByIdAndUpdate(
+          supplier._id,
+          { $inc: { total_amount: totalPrice, payable: totalPrice } },
+          opts,
+        );
+      }
+
+      await writeLedger(
+        {
+          transactionType: TX.ADJUSTMENT,
+          direction: DIR.IN,
+          productId: newProductId,
+          quantity: newQty,
+          locationId: storeLoc._id,
+          storeId: storeLoc.store_id ?? null,
+          referenceType: "ProductStock",
+          referenceId: updated._id,
+          userId,
+          notes,
+          previousBalance: prevStoreQty,
+          newBalance: prevStoreQty + newQty,
+        },
+        session,
+      );
+
+      await writeAudit({
+        entityType: "ProductStock",
+        entityId: updated._id,
+        action: "update",
+        previousValue: oldItem.toObject?.() ?? oldItem,
+        newValue: updated.toObject?.() ?? updated,
+        userId,
+        notes: `Product totals after update: ${Number(updatedProduct?.available_quantity ?? 0)}. ${notes}`,
+        session,
+      });
+
+      return updated;
     });
 
-    await writeLedger({
-      transactionType: TX.ADJUSTMENT,
-      direction: DIR.IN,
-      productId: newProductId,
-      quantity: newQty,
-      referenceType: "ProductStock",
-      referenceId: item._id,
-      userId,
-      notes: "Product stock entry updated",
-      previousBalance: Number(updatedProduct?.available_quantity ?? 0) - newQty,
-      newBalance: Number(updatedProduct?.available_quantity ?? newQty),
-    });
+    const populated = await ProductStock.findById(item._id)
+      .populate("product_id")
+      .populate("location_id")
+      .populate("supplier_id");
 
-    await writeAudit({
-      entityType: "ProductStock",
-      entityId: item._id,
-      action: "update",
-      previousValue: oldItem.toObject?.() ?? oldItem,
-      newValue: item.toObject?.() ?? item,
-      userId,
-    });
-
-    return successMessage(res, item, "Product stock updated successfully.");
+    return successMessage(
+      res,
+      populated || item,
+      "Product stock updated successfully.",
+    );
   } catch (err) {
     console.error("ProductStock update error:", err);
-    return createError(res, err.status || 500, err.message || "Failed to update product stock.");
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to update product stock.",
+    );
   }
 };
 
