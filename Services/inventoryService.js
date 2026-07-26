@@ -924,6 +924,85 @@ async function reverseBomConsumption(consumptions, userId = null, session = null
   }
 }
 
+/** Remaining qty on a purchase batch (legacy-safe). */
+function getPurchaseBatchRemaining(stock) {
+  if (!stock) return 0;
+  if (stock.remaining_quantity != null && stock.remaining_quantity !== undefined) {
+    return Number(stock.remaining_quantity);
+  }
+  return Number(stock.quantity || 0) - Number(stock.out_quantity || 0);
+}
+
+/** Debit a purchase batch when dispatching to Production / Shop. */
+async function debitPurchaseBatch(stockId, quantity, session = null) {
+  if (!stockId) return;
+  const qty = Number(quantity);
+  if (!qty || qty <= 0) return;
+
+  const opts = session ? { session } : {};
+  const q = RawMaterialStock.findById(stockId).where({ isDeleted: false });
+  if (session) q.session(session);
+  const stock = await q;
+  if (!stock) {
+    const err = new Error("Raw material stock batch not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (Number(stock.purpose) !== 1) {
+    const err = new Error("Dispatch must reference a purchase stock batch.");
+    err.status = 400;
+    throw err;
+  }
+
+  const remaining = getPurchaseBatchRemaining(stock);
+  if (qty > remaining) {
+    const err = new Error(
+      `Insufficient batch stock. Remaining: ${remaining}, requested: ${qty}.`,
+    );
+    err.status = 409;
+    throw err;
+  }
+
+  const outQty = Number(stock.out_quantity || 0);
+  await RawMaterialStock.findByIdAndUpdate(
+    stockId,
+    {
+      out_quantity: outQty + qty,
+      remaining_quantity: remaining - qty,
+    },
+    opts,
+  );
+}
+
+/** Credit a purchase batch when reversing a dispatch. */
+async function creditPurchaseBatch(stockId, quantity, session = null) {
+  if (!stockId) return;
+  const qty = Number(quantity);
+  if (!qty || qty <= 0) return;
+
+  const opts = session ? { session } : {};
+  const q = RawMaterialStock.findById(stockId);
+  if (session) q.session(session);
+  const stock = await q;
+  if (!stock || stock.isDeleted) return;
+  if (Number(stock.purpose) !== 1) return;
+
+  const outQty = Number(stock.out_quantity || 0);
+  const remaining = getPurchaseBatchRemaining(stock);
+  const nextOut = Math.max(0, outQty - qty);
+  const nextRemaining = remaining + qty;
+  const inQty = Number(stock.quantity || 0);
+
+  await RawMaterialStock.findByIdAndUpdate(
+    stockId,
+    {
+      out_quantity: nextOut,
+      remaining_quantity: Math.min(inQty, nextRemaining),
+    },
+    opts,
+  );
+}
+
 /**
  * Apply inventory impact when raw material is dispatched RM Store → Production Area.
  * Legacy rows without fromLocationId still deduct global stock (generated_stock_id).
@@ -935,6 +1014,7 @@ async function applyRawMaterialDispatchImpact({
   toLocationId = null,
   locationId = null,
   storeId = null,
+  rawMaterialStockId = null,
   referenceId,
   userId = null,
   notes = "",
@@ -967,6 +1047,11 @@ async function applyRawMaterialDispatchImpact({
       );
       err.status = 409;
       throw err;
+    }
+
+    // Batch-level tracking: reduce remaining on the selected purchase batch.
+    if (rawMaterialStockId) {
+      await debitPurchaseBatch(rawMaterialStockId, qty, session);
     }
 
     await adjustLocationRawMaterialInventory(
@@ -1032,12 +1117,18 @@ async function applyRawMaterialDispatchImpact({
     throw err;
   }
 
+  if (rawMaterialStockId) {
+    await debitPurchaseBatch(rawMaterialStockId, qty, session);
+  }
+
   const [stockEntry] = await RawMaterialStock.create(
     [
       {
         raw_material_id: rawMaterialId,
         desc: notes || "Raw material dispatch",
         quantity: qty,
+        out_quantity: qty,
+        remaining_quantity: 0,
         price: 0,
         total_price: 0,
         purpose: 2,
@@ -1083,6 +1174,7 @@ async function reverseRawMaterialDispatchImpact(
     toLocationId = null,
     locationId = null,
     generatedStockId = null,
+    rawMaterialStockId = null,
     referenceId = null,
   },
   userId = null,
@@ -1095,6 +1187,10 @@ async function reverseRawMaterialDispatchImpact(
   const destId = toLocationId || locationId;
 
   if (fromLocationId && destId) {
+    if (rawMaterialStockId) {
+      await creditPurchaseBatch(rawMaterialStockId, qty, session);
+    }
+
     const fromPrev = await getLocationRawMaterialQty(
       fromLocationId,
       rawMaterialId,
@@ -1160,7 +1256,16 @@ async function reverseRawMaterialDispatchImpact(
     return;
   }
 
-  if (!generatedStockId) return;
+  if (!generatedStockId) {
+    if (rawMaterialStockId) {
+      await creditPurchaseBatch(rawMaterialStockId, qty, session);
+    }
+    return;
+  }
+
+  if (rawMaterialStockId) {
+    await creditPurchaseBatch(rawMaterialStockId, qty, session);
+  }
 
   const stockQ = RawMaterialStock.findById(generatedStockId);
   if (session) stockQ.session(session);
@@ -1403,6 +1508,9 @@ module.exports = {
   reverseStoreReceipt,
   applyRawMaterialDispatchImpact,
   reverseRawMaterialDispatchImpact,
+  debitPurchaseBatch,
+  creditPurchaseBatch,
+  getPurchaseBatchRemaining,
   validateBomAvailability,
   consumeBomForProduction,
   reverseBomConsumption,

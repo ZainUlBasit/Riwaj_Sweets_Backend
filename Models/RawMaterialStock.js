@@ -1,6 +1,5 @@
 const mongoose = require("mongoose");
 const {
-  requiredString,
   requiredNumberWithDefault,
   requiredBooleanWithDefaultFalse,
 } = require("../utils/Types");
@@ -25,7 +24,12 @@ const RawMaterialStockSchema = new Schema(
       type: String,
       default: "",
     },
+    /** Original purchase qty that came into this batch (kitna aya). */
     quantity: requiredNumberWithDefault,
+    /** Qty dispatched from this batch to Production / Shop (kitna gaya). */
+    out_quantity: requiredNumberWithDefault,
+    /** Qty still left in this batch (kitna rehta). */
+    remaining_quantity: requiredNumberWithDefault,
     price: requiredNumberWithDefault,
     total_price: requiredNumberWithDefault,
     // purpose tags an inventory movement.

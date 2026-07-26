@@ -130,6 +130,13 @@ const create = async (req, res) => {
     if (!raw_material_id) {
       return createError(res, 400, "raw_material_id is required.");
     }
+    if (!raw_material_stock_id) {
+      return createError(
+        res,
+        400,
+        "raw_material_stock_id (purchase batch) is required.",
+      );
+    }
     if (!dispatch_date) {
       return createError(res, 400, "dispatch_date is required.");
     }
@@ -151,6 +158,24 @@ const create = async (req, res) => {
       );
       if (!stock) {
         return createError(res, 404, "Raw material stock batch not found.");
+      }
+      if (Number(stock.purpose) !== 1) {
+        return createError(
+          res,
+          400,
+          "Dispatch must reference a purchase stock batch.",
+        );
+      }
+      const remaining =
+        stock.remaining_quantity != null
+          ? Number(stock.remaining_quantity)
+          : Number(stock.quantity || 0) - Number(stock.out_quantity || 0);
+      if (qty > remaining) {
+        return createError(
+          res,
+          409,
+          `Insufficient batch stock. Remaining: ${remaining}, requested: ${qty}.`,
+        );
       }
     }
 
@@ -213,6 +238,7 @@ const create = async (req, res) => {
         fromLocationId: fromLocation._id,
         toLocationId: toLocation._id,
         storeId: fromLocation.store_id ?? toLocation.store_id ?? null,
+        rawMaterialStockId: raw_material_stock_id || null,
         referenceId: created._id,
         userId,
         notes: dispatchNotes,
@@ -350,6 +376,7 @@ const update = async (req, res) => {
             fromLocationId: existing.from_location_id,
             toLocationId: existing.location_id,
             generatedStockId: existing.generated_stock_id,
+            rawMaterialStockId: existing.raw_material_stock_id,
             referenceId: existing._id,
           },
           userId,
@@ -361,6 +388,7 @@ const update = async (req, res) => {
             rawMaterialId: existing.raw_material_id,
             quantity: existing.quantity,
             generatedStockId: existing.generated_stock_id,
+            rawMaterialStockId: existing.raw_material_stock_id,
             referenceId: existing._id,
           },
           userId,
@@ -385,6 +413,10 @@ const update = async (req, res) => {
 
       const finalMaterialId = updatePayload.raw_material_id ?? existing.raw_material_id;
       const finalQty = updatePayload.quantity ?? existing.quantity;
+      const finalStockId =
+        updatePayload.raw_material_stock_id !== undefined
+          ? updatePayload.raw_material_stock_id
+          : existing.raw_material_stock_id;
       const dispatchNotes =
         updatePayload.notes ??
         existing.notes ??
@@ -398,6 +430,7 @@ const update = async (req, res) => {
           toLocationId: finalLocation._id,
           storeId:
             finalFromLocation.store_id ?? finalLocation.store_id ?? null,
+          rawMaterialStockId: finalStockId || null,
           referenceId: updated._id,
           userId,
           notes: dispatchNotes,
@@ -409,6 +442,7 @@ const update = async (req, res) => {
           quantity: finalQty,
           locationId: finalLocation._id,
           storeId: finalLocation.store_id ?? null,
+          rawMaterialStockId: finalStockId || null,
           referenceId: updated._id,
           userId,
           notes: dispatchNotes,
@@ -461,6 +495,7 @@ const remove = async (req, res) => {
             fromLocationId: existing.from_location_id,
             toLocationId: existing.location_id,
             generatedStockId: existing.generated_stock_id,
+            rawMaterialStockId: existing.raw_material_stock_id,
             referenceId: existing._id,
           },
           userId,
@@ -472,6 +507,7 @@ const remove = async (req, res) => {
             rawMaterialId: existing.raw_material_id,
             quantity: existing.quantity,
             generatedStockId: existing.generated_stock_id,
+            rawMaterialStockId: existing.raw_material_stock_id,
             referenceId: existing._id,
           },
           userId,

@@ -70,8 +70,20 @@ const list = async (req, res) => {
       .sort({ createdAt: -1 });
 
     // Legacy purchases may lack rm_store_location_id — resolve from ledger in bulk.
+    // Also backfill batch remaining for older rows that predate out/remaining fields.
     const enrichStore = async (docs) => {
       const objects = docs.map((doc) => doc.toObject?.() ?? doc);
+      for (const obj of objects) {
+        if (Number(obj.purpose) === 1) {
+          const inQty = Number(obj.quantity || 0);
+          const outQty = Number(obj.out_quantity || 0);
+          const remQty = Number(obj.remaining_quantity || 0);
+          if (Math.abs(remQty + outQty - inQty) > 0.0001) {
+            obj.out_quantity = outQty;
+            obj.remaining_quantity = Math.max(0, inQty - outQty);
+          }
+        }
+      }
       const missing = objects.filter(
         (o) => !o.rm_store_location_id && Number(o.purpose) === 1,
       );
@@ -224,6 +236,8 @@ const create = async (req, res) => {
             supplier_id,
             desc: desc ?? "",
             quantity: qty,
+            out_quantity: 0,
+            remaining_quantity: qty,
             price: prc,
             total_price: totalPrice,
             purpose: 1,
@@ -231,6 +245,13 @@ const create = async (req, res) => {
             isDeleted: false,
           },
         ],
+        opts,
+      );
+
+      // Latest purchase price becomes the Raw Material unit price.
+      await RawMaterial.findByIdAndUpdate(
+        raw_material_id,
+        { price: prc },
         opts,
       );
 
@@ -316,6 +337,15 @@ const update = async (req, res) => {
     if (!qty || qty <= 0) {
       return createError(res, 400, "quantity must be greater than 0.");
     }
+    const alreadyOut = Number(oldItem.out_quantity || 0);
+    if (qty < alreadyOut) {
+      return createError(
+        res,
+        400,
+        `Cannot set quantity below already dispatched amount (${alreadyOut}).`,
+      );
+    }
+    const remainingQty = qty - alreadyOut;
     const prc = Number(price ?? oldItem.price ?? 0);
     const newTotalPrice = total_price != null ? Number(total_price) : qty * prc;
     const newRawMaterialId = raw_material_id ?? oldItem.raw_material_id;
@@ -416,12 +446,21 @@ const update = async (req, res) => {
           supplier_id: newSupplierId,
           desc: desc !== undefined ? desc : oldItem.desc,
           quantity: qty,
+          out_quantity: alreadyOut,
+          remaining_quantity: remainingQty,
           price: prc,
           total_price: newTotalPrice,
           rm_store_location_id: newRmStoreId,
           isDeleted: false,
         },
         { new: true, runValidators: true, ...opts },
+      );
+
+      // Latest purchase price becomes the Raw Material unit price.
+      await RawMaterial.findByIdAndUpdate(
+        newRawMaterialId,
+        { price: prc },
+        opts,
       );
 
       await Supplier.findByIdAndUpdate(
@@ -488,6 +527,14 @@ const remove = async (req, res) => {
         res,
         400,
         "Use DELETE /raw-material-stock/production/:id for production consumption entries.",
+      );
+    }
+
+    if (Number(item.out_quantity || 0) > 0) {
+      return createError(
+        res,
+        400,
+        "Cannot delete a batch that has already been partially dispatched. Reverse those dispatches first.",
       );
     }
 
