@@ -182,6 +182,10 @@ const create = async (req, res) => {
     if (!supplier_id) {
       return createError(res, 400, "supplier_id is required.");
     }
+    const batchDesc = String(desc ?? "").trim();
+    if (!batchDesc) {
+      return createError(res, 400, "Description (Batch) is required.");
+    }
     if (!rm_store_location_id) {
       return createError(
         res,
@@ -234,7 +238,7 @@ const create = async (req, res) => {
           {
             raw_material_id,
             supplier_id,
-            desc: desc ?? "",
+            desc: batchDesc,
             quantity: qty,
             out_quantity: 0,
             remaining_quantity: qty,
@@ -275,7 +279,7 @@ const create = async (req, res) => {
         referenceType: "RawMaterialStock",
         referenceId: created._id,
         userId,
-        notes: desc || "Raw material purchase",
+        notes: batchDesc || "Raw material purchase",
         session,
       });
 
@@ -346,6 +350,11 @@ const update = async (req, res) => {
       );
     }
     const remainingQty = qty - alreadyOut;
+    const batchDesc =
+      desc !== undefined ? String(desc ?? "").trim() : String(oldItem.desc ?? "").trim();
+    if (!batchDesc) {
+      return createError(res, 400, "Description (Batch) is required.");
+    }
     const prc = Number(price ?? oldItem.price ?? 0);
     const newTotalPrice = total_price != null ? Number(total_price) : qty * prc;
     const newRawMaterialId = raw_material_id ?? oldItem.raw_material_id;
@@ -444,7 +453,7 @@ const update = async (req, res) => {
         {
           raw_material_id: newRawMaterialId,
           supplier_id: newSupplierId,
-          desc: desc !== undefined ? desc : oldItem.desc,
+          desc: batchDesc,
           quantity: qty,
           out_quantity: alreadyOut,
           remaining_quantity: remainingQty,

@@ -20,9 +20,11 @@ const RawMaterialStockSchema = new Schema(
       default: null,
       index: true,
     },
+    // Batch label / description — required so each purchase batch is identifiable.
     desc: {
       type: String,
-      default: "",
+      required: true,
+      trim: true,
     },
     /** Original purchase qty that came into this batch (kitna aya). */
     quantity: requiredNumberWithDefault,
