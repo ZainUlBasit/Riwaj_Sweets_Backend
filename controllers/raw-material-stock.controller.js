@@ -35,6 +35,13 @@ async function resolvePurchaseRmStoreId(stockDoc, session = null) {
   return entry?.location_id ?? null;
 }
 
+/** Resolve purchase supplier — stock field, or legacy RM master supplier. */
+function resolvePurchaseSupplierId(stockDoc, rawMaterialDoc = null) {
+  if (stockDoc?.supplier_id) return stockDoc.supplier_id;
+  if (rawMaterialDoc?.supplier_id) return rawMaterialDoc.supplier_id;
+  return null;
+}
+
 const list = async (req, res) => {
   try {
     const filter = { isDeleted: false };
@@ -53,10 +60,12 @@ const list = async (req, res) => {
 
     const items = await RawMaterialStock.find(filter)
       .populate("raw_material_id")
+      .populate("supplier_id")
       .populate(locationPopulate)
       .sort({ createdAt: -1 });
     const deletedItems = await RawMaterialStock.find({ isDeleted: true })
       .populate("raw_material_id")
+      .populate("supplier_id")
       .populate(locationPopulate)
       .sort({ createdAt: -1 });
 
@@ -124,6 +133,7 @@ const getOne = async (req, res) => {
   try {
     const item = await RawMaterialStock.findById(req.params.id)
       .populate("raw_material_id")
+      .populate("supplier_id")
       .populate("rm_store_location_id", "name location_type")
       .where({ isDeleted: false });
     if (!item)
@@ -147,6 +157,7 @@ const create = async (req, res) => {
   try {
     const {
       raw_material_id,
+      supplier_id,
       desc,
       quantity,
       price,
@@ -155,6 +166,9 @@ const create = async (req, res) => {
     } = req.body;
     if (!raw_material_id) {
       return createError(res, 400, "raw_material_id is required.");
+    }
+    if (!supplier_id) {
+      return createError(res, 400, "supplier_id is required.");
     }
     if (!rm_store_location_id) {
       return createError(
@@ -175,6 +189,13 @@ const create = async (req, res) => {
     });
     if (!rawMaterial) {
       return createError(res, 404, "Raw material not found.");
+    }
+
+    const supplier = await Supplier.findById(supplier_id).where({
+      isDeleted: false,
+    });
+    if (!supplier) {
+      return createError(res, 404, "Supplier not found.");
     }
 
     const loc = await DispatchLocation.findById(rm_store_location_id).where({
@@ -200,6 +221,7 @@ const create = async (req, res) => {
         [
           {
             raw_material_id,
+            supplier_id,
             desc: desc ?? "",
             quantity: qty,
             price: prc,
@@ -219,7 +241,7 @@ const create = async (req, res) => {
       );
 
       await Supplier.findByIdAndUpdate(
-        rawMaterial.supplier_id,
+        supplier_id,
         { $inc: { total_amount: totalPrice, payable: totalPrice } },
         opts,
       );
@@ -281,6 +303,7 @@ const update = async (req, res) => {
 
     const {
       raw_material_id,
+      supplier_id,
       desc,
       quantity,
       price,
@@ -302,6 +325,27 @@ const update = async (req, res) => {
     });
     if (!newRawMaterial) {
       return createError(res, 404, "Raw material not found.");
+    }
+
+    const oldRawMaterial = await RawMaterial.findById(
+      oldItem.raw_material_id,
+    ).where({ isDeleted: false });
+
+    const oldSupplierId = resolvePurchaseSupplierId(oldItem, oldRawMaterial);
+    let newSupplierId =
+      supplier_id !== undefined
+        ? supplier_id
+        : resolvePurchaseSupplierId(oldItem, newRawMaterial);
+
+    if (!newSupplierId) {
+      return createError(res, 400, "supplier_id is required.");
+    }
+
+    const newSupplier = await Supplier.findById(newSupplierId).where({
+      isDeleted: false,
+    });
+    if (!newSupplier) {
+      return createError(res, 404, "Supplier not found.");
     }
 
     const oldRmStoreId = await resolvePurchaseRmStoreId(oldItem);
@@ -335,18 +379,16 @@ const update = async (req, res) => {
     const item = await withTransaction(async (session) => {
       const opts = { session };
       const oldTotalPrice = oldItem.total_price || 0;
-      const oldRawMaterial = await RawMaterial.findById(
-        oldItem.raw_material_id,
-      )
-        .where({ isDeleted: false })
-        .session(session);
 
-      if (oldRawMaterial) {
+      if (oldSupplierId) {
         await Supplier.findByIdAndUpdate(
-          oldRawMaterial.supplier_id,
+          oldSupplierId,
           { $inc: { total_amount: -oldTotalPrice, payable: -oldTotalPrice } },
           opts,
         );
+      }
+
+      if (oldRawMaterial) {
         await adjustRawMaterial(
           oldItem.raw_material_id,
           { inDelta: -oldItem.quantity, availDelta: -oldItem.quantity },
@@ -371,6 +413,7 @@ const update = async (req, res) => {
         req.params.id,
         {
           raw_material_id: newRawMaterialId,
+          supplier_id: newSupplierId,
           desc: desc !== undefined ? desc : oldItem.desc,
           quantity: qty,
           price: prc,
@@ -382,7 +425,7 @@ const update = async (req, res) => {
       );
 
       await Supplier.findByIdAndUpdate(
-        newRawMaterial.supplier_id,
+        newSupplierId,
         { $inc: { total_amount: newTotalPrice, payable: newTotalPrice } },
         opts,
       );
@@ -458,12 +501,17 @@ const remove = async (req, res) => {
         .where({ isDeleted: false })
         .session(session);
 
-      if (rawMaterial) {
+      const supplierId = resolvePurchaseSupplierId(item, rawMaterial);
+
+      if (supplierId) {
         await Supplier.findByIdAndUpdate(
-          rawMaterial.supplier_id,
+          supplierId,
           { $inc: { total_amount: -totalPrice, payable: -totalPrice } },
           opts,
         );
+      }
+
+      if (rawMaterial) {
         const prevAvail = Number(rawMaterial.available_quantity || 0);
         const updated = await adjustRawMaterial(
           item.raw_material_id,

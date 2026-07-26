@@ -43,9 +43,9 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, supplier_id, price, unit, opening_quantity } = req.body;
-    if (!name || !supplier_id || unit == null) {
-      return createError(res, 400, "Name, supplier_id and unit are required.");
+    const { name, price, unit, opening_quantity } = req.body;
+    if (!name || unit == null) {
+      return createError(res, 400, "Name and unit are required.");
     }
     const openingQty = Number(opening_quantity ?? 0);
     if (!Number.isFinite(openingQty) || openingQty < 0) {
@@ -62,7 +62,7 @@ const create = async (req, res) => {
         [
           {
             name,
-            supplier_id,
+            supplier_id: null,
             price: price ?? 0,
             unit,
             opening_quantity: openingQty,
@@ -115,12 +115,11 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, supplier_id, price, unit } = req.body;
+    const { name, price, unit } = req.body;
     const item = await RawMaterial.findByIdAndUpdate(
       req.params.id,
       {
         name,
-        supplier_id,
         price,
         unit,
         isDeleted: false,

@@ -10,10 +10,11 @@ const Schema = mongoose.Schema;
 const RawMaterialSchema = new Schema(
   {
     name: requiredString,
+    // Legacy — supplier is now set per stock purchase, not on the material master.
     supplier_id: {
       type: mongoose.Types.ObjectId,
       ref: "Supplier",
-      required: true,
+      default: null,
     },
     price: requiredNumberWithDefault,
     unit: {

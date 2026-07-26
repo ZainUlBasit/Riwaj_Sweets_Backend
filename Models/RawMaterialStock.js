@@ -14,6 +14,13 @@ const RawMaterialStockSchema = new Schema(
       ref: "RawMaterial",
       required: true,
     },
+    // Supplier for this purchase batch (set when adding stock).
+    supplier_id: {
+      type: mongoose.Types.ObjectId,
+      ref: "Supplier",
+      default: null,
+      index: true,
+    },
     desc: {
       type: String,
       default: "",
