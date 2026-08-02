@@ -471,9 +471,10 @@ const remove = async (req, res) => {
 /**
  * POST /api/product/import
  *
- * Body: { products: Array<{ name, category|category_name, unit, price?, ... }> }
+ * Body: { products: Array<{ name, category|category_name, unit, price?, bom?, ... }> }
  * Resolves category by name (creates if missing). Optional `id`/`product_code`
- * sets Products.id for barcode item codes.
+ * sets Products.id for barcode item codes. Optional `bom` uses the same
+ * shape as product create: [{ rawMaterialId, quantity_required_per_unit }].
  */
 const importBulk = async (req, res) => {
   try {
@@ -600,6 +601,20 @@ const importBulk = async (req, res) => {
             continue;
           }
           payload.id = code;
+        }
+
+        // Optional recipe / BOM — same shape as product create/update.
+        if (raw.bom !== undefined) {
+          const parsedBom = parseBom(raw.bom);
+          if (parsedBom === null) {
+            errors.push({
+              row: rowNum,
+              message:
+                "Invalid bom. Expected [{ rawMaterialId, quantity_required_per_unit }].",
+            });
+            continue;
+          }
+          payload.bom = parsedBom;
         }
 
         const product = await Product.create(payload);

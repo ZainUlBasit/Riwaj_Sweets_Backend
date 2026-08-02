@@ -304,6 +304,11 @@ app.use("/api/dispatch-location", DispatchLocationRoutes);
 const ProductionDashboardRoutes = require("../routes/production-dashboard.routes");
 app.use("/api/production-dashboard", ProductionDashboardRoutes);
 // ===================================================
+// Owner Dashboard Routes
+// ===================================================
+const DashboardRoutes = require("../routes/dashboard.routes");
+app.use("/api/dashboard", DashboardRoutes);
+// ===================================================
 // Order Routes
 // ===================================================
 const OrderRoutes = require("../routes/order.routes");
