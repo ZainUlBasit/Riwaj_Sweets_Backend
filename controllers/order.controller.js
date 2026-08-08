@@ -155,7 +155,9 @@ const resolveProductBarcodeItem = async (barcode) => {
   const product = await Product.findOne({
     id: parsed.productCode,
     isDeleted: false,
-  }).populate("category_id");
+  })
+    .select("_id id name unit price")
+    .lean();
 
   if (!product) {
     throw Object.assign(

@@ -669,7 +669,9 @@ async function getLocationInventoryQty(
     product_id: productId,
     inventory_type: inventoryType,
     isDeleted: false,
-  });
+  })
+    .select("quantity")
+    .lean();
   if (session) q.session(session);
   const row = await q;
   return row ? Number(row.quantity || 0) : 0;

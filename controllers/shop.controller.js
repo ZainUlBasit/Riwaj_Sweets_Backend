@@ -463,6 +463,7 @@ const scanProductBarcode = async (req, res) => {
     const item = await resolveProductBarcodeItem(
       req.body?.barcode || req.body?.code,
     );
+    // Stock qty is optional for cart add — fetch in parallel-friendly lean path
     const available_qty = await getLocationInventoryQty(
       shop.location_id,
       item.product_id,
@@ -472,8 +473,14 @@ const scanProductBarcode = async (req, res) => {
       res,
       {
         item: {
-          ...item,
-          product: undefined,
+          barcode: item.barcode,
+          product_id: item.product_id,
+          product_code: item.product_code,
+          name: item.name,
+          unit: item.unit,
+          quantity: item.quantity,
+          unit_price: item.unit_price,
+          total_price: item.total_price,
           available_qty,
           available_quantity: available_qty,
         },
@@ -500,11 +507,33 @@ const cashBarcodeSale = async (req, res) => {
     }
 
     const resolved = [];
+    const uniqueBarcodes = [];
+    const seenBarcode = new Set();
     for (const raw of rawItems) {
       if (!raw?.barcode) {
         return createError(res, 400, "Each item needs a scanned barcode.");
       }
-      const item = await resolveProductBarcodeItem(raw.barcode);
+      const code = String(raw.barcode).trim();
+      if (!seenBarcode.has(code)) {
+        seenBarcode.add(code);
+        uniqueBarcodes.push(code);
+      }
+    }
+
+    const resolvedByBarcode = new Map();
+    await Promise.all(
+      uniqueBarcodes.map(async (code) => {
+        const item = await resolveProductBarcodeItem(code);
+        resolvedByBarcode.set(code, item);
+      }),
+    );
+
+    for (const raw of rawItems) {
+      const code = String(raw.barcode).trim();
+      const item = resolvedByBarcode.get(code);
+      if (!item) {
+        return createError(res, 404, `Product not found for barcode ${code}.`);
+      }
       resolved.push({
         product_id: item.product_id,
         name: item.name,
@@ -515,29 +544,38 @@ const cashBarcodeSale = async (req, res) => {
     }
 
     const requiredByProduct = new Map();
+    const nameByProduct = new Map();
     for (const item of resolved) {
       const key = String(item.product_id);
       requiredByProduct.set(
         key,
         (requiredByProduct.get(key) || 0) + Number(item.quantity || 0),
       );
+      nameByProduct.set(key, item.name);
     }
 
-    for (const [productId, requiredQty] of requiredByProduct.entries()) {
-      const product = await Product.findById(productId).where({ isDeleted: false });
-      if (!product) {
-        return createError(res, 404, "One or more products no longer exist.");
-      }
-      const available = await getLocationInventoryQty(
-        shop.location_id,
-        product._id,
-        INV_TYPE.SHOP,
-      );
-      if (available < requiredQty) {
+    const stockChecks = await Promise.all(
+      [...requiredByProduct.entries()].map(async ([productId, requiredQty]) => {
+        const available = await getLocationInventoryQty(
+          shop.location_id,
+          productId,
+          INV_TYPE.SHOP,
+        );
+        return {
+          productId,
+          name: nameByProduct.get(productId) || "Product",
+          requiredQty,
+          available,
+        };
+      }),
+    );
+
+    for (const check of stockChecks) {
+      if (check.available < check.requiredQty) {
         return createError(
           res,
           409,
-          `Insufficient shop stock for "${product.name}". Available: ${available}, requested: ${round3(requiredQty)}.`,
+          `Insufficient shop stock for "${check.name}". Available: ${check.available}, requested: ${round3(check.requiredQty)}.`,
         );
       }
     }
