@@ -4,6 +4,7 @@ const LocationInventory = require("../Models/LocationInventory");
 const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const { LOCATION_TYPE } = require("../Services/inventoryService");
+const { ensureDefaultLocations } = require("../Services/ensureDefaultLocations");
 
 const UNIT_LABEL_TO_ID = {
   kg: 1,
@@ -143,16 +144,19 @@ const parseRecipeExpenses = (raw) => {
   return out;
 };
 
-/** Aggregates stock per product × location (stores + shops). */
+/** Aggregates stock per product × location (RM Store + Product Store + Shop). */
 async function buildLocationStockMaps() {
+  const columnTypes = [
+    LOCATION_TYPE.RAW_MATERIAL_STORE,
+    LOCATION_TYPE.FINISHED_GOODS_STORE,
+    LOCATION_TYPE.SHOP,
+  ];
+
   const [locations, rows] = await Promise.all([
     DispatchLocation.find({
       isDeleted: false,
-      location_type: {
-        $in: [LOCATION_TYPE.FINISHED_GOODS_STORE, LOCATION_TYPE.SHOP],
-      },
+      location_type: { $in: columnTypes },
     })
-      .populate("store_id", "name")
       .select("_id name location_type store_id")
       .sort({ location_type: 1, name: 1 })
       .lean(),
@@ -171,10 +175,7 @@ async function buildLocationStockMaps() {
         $match: {
           "location.isDeleted": false,
           "location.location_type": {
-            $in: [
-              LOCATION_TYPE.FINISHED_GOODS_STORE,
-              LOCATION_TYPE.SHOP,
-            ],
+            $in: columnTypes,
           },
         },
       },
@@ -192,19 +193,17 @@ async function buildLocationStockMaps() {
   ]);
 
   const location_columns = locations.map((loc) => {
-    const isShop = Number(loc.location_type) === LOCATION_TYPE.SHOP;
-    const storeName =
-      loc.store_id && typeof loc.store_id === "object"
-        ? loc.store_id.name
-        : null;
-    // Prefer godown name for FG columns ("Store 1") so titles stay short.
-    const displayName =
-      !isShop && storeName ? storeName : loc.name;
+    const t = Number(loc.location_type);
     return {
       _id: String(loc._id),
-      name: displayName,
-      location_type: Number(loc.location_type),
-      kind: isShop ? "shop" : "store",
+      name: loc.name,
+      location_type: t,
+      kind:
+        t === LOCATION_TYPE.SHOP
+          ? "shop"
+          : t === LOCATION_TYPE.RAW_MATERIAL_STORE
+            ? "rm_store"
+            : "product_store",
     };
   });
 
@@ -241,127 +240,11 @@ const attachLocationStock = (product, mainStore, shop, byProduct) => {
 };
 
 /**
- * Ensure Store 1 / Store 2 (godown + FG location) and Shop 1 / Shop 2 exist.
- * Safe to call repeatedly — skips existing names.
+ * Simple masters: RM Store 1/2 + Shop 1/2.
+ * Production + Product Store stay auto/hidden under internal "Main" godown.
  */
 async function ensureDefaultStoresAndShops() {
-  const Store = require("../Models/Store");
-  const pairs = [
-    { storeName: "Store 1", shopName: "Shop 1" },
-    { storeName: "Store 2", shopName: "Shop 2" },
-  ];
-
-  for (const { storeName, shopName } of pairs) {
-    let store = await Store.findOne({
-      name: new RegExp(`^${storeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-      isDeleted: false,
-    });
-    if (!store) {
-      store = await Store.create({
-        name: storeName,
-        description: "Auto-created product/outlet store",
-        isDeleted: false,
-      });
-    }
-
-    let fg = await DispatchLocation.findOne({
-      store_id: store._id,
-      location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
-      isDeleted: false,
-    });
-    if (!fg) {
-      const nameTaken = await DispatchLocation.findOne({
-        name: new RegExp(
-          `^${storeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-          "i",
-        ),
-        isDeleted: false,
-      });
-      if (
-        nameTaken &&
-        Number(nameTaken.location_type) === LOCATION_TYPE.FINISHED_GOODS_STORE
-      ) {
-        fg = nameTaken;
-        if (!fg.store_id || String(fg.store_id) !== String(store._id)) {
-          fg.store_id = store._id;
-          await fg.save();
-        }
-      } else if (!nameTaken) {
-        fg = await DispatchLocation.create({
-          name: storeName,
-          description: "Finished goods store",
-          store_id: store._id,
-          location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
-          isDeleted: false,
-        });
-      } else {
-        const altName = `${storeName} — Product Store`;
-        const alt = await DispatchLocation.findOne({
-          name: new RegExp(
-            `^${altName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-            "i",
-          ),
-          isDeleted: false,
-        });
-        if (!alt) {
-          fg = await DispatchLocation.create({
-            name: altName,
-            description: "Finished goods store",
-            store_id: store._id,
-            location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
-            isDeleted: false,
-          });
-        }
-      }
-    }
-
-    const production = await DispatchLocation.findOne({
-      store_id: store._id,
-      location_type: LOCATION_TYPE.PRODUCTION_AREA,
-      isDeleted: false,
-    });
-    if (!production) {
-      const prodName = `${storeName} — Production`;
-      const prodTaken = await DispatchLocation.findOne({
-        name: new RegExp(
-          `^${prodName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-          "i",
-        ),
-        isDeleted: false,
-      });
-      if (!prodTaken) {
-        await DispatchLocation.create({
-          name: prodName,
-          description: "Production area",
-          store_id: store._id,
-          location_type: LOCATION_TYPE.PRODUCTION_AREA,
-          isDeleted: false,
-        });
-      }
-    }
-
-    let shopLoc = await DispatchLocation.findOne({
-      name: new RegExp(
-        `^${shopName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-        "i",
-      ),
-      isDeleted: false,
-    });
-    if (!shopLoc) {
-      shopLoc = await DispatchLocation.create({
-        name: shopName,
-        description: "Retail shop outlet",
-        store_id: store._id,
-        location_type: LOCATION_TYPE.SHOP,
-        isDeleted: false,
-      });
-    } else if (Number(shopLoc.location_type) !== LOCATION_TYPE.SHOP) {
-      // name exists as non-shop — leave it; do not overwrite
-    } else if (!shopLoc.store_id) {
-      shopLoc.store_id = store._id;
-      await shopLoc.save();
-    }
-  }
+  return ensureDefaultLocations();
 }
 
 const list = async (req, res) => {

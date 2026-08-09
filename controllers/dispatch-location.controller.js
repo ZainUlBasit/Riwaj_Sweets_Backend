@@ -1,6 +1,7 @@
 const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const { getAssignedStoreId } = require("../utils/storeScope");
+const { ensureDefaultLocations } = require("../Services/ensureDefaultLocations");
 
 const LOCATION_TYPE = {
   RAW_MATERIAL_STORE: 1,
@@ -9,9 +10,9 @@ const LOCATION_TYPE = {
   FINISHED_GOODS_STORE: 4,
 };
 
-// Product Store is unique per godown. RM Store is unique for the WHOLE system
-// (one central raw-material store; production areas can be many).
-const PER_GODOWN_SINGLETON_TYPES = [LOCATION_TYPE.FINISHED_GOODS_STORE];
+// Product Store used to be unique per godown — now multiple allowed
+// (Product Store 1, Product Store 2, …) like RM Stores.
+const PER_GODOWN_SINGLETON_TYPES = [];
 
 const getSingletonLabel = (type) => {
   if (type === LOCATION_TYPE.RAW_MATERIAL_STORE) return "Raw Material Store";
@@ -54,6 +55,7 @@ const findByName = (name) =>
 const list = async (req, res) => {
   try {
     await syncLegacyDispatchLocations();
+    await ensureDefaultLocations();
 
     const filter = { isDeleted: false };
     const scopedStore =
@@ -128,14 +130,7 @@ const create = async (req, res) => {
     const locType = location_type != null ? Number(location_type) : 2;
 
     if (locType === LOCATION_TYPE.RAW_MATERIAL_STORE) {
-      const existingRm = await findGlobalRmStore();
-      if (existingRm) {
-        return createError(
-          res,
-          409,
-          `Only one RM Store is allowed in the whole system ("${existingRm.name}"). Production areas can be many.`,
-        );
-      }
+      // Multiple RM Stores allowed (RM Store 1, RM Store 2, …).
     } else if (store_id) {
       const duplicate = await assertSingletonLocation(store_id, locType);
       if (duplicate) {
@@ -206,14 +201,7 @@ const update = async (req, res) => {
         : current.location_type;
 
     if (Number(effectiveType) === LOCATION_TYPE.RAW_MATERIAL_STORE) {
-      const existingRm = await findGlobalRmStore(req.params.id);
-      if (existingRm) {
-        return createError(
-          res,
-          409,
-          `Only one RM Store is allowed in the whole system ("${existingRm.name}").`,
-        );
-      }
+      // Multiple RM Stores allowed.
     } else if (effectiveStoreId) {
       const duplicate = await assertSingletonLocation(
         effectiveStoreId,

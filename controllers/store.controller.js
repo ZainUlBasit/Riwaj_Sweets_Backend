@@ -79,20 +79,6 @@ const create = async (req, res) => {
         },
       ];
 
-      // RM Store is a single central location for the whole system.
-      // Only create one if none exists yet.
-      const existingRm = await DispatchLocation.findOne({
-        location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
-        isDeleted: false,
-      });
-      if (!existingRm) {
-        defaults.unshift({
-          name: "Central RM Store",
-          location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
-          description: "Central raw material store (system-wide)",
-        });
-      }
-
       locations = await DispatchLocation.insertMany(
         defaults.map((d) => ({
           ...d,
@@ -114,7 +100,7 @@ const create = async (req, res) => {
       res,
       { ...store.toObject(), locations },
       setup_defaults !== false
-        ? "Godown created with RM Store, Production, and Product Store."
+        ? "Godown created with Production and Product Store (auto)."
         : "Store created successfully.",
     );
   } catch (err) {
