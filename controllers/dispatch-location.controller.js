@@ -57,10 +57,9 @@ const findByName = (name) =>
  * Include:
  *  - locations on their assigned godown
  *  - unscoped legacy rows (store_id null) for RM / Product Store / Shop
- *  - system-wide RM Stores (type 1)
- *
- * Product Stores used to vanish for managers when store_id was null, or when
- * ensureDefaultLocations soft-deleted the only Product Store rows.
+ *  - system-wide simple masters: RM Store, Shop, Product Store
+ *    (Shop 1/2 & Product Store 1/2 live on Store 1 but must be visible
+ *     to every RM Manager for Shop Transfer / production receive)
  */
 const buildListFilter = (req, { deleted }) => {
   const filter = { isDeleted: !!deleted };
@@ -85,6 +84,7 @@ const buildListFilter = (req, { deleted }) => {
         },
       },
       { location_type: LOCATION_TYPE.RAW_MATERIAL_STORE },
+      { location_type: LOCATION_TYPE.SHOP },
       { location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
     ],
   };
