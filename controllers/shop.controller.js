@@ -924,55 +924,159 @@ const posSale = async (req, res) => {
 };
 
 /**
+ * Normalize transfer shipment barcode.
+ * Accepts `PT-XXXXXXXX` or 8-char hex tail.
+ */
+const normalizeTransferCode = (raw) => {
+  let code = String(raw || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "");
+  if (!code) return "";
+  if (code.startsWith("PT-")) return code;
+  if (/^[A-F0-9]{8}$/.test(code)) return `PT-${code}`;
+  return code;
+};
+
+/**
+ * Resolve pending (In transit) lines for this shop + barcode.
+ * Throws { status, message } on failure.
+ */
+async function loadPendingTransferForShop(shop, rawCode) {
+  const code = normalizeTransferCode(rawCode);
+  if (!code || !code.startsWith("PT-")) {
+    const err = new Error("Transfer barcode required (e.g. PT-A1B2C3D4).");
+    err.status = 400;
+    throw err;
+  }
+  if (!shop?.location_id) {
+    const err = new Error(
+      "Shop has no linked location. Admin se Shop account location set karwayein.",
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  const shopLocId = String(shop.location_id._id || shop.location_id);
+
+  const pending = await ProductTransfer.find({
+    transfer_code: code,
+    to_location_id: shopLocId,
+    status: TRANSFER_STATUS.PENDING,
+    isDeleted: false,
+  })
+    .populate("product_id", "name id unit price")
+    .populate("from_location_id", "name")
+    .populate("to_location_id", "name");
+
+  if (!pending.length) {
+    const any = await ProductTransfer.findOne({
+      transfer_code: code,
+      isDeleted: false,
+    }).populate("to_location_id", "name");
+    if (!any) {
+      const err = new Error(`Transfer barcode not found: ${code}`);
+      err.status = 404;
+      throw err;
+    }
+    if (String(any.to_location_id?._id || any.to_location_id) !== shopLocId) {
+      const dest = any.to_location_id?.name || "another shop";
+      const err = new Error(
+        `Yeh transfer "${dest}" ke liye hai — is shop (${shop.name}) pe receive nahi ho sakta.`,
+      );
+      err.status = 403;
+      throw err;
+    }
+    if (Number(any.status) === TRANSFER_STATUS.RECEIVED) {
+      const err = new Error(
+        "Yeh transfer pehle hi receive ho chuka hai (status: Received).",
+      );
+      err.status = 409;
+      throw err;
+    }
+    if (Number(any.status) === TRANSFER_STATUS.CANCELLED) {
+      const err = new Error("Yeh transfer cancel / reverse ho chuka hai.");
+      err.status = 409;
+      throw err;
+    }
+    const err = new Error(
+      "Is barcode pe koi pending (In transit) stock nahi.",
+    );
+    err.status = 404;
+    throw err;
+  }
+
+  const items = pending.map((row) => ({
+    transfer_id: row._id,
+    product_id: row.product_id?._id || row.product_id,
+    product_code: row.product_id?.id ?? null,
+    name: row.product_id?.name || "Product",
+    unit: row.product_id?.unit ?? null,
+    quantity: Number(row.quantity || 0),
+    from_location: row.from_location_id?.name || null,
+    to_location: row.to_location_id?.name || shop.name || null,
+  }));
+
+  const total_quantity = items.reduce(
+    (sum, row) => sum + Number(row.quantity || 0),
+    0,
+  );
+
+  return {
+    code,
+    shopLocId,
+    pending,
+    preview: {
+      transfer_code: code,
+      status: TRANSFER_STATUS.PENDING,
+      status_label: "In transit",
+      from_location: items[0]?.from_location || null,
+      to_location: items[0]?.to_location || null,
+      item_count: items.length,
+      total_quantity,
+      items,
+    },
+  };
+}
+
+/**
+ * POST /api/shop/preview-transfer
+ * Scan PT- barcode → show kya/kitna aaya WITHOUT receiving yet.
+ */
+const previewTransfer = async (req, res) => {
+  try {
+    const shop = req.shop;
+    const raw =
+      req.body?.barcode || req.body?.transfer_code || req.body?.code || "";
+    const { preview } = await loadPendingTransferForShop(shop, raw);
+    return successMessage(
+      res,
+      preview,
+      `${preview.item_count} item(s) ready to receive — confirm karein.`,
+    );
+  } catch (err) {
+    console.error("Shop previewTransfer error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to preview transfer.",
+    );
+  }
+};
+
+/**
  * POST /api/shop/receive-transfer
- * Scan Product Store → Shop transfer barcode (PT-…).
- * Credits this shop's inventory for pending lines on that shipment.
+ * Confirm receive: In transit (1) → Received (2), credit shop stock.
  */
 const receiveTransfer = async (req, res) => {
   try {
     const shop = req.shop;
-    const code = String(
-      req.body?.barcode || req.body?.transfer_code || req.body?.code || "",
-    )
-      .trim()
-      .toUpperCase();
+    const raw =
+      req.body?.barcode || req.body?.transfer_code || req.body?.code || "";
+    const { code, shopLocId, pending, preview } =
+      await loadPendingTransferForShop(shop, raw);
 
-    if (!code) {
-      return createError(res, 400, "Transfer barcode is required.");
-    }
-    if (!shop?.location_id) {
-      return createError(res, 400, "Shop has no linked location.");
-    }
-
-    const pending = await ProductTransfer.find({
-      transfer_code: code,
-      to_location_id: shop.location_id,
-      status: TRANSFER_STATUS.PENDING,
-      isDeleted: false,
-    }).populate("product_id", "name id unit price");
-
-    if (!pending.length) {
-      const any = await ProductTransfer.findOne({
-        transfer_code: code,
-        isDeleted: false,
-      });
-      if (!any) {
-        return createError(res, 404, `Transfer barcode not found: ${code}`);
-      }
-      if (String(any.to_location_id) !== String(shop.location_id)) {
-        return createError(
-          res,
-          403,
-          "Yeh transfer kisi aur shop ke liye hai.",
-        );
-      }
-      if (Number(any.status) === TRANSFER_STATUS.RECEIVED) {
-        return createError(res, 409, "Yeh transfer pehle hi receive ho chuka hai.");
-      }
-      return createError(res, 404, "Is barcode pe koi pending stock nahi.");
-    }
-
-    const toLoc = await DispatchLocation.findById(shop.location_id).where({
+    const toLoc = await DispatchLocation.findById(shopLocId).where({
       isDeleted: false,
     });
     if (!toLoc) return createError(res, 404, "Shop location not found.");
@@ -986,14 +1090,14 @@ const receiveTransfer = async (req, res) => {
         const qty = Number(row.quantity || 0);
         const productId = row.product_id?._id || row.product_id;
         const prevQty = await getLocationInventoryQty(
-          shop.location_id,
+          shopLocId,
           productId,
           toInvType,
           session,
         );
 
         await adjustLocationInventory(
-          shop.location_id,
+          shopLocId,
           productId,
           qty,
           toInvType,
@@ -1006,7 +1110,7 @@ const receiveTransfer = async (req, res) => {
             direction: DIR.IN,
             productId,
             quantity: qty,
-            locationId: shop.location_id,
+            locationId: shopLocId,
             storeId: toLoc.store_id,
             referenceType: "ProductTransfer",
             referenceId: row._id,
@@ -1047,10 +1151,18 @@ const receiveTransfer = async (req, res) => {
       res,
       {
         transfer_code: code,
+        status: TRANSFER_STATUS.RECEIVED,
+        status_label: "Received",
+        from_location: preview.from_location,
+        to_location: preview.to_location,
         received_count: receivedItems.length,
+        total_quantity: receivedItems.reduce(
+          (sum, row) => sum + Number(row.quantity || 0),
+          0,
+        ),
         items: receivedItems,
       },
-      `${receivedItems.length} item(s) shop stock me add ho gaye.`,
+      `${receivedItems.length} item(s) shop stock me add — status ab Received.`,
     );
   } catch (err) {
     console.error("Shop receiveTransfer error:", err);
@@ -1076,5 +1188,6 @@ module.exports = {
   scanProductBarcode,
   cashBarcodeSale,
   posSale,
+  previewTransfer,
   receiveTransfer,
 };

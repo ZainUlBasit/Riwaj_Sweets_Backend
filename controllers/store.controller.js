@@ -53,7 +53,7 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, description, setup_defaults = false } = req.body || {};
+    const { name, description, setup_defaults = true } = req.body || {};
     if (!name?.trim()) return createError(res, 400, "Store name is required.");
 
     const userId = getUserId(req);
@@ -64,19 +64,28 @@ const create = async (req, res) => {
       isDeleted: false,
     });
 
-    // Masters UI is simple: Store / RM Store / Product Store / Shop.
-    // Do not auto-create "X — Production" / "X — Product Store" clutter.
     let locations = [];
-    if (setup_defaults === true) {
-      locations = await DispatchLocation.insertMany([
+    if (setup_defaults !== false) {
+      const defaults = [
         {
-          name: "Production",
+          name: `${storeName} — Production`,
           location_type: LOCATION_TYPE.PRODUCTION_AREA,
-          description: "Internal production (hidden)",
+          description: "Production / manufacturing area",
+        },
+        {
+          name: `${storeName} — Product Store`,
+          location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+          description: "Finished goods main store",
+        },
+      ];
+
+      locations = await DispatchLocation.insertMany(
+        defaults.map((d) => ({
+          ...d,
           store_id: store._id,
           isDeleted: false,
-        },
-      ]);
+        })),
+      );
     }
 
     await writeAudit({
@@ -90,7 +99,9 @@ const create = async (req, res) => {
     return successMessage(
       res,
       { ...store.toObject(), locations },
-      "Store created successfully.",
+      setup_defaults !== false
+        ? "Godown created with Production and Product Store (auto)."
+        : "Store created successfully.",
     );
   } catch (err) {
     console.error("Store create error:", err);
