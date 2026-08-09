@@ -20,8 +20,12 @@ async function assertLocationBelongsToStore(locationId, storeId) {
     err.status = 404;
     throw err;
   }
-  // Central RM Store is system-wide — any RM Manager may record stock-in/wastage there.
-  if (Number(loc.location_type) === 1) return;
+  const type = Number(loc.location_type);
+  // Shared system locations used across RM Manager godowns:
+  //   1 = RM Store (simple masters RM Store 1/2)
+  //   2 = Production (internal / hidden — ustad jobs, manufacturing)
+  if (type === 1 || type === 2) return;
+
   if (!loc.store_id || String(loc.store_id) !== String(storeId)) {
     const err = new Error("This location is outside your assigned store.");
     err.status = 403;
@@ -44,17 +48,13 @@ async function getStoreLocationIds(storeId) {
     store_id: storeId,
     isDeleted: false,
   }).distinct("_id");
-  // Always include the single central RM Store (type 1), regardless of godown.
-  const rmStore = await DispatchLocation.findOne({
-    location_type: 1,
+  // Shared simple masters: all RM Stores + Production areas
+  const shared = await DispatchLocation.find({
+    location_type: { $in: [1, 2] },
     isDeleted: false,
-  }).select("_id");
-  const ids = own.map(String);
-  if (rmStore?._id) {
-    const rmId = String(rmStore._id);
-    if (!ids.includes(rmId)) ids.push(rmId);
-  }
-  return ids;
+  }).distinct("_id");
+  const ids = new Set([...own, ...shared].map(String));
+  return [...ids];
 }
 
 async function applyStoreLocationFilter(req, filter, field = "location_id") {

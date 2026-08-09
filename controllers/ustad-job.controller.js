@@ -29,6 +29,64 @@ const generateJobCode = () => {
   return `UJ-${day}-${rand}`;
 };
 
+/**
+ * Prefer Production under the manager/ustad/RM godown.
+ * Creates a dedicated Production row for that store when missing so RM Managers
+ * are not blocked by a Store-1-only Production + store-scope assert mismatch.
+ */
+async function resolveProductionArea(storeHint) {
+  if (storeHint) {
+    let prod = await findProductionArea(storeHint);
+    if (prod) return prod;
+
+    const Store = require("../Models/Store");
+    const store = await Store.findById(storeHint).where({ isDeleted: false });
+    const baseName = store?.name ? String(store.name).trim() : "Store";
+    const preferredName = `${baseName} — Production`;
+
+    const existingByName = await DispatchLocation.findOne({
+      name: new RegExp(
+        `^${preferredName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+        "i",
+      ),
+      isDeleted: false,
+    });
+    if (existingByName && Number(existingByName.location_type) === 2) {
+      if (!existingByName.store_id) {
+        existingByName.store_id = storeHint;
+        await existingByName.save();
+      }
+      return existingByName;
+    }
+
+    try {
+      return await DispatchLocation.create({
+        name: preferredName,
+        description: "Internal production (hidden)",
+        store_id: storeHint,
+        location_type: 2,
+        isDeleted: false,
+      });
+    } catch (err) {
+      if (err.code === 11000) {
+        return (
+          (await findProductionArea(storeHint)) ||
+          (await DispatchLocation.findOne({
+            name: preferredName,
+            isDeleted: false,
+          }))
+        );
+      }
+      throw err;
+    }
+  }
+
+  return DispatchLocation.findOne({
+    location_type: 2,
+    isDeleted: false,
+  }).sort({ createdAt: 1 });
+}
+
 const populateJob = (q) =>
   q
     .populate("ustad_id", "name phone")
@@ -299,7 +357,7 @@ const create = async (req, res) => {
     });
     if (!fromLoc) return createError(res, 404, "RM Store not found.");
 
-    // Production area is internal — auto-resolve (no UI selection).
+    // Production area is internal — auto-resolve under assigned/ustad/RM godown.
     let toLoc = null;
     if (location_id) {
       toLoc = await DispatchLocation.findById(location_id).where({
@@ -309,23 +367,17 @@ const create = async (req, res) => {
     if (!toLoc) {
       const storeHint =
         getAssignedStoreId(req) ||
-        ustadDoc?.store_id ||
-        fromLoc.store_id ||
-        null;
-      toLoc = await findProductionArea(storeHint);
-    }
-    if (!toLoc) {
-      // Fallback: any production area in system
-      toLoc = await DispatchLocation.findOne({
-        location_type: 2,
-        isDeleted: false,
-      }).sort({ createdAt: 1 });
+        (ustadDoc?.store_id
+          ? String(ustadDoc.store_id._id ?? ustadDoc.store_id)
+          : null) ||
+        (fromLoc.store_id ? String(fromLoc.store_id) : null);
+      toLoc = await resolveProductionArea(storeHint);
     }
     if (!toLoc) {
       return createError(
         res,
         400,
-        "Production area configure nahi hai. Stores & Locations me store setup karein.",
+        "Production area configure nahi hai. Stores pe Store setup karein.",
       );
     }
 
@@ -336,6 +388,7 @@ const create = async (req, res) => {
     }
 
     try {
+      // RM Store (type 1) + Production (type 2) are shared; Product/Shop still scoped.
       await assertRmManagerStoreAccess(req, [fromLoc._id, toLoc._id]);
     } catch (err) {
       return createError(res, err.status || 403, err.message);
