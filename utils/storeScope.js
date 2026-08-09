@@ -21,10 +21,9 @@ async function assertLocationBelongsToStore(locationId, storeId) {
     throw err;
   }
   const type = Number(loc.location_type);
-  // Shared system locations used across RM Manager godowns:
-  //   1 = RM Store (simple masters RM Store 1/2)
-  //   2 = Production (internal / hidden — ustad jobs, manufacturing)
-  if (type === 1 || type === 2) return;
+  // Shared system / simple masters used across RM Manager godowns:
+  //   1 = RM Store, 2 = Production, 4 = Product Store (finished goods)
+  if (type === 1 || type === 2 || type === 4) return;
 
   if (!loc.store_id || String(loc.store_id) !== String(storeId)) {
     const err = new Error("This location is outside your assigned store.");
@@ -48,9 +47,9 @@ async function getStoreLocationIds(storeId) {
     store_id: storeId,
     isDeleted: false,
   }).distinct("_id");
-  // Shared simple masters: all RM Stores + Production areas
+  // Shared simple masters: all RM Stores + Production + Product Stores
   const shared = await DispatchLocation.find({
-    location_type: { $in: [1, 2] },
+    location_type: { $in: [1, 2, 4] },
     isDeleted: false,
   }).distinct("_id");
   const ids = new Set([...own, ...shared].map(String));

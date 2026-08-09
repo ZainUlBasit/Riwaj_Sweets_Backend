@@ -171,6 +171,8 @@ async function applyProductionImpact({
   referenceId,
   ustadName = "",
   ustadId = null,
+  /** Optional explicit Product Store (finished goods). Required for clear destination. */
+  productStoreLocation = null,
   session = null,
 }) {
   const opts = session ? { session } : {};
@@ -181,9 +183,20 @@ async function applyProductionImpact({
   let storeReceipt = null;
 
   if (cakes > 0) {
-    let fgStore = null;
-    if (productionLocation?.store_id) {
-      fgStore = await findFinishedGoodsStore(productionLocation.store_id, session);
+    let fgStore = productStoreLocation || null;
+    if (
+      fgStore &&
+      Number(fgStore.location_type) !== LOCATION_TYPE.FINISHED_GOODS_STORE
+    ) {
+      const err = new Error("to_location_id must be a Product Store.");
+      err.status = 400;
+      throw err;
+    }
+    if (!fgStore && productionLocation?.store_id) {
+      fgStore = await findFinishedGoodsStore(
+        productionLocation.store_id,
+        session,
+      );
     }
 
     const stockLocationId = fgStore?._id ?? productionLocation?._id ?? null;
@@ -294,6 +307,8 @@ const create = async (req, res) => {
       ustad_name,
       ustad_id,
       ustad_job_id,
+      to_location_id,
+      product_store_id,
     } = req.body || {};
 
     if (!production_date) {
@@ -407,6 +422,36 @@ const create = async (req, res) => {
       }
     }
 
+    // Explicit Product Store destination (Ustad / production receive)
+    let productStoreLocation = null;
+    const fgLocationId = to_location_id || product_store_id || null;
+    if (cakes > 0) {
+      if (!fgLocationId) {
+        return createError(
+          res,
+          400,
+          "Product Store select karein — finished goods kahan add honge.",
+        );
+      }
+      productStoreLocation = await DispatchLocation.findById(fgLocationId).where({
+        isDeleted: false,
+      });
+      if (!productStoreLocation) {
+        return createError(res, 404, "Product Store not found.");
+      }
+      if (
+        Number(productStoreLocation.location_type) !==
+        LOCATION_TYPE.FINISHED_GOODS_STORE
+      ) {
+        return createError(res, 400, "to_location_id must be a Product Store.");
+      }
+      try {
+        await assertRmManagerStoreAccess(req, [productStoreLocation._id]);
+      } catch (err) {
+        return createError(res, err.status || 403, err.message);
+      }
+    }
+
     const userId = getUserId(req);
 
     const item = await withTransaction(async (session) => {
@@ -439,6 +484,7 @@ const create = async (req, res) => {
         referenceId: created._id,
         ustadName,
         ustadId: ustadDocId,
+        productStoreLocation,
         session,
       });
 
