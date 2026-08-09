@@ -92,10 +92,18 @@ const parseBom = (raw) => {
   }
   if (!Array.isArray(arr)) return null;
 
+  const extractId = (v) => {
+    if (v == null || v === "") return null;
+    if (typeof v === "object") return v._id || v.id || null;
+    return v;
+  };
+
   const out = [];
   const seen = new Set();
   for (const row of arr) {
-    const rmId = row?.rawMaterialId || row?.raw_material_id;
+    const rmId = extractId(
+      row?.rawMaterialId ?? row?.raw_material_id ?? row?.raw_material,
+    );
     const qty = Number(row?.quantity_required_per_unit ?? row?.quantity);
     if (!rmId || !Number.isFinite(qty) || qty < 0) return null;
     if (qty === 0) continue;
@@ -110,7 +118,32 @@ const parseBom = (raw) => {
   return out;
 };
 
-/** Aggregates per-product qty in main stores vs shops from LocationInventory. */
+/** Parse recipe expenses. Returns array or null on bad input. */
+const parseRecipeExpenses = (raw) => {
+  if (raw === undefined) return undefined;
+  if (raw === null || raw === "") return [];
+  let arr = raw;
+  if (typeof raw === "string") {
+    try {
+      arr = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!Array.isArray(arr)) return null;
+
+  const out = [];
+  for (const row of arr) {
+    const name = String(row?.name || "").trim();
+    const amount = Number(row?.amount_per_unit ?? row?.amount ?? row?.expense);
+    if (!name || !Number.isFinite(amount) || amount < 0) return null;
+    if (amount === 0) continue;
+    out.push({ name, amount_per_unit: amount });
+  }
+  return out;
+};
+
+/** Aggregates per-product qty totals + per-location breakdown from LocationInventory. */
 async function buildLocationStockMaps() {
   const rows = await LocationInventory.aggregate([
     { $match: { isDeleted: false, quantity: { $gt: 0 } } },
@@ -128,6 +161,7 @@ async function buildLocationStockMaps() {
       $group: {
         _id: {
           product_id: "$product_id",
+          location_id: "$location_id",
           location_type: "$location.location_type",
         },
         totalQty: { $sum: "$quantity" },
@@ -137,30 +171,76 @@ async function buildLocationStockMaps() {
 
   const mainStore = new Map();
   const shop = new Map();
+  /** Map productId -> { [locationId]: qty } */
+  const byLocation = new Map();
+
   for (const row of rows) {
     const pid = String(row._id.product_id);
+    const lid = String(row._id.location_id);
     const locType = Number(row._id.location_type);
     const qty = Number(row.totalQty || 0);
+
+    if (!byLocation.has(pid)) byLocation.set(pid, {});
+    byLocation.get(pid)[lid] = (byLocation.get(pid)[lid] || 0) + qty;
+
     if (locType === LOCATION_TYPE.FINISHED_GOODS_STORE) {
       mainStore.set(pid, (mainStore.get(pid) || 0) + qty);
     } else if (locType === LOCATION_TYPE.SHOP) {
       shop.set(pid, (shop.get(pid) || 0) + qty);
     }
   }
-  return { mainStore, shop };
+  return { mainStore, shop, byLocation };
 }
 
-const attachLocationStock = (product, mainStore, shop) => {
+const attachLocationStock = (product, mainStore, shop, byLocation) => {
   const doc = product.toObject ? product.toObject() : { ...product };
   const pid = String(doc._id);
   doc.main_store_quantity = mainStore.get(pid) || 0;
   doc.shop_quantity = shop.get(pid) || 0;
+  doc.location_quantities = byLocation.get(pid) || {};
   return doc;
 };
 
 const list = async (req, res) => {
   try {
-    const [{ mainStore, shop }, rawItems, rawDeleted] = await Promise.all([
+    // Ensure Store 1/2 + Shop 1/2 exist (idempotent)
+    const defaults = [
+      { name: "Store 1", location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
+      { name: "Store 2", location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
+      { name: "Shop 1", location_type: LOCATION_TYPE.SHOP },
+      { name: "Shop 2", location_type: LOCATION_TYPE.SHOP },
+    ];
+    for (const row of defaults) {
+      const existing = await DispatchLocation.findOne({
+        name: new RegExp(`^${row.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+        isDeleted: false,
+      });
+      if (existing) {
+        if (Number(existing.location_type) !== Number(row.location_type)) {
+          existing.location_type = row.location_type;
+          await existing.save();
+        }
+        continue;
+      }
+      try {
+        await DispatchLocation.create({
+          name: row.name,
+          description: "",
+          store_id: null,
+          location_type: row.location_type,
+          isDeleted: false,
+        });
+      } catch (err) {
+        if (err.code !== 11000) throw err;
+      }
+    }
+
+    const [
+      { mainStore, shop, byLocation },
+      rawItems,
+      rawDeleted,
+      stockLocations,
+    ] = await Promise.all([
       buildLocationStockMaps(),
       Product.find({ isDeleted: false })
         .populate("category_id")
@@ -172,11 +252,22 @@ const list = async (req, res) => {
         .populate("counter_id")
         .populate("bom.rawMaterialId")
         .sort({ createdAt: -1 }),
+      DispatchLocation.find({
+        isDeleted: false,
+        location_type: {
+          $in: [LOCATION_TYPE.FINISHED_GOODS_STORE, LOCATION_TYPE.SHOP],
+        },
+      })
+        .select("_id name location_type store_id")
+        .sort({ location_type: 1, name: 1 })
+        .lean(),
     ]);
 
-    const items = rawItems.map((p) => attachLocationStock(p, mainStore, shop));
+    const items = rawItems.map((p) =>
+      attachLocationStock(p, mainStore, shop, byLocation),
+    );
     const deletedItems = rawDeleted.map((p) =>
-      attachLocationStock(p, mainStore, shop),
+      attachLocationStock(p, mainStore, shop, byLocation),
     );
 
     return successMessage(
@@ -186,6 +277,7 @@ const list = async (req, res) => {
         deletedItems,
         products: items,
         deletedProducts: deletedItems,
+        stock_locations: stockLocations,
       },
       "Products fetched successfully.",
     );
@@ -277,6 +369,7 @@ const create = async (req, res) => {
       available_quantity,
       counter_id,
       bom,
+      recipe_expenses,
     } = req.body;
 
     if (!name || !category_id || !unit) {
@@ -301,6 +394,15 @@ const create = async (req, res) => {
         res,
         400,
         "Invalid bom. Expected [{ rawMaterialId, quantity_required_per_unit }].",
+      );
+    }
+
+    const parsedExpenses = parseRecipeExpenses(recipe_expenses);
+    if (recipe_expenses !== undefined && parsedExpenses === null) {
+      return createError(
+        res,
+        400,
+        "Invalid recipe_expenses. Expected [{ name, amount_per_unit }].",
       );
     }
 
@@ -333,6 +435,7 @@ const create = async (req, res) => {
       payload.counter_id = counter_id;
     }
     if (parsedBom !== undefined) payload.bom = parsedBom;
+    if (parsedExpenses !== undefined) payload.recipe_expenses = parsedExpenses;
 
     const product = await Product.create(payload);
     const populated = await Product.findById(product._id)
@@ -359,6 +462,7 @@ const update = async (req, res) => {
       counter_id,
       remove_image,
       bom,
+      recipe_expenses,
     } = req.body;
 
     const updatePayload = { isDeleted: false };
@@ -411,6 +515,17 @@ const update = async (req, res) => {
         );
       }
       updatePayload.bom = parsedBom;
+    }
+    if (recipe_expenses !== undefined) {
+      const parsedExpenses = parseRecipeExpenses(recipe_expenses);
+      if (parsedExpenses === null) {
+        return createError(
+          res,
+          400,
+          "Invalid recipe_expenses. Expected [{ name, amount_per_unit }].",
+        );
+      }
+      updatePayload.recipe_expenses = parsedExpenses;
     }
 
     // Image handling:
@@ -615,6 +730,19 @@ const importBulk = async (req, res) => {
             continue;
           }
           payload.bom = parsedBom;
+        }
+
+        if (raw.recipe_expenses !== undefined) {
+          const parsedExpenses = parseRecipeExpenses(raw.recipe_expenses);
+          if (parsedExpenses === null) {
+            errors.push({
+              row: rowNum,
+              message:
+                "Invalid recipe_expenses. Expected [{ name, amount_per_unit }].",
+            });
+            continue;
+          }
+          payload.recipe_expenses = parsedExpenses;
         }
 
         const product = await Product.create(payload);

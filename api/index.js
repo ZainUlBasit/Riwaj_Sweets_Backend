@@ -294,6 +294,16 @@ app.use("/api/cake-production", CakeProductionRoutes);
 const RawMaterialDispatchRoutes = require("../routes/raw-material-dispatch.routes");
 app.use("/api/raw-material-dispatch", RawMaterialDispatchRoutes);
 // ===================================================
+// Ustad Job (RM issue → FG return tracking)
+// ===================================================
+const UstadJobRoutes = require("../routes/ustad-job.routes");
+app.use("/api/ustad-job", UstadJobRoutes);
+// ===================================================
+// Ustad master (registered karegar)
+// ===================================================
+const UstadRoutes = require("../routes/ustad.routes");
+app.use("/api/ustad", UstadRoutes);
+// ===================================================
 // Dispatch Location Routes
 // ===================================================
 const DispatchLocationRoutes = require("../routes/dispatch-location.routes");

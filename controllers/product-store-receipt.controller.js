@@ -8,6 +8,7 @@ const {
   writeAudit,
   executeStoreReceipt,
   reverseStoreReceipt,
+  findProductionArea,
   withTransaction,
 } = require("../Services/inventoryService");
 
@@ -70,20 +71,36 @@ const create = async (req, res) => {
       quantity,
       receipt_date,
       notes,
+      ustad_name,
+      ustad_id,
     } = req.body || {};
 
-    if (!from_location_id || !to_location_id || !product_id) {
+    if (!to_location_id || !product_id) {
       return createError(
         res,
         400,
-        "from_location_id, to_location_id and product_id are required.",
+        "to_location_id and product_id are required.",
       );
-    }
-    if (String(from_location_id) === String(to_location_id)) {
-      return createError(res, 400, "From and to locations must be different.");
     }
     if (!receipt_date) {
       return createError(res, 400, "receipt_date is required.");
+    }
+
+    let ustadName = String(ustad_name || "").trim();
+    let ustadDocId = null;
+    if (ustad_id) {
+      const Ustad = require("../Models/Ustad");
+      const u = await Ustad.findById(ustad_id).where({ isDeleted: false });
+      if (!u) return createError(res, 404, "Registered ustad not found.");
+      ustadName = u.name;
+      ustadDocId = u._id;
+    }
+    if (!ustadName) {
+      return createError(
+        res,
+        400,
+        "Registered ustad select karein (kis ne tayar kiya).",
+      );
     }
 
     const qty = Number(quantity);
@@ -91,14 +108,41 @@ const create = async (req, res) => {
       return createError(res, 400, "quantity must be greater than 0.");
     }
 
-    const [fromLoc, toLoc, product] = await Promise.all([
-      DispatchLocation.findById(from_location_id).where({ isDeleted: false }),
-      DispatchLocation.findById(to_location_id).where({ isDeleted: false }),
-      Product.findById(product_id).where({ isDeleted: false }),
-    ]);
-
-    if (!fromLoc) return createError(res, 404, "From location not found.");
+    const toLoc = await DispatchLocation.findById(to_location_id).where({
+      isDeleted: false,
+    });
     if (!toLoc) return createError(res, 404, "To location not found.");
+
+    let fromLoc = null;
+    if (from_location_id) {
+      fromLoc = await DispatchLocation.findById(from_location_id).where({
+        isDeleted: false,
+      });
+    }
+    if (!fromLoc) {
+      fromLoc = await findProductionArea(toLoc.store_id);
+    }
+    if (!fromLoc) {
+      fromLoc = await DispatchLocation.findOne({
+        location_type: LOCATION_TYPE.PRODUCTION_AREA,
+        isDeleted: false,
+      }).sort({ createdAt: 1 });
+    }
+    if (!fromLoc) {
+      return createError(
+        res,
+        400,
+        "Production area configure nahi hai. Stores & Locations me store setup karein.",
+      );
+    }
+
+    if (String(fromLoc._id) === String(toLoc._id)) {
+      return createError(res, 400, "From and to locations must be different.");
+    }
+
+    const product = await Product.findById(product_id).where({
+      isDeleted: false,
+    });
     if (!product) return createError(res, 404, "Product not found.");
 
     const fromType = Number(fromLoc.location_type || LOCATION_TYPE.PRODUCTION_AREA);
@@ -123,13 +167,15 @@ const create = async (req, res) => {
 
     const item = await withTransaction(async (session) => {
       const receipt = await executeStoreReceipt({
-        fromLocationId: from_location_id,
-        toLocationId: to_location_id,
+        fromLocationId: fromLoc._id,
+        toLocationId: toLoc._id,
         productId: product_id,
         quantity: qty,
         receiptDate: receipt_date,
         userId,
         notes: notes ?? "",
+        ustadName,
+        ustadId: ustadDocId,
         session,
       });
 

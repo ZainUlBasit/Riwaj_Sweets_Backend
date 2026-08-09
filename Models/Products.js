@@ -27,6 +27,24 @@ const BomEntrySchema = new Schema(
   { _id: false },
 );
 
+/** Non-RM cost lines on the product recipe (labour, gas, packing, …) — Rs per 1 unit. */
+const RecipeExpenseEntrySchema = new Schema(
+  {
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    amount_per_unit: {
+      type: Number,
+      required: true,
+      min: 0,
+      default: 0,
+    },
+  },
+  { _id: false },
+);
+
 const PRODUCT_ID_SEQUENCE = "product_id_seq";
 
 /** Default Riwaj Sweets menu — seeded via Product.seedDefaults() or scripts/seed-products.js */
@@ -165,6 +183,11 @@ const ProductSchema = new Schema(
     /** Bill of materials — raw material qty required per 1 unit of finished product. */
     bom: {
       type: [BomEntrySchema],
+      default: [],
+    },
+    /** Recipe expenses — fixed Rs cost per 1 unit of finished product (labour, gas, …). */
+    recipe_expenses: {
+      type: [RecipeExpenseEntrySchema],
       default: [],
     },
     isDeleted: requiredBooleanWithDefaultFalse,

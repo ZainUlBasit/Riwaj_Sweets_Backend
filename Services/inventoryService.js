@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 const RawMaterial = require("../Models/RawMaterial");
 const RawMaterialStock = require("../Models/RawMaterialStock");
 const Product = require("../Models/Products");
@@ -8,6 +9,11 @@ const LocationInventory = require("../Models/LocationInventory");
 const LocationRawMaterialInventory = require("../Models/LocationRawMaterialInventory");
 const DispatchLocation = require("../Models/DispatchLocation");
 const ProductStoreReceipt = require("../Models/ProductStoreReceipt");
+
+const generateStoreReceiptCode = () => {
+  const rand = crypto.randomBytes(4).toString("hex").toUpperCase();
+  return `PSR-${rand}`;
+};
 
 /** Ledger transaction types — must match InventoryLedger schema enum. */
 const TX = {
@@ -49,6 +55,17 @@ async function findFinishedGoodsStore(storeId, session = null) {
     location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
     isDeleted: false,
   });
+  if (session) q.session(session);
+  return q;
+}
+
+async function findProductionArea(storeId, session = null) {
+  if (!storeId) return null;
+  const q = DispatchLocation.findOne({
+    store_id: storeId,
+    location_type: LOCATION_TYPE.PRODUCTION_AREA,
+    isDeleted: false,
+  }).sort({ createdAt: 1 });
   if (session) q.session(session);
   return q;
 }
@@ -1333,6 +1350,8 @@ async function executeStoreReceipt({
   referenceId = null,
   notes = "",
   cakeProductionId = null,
+  ustadName = "",
+  ustadId = null,
   session = null,
 }) {
   const opts = session ? { session } : {};
@@ -1363,6 +1382,9 @@ async function executeStoreReceipt({
   await adjustLocationInventory(fromLocationId, productId, -qty, fromInv, session);
   await adjustLocationInventory(toLocationId, productId, qty, toInv, session);
 
+  const receipt_code = generateStoreReceiptCode();
+  const ustad_name = String(ustadName || "").trim();
+
   const [item] = await ProductStoreReceipt.create(
     [
       {
@@ -1372,6 +1394,9 @@ async function executeStoreReceipt({
         quantity: qty,
         receipt_date: new Date(receiptDate),
         notes: notes ?? "",
+        receipt_code,
+        ustad_name,
+        ustad_id: ustadId || null,
         cake_production_id: cakeProductionId,
         created_by: userId,
         isDeleted: false,
@@ -1396,7 +1421,11 @@ async function executeStoreReceipt({
       referenceType,
       referenceId: referenceId ?? item._id,
       userId,
-      notes: notes || `Store receipt out → ${toLoc?.name ?? "main store"}`,
+      notes:
+        notes ||
+        `Store receipt out → ${toLoc?.name ?? "main store"}${
+          ustad_name ? ` · Ustad: ${ustad_name}` : ""
+        } [${receipt_code}]`,
       previousBalance: availableAtFrom,
       newBalance: availableAtFrom - qty,
     },
@@ -1415,7 +1444,11 @@ async function executeStoreReceipt({
       referenceType,
       referenceId: referenceId ?? item._id,
       userId,
-      notes: notes || `Store receipt in ← ${fromLoc?.name ?? "production"}`,
+      notes:
+        notes ||
+        `Store receipt in ← ${fromLoc?.name ?? "production"}${
+          ustad_name ? ` · Ustad: ${ustad_name}` : ""
+        } [${receipt_code}]`,
       previousBalance: toPrev - qty,
       newBalance: toPrev,
     },
@@ -1496,6 +1529,7 @@ module.exports = {
   adjustLocationInventory,
   getInventoryTypeForLocation,
   findFinishedGoodsStore,
+  findProductionArea,
   findRmStoreForGodown,
   getLocationRawMaterialQty,
   adjustLocationRawMaterialInventory,
@@ -1507,6 +1541,7 @@ module.exports = {
   reverseManualProductionConsumption,
   recordRmWastage,
   executeStoreReceipt,
+  generateStoreReceiptCode,
   reverseStoreReceipt,
   applyRawMaterialDispatchImpact,
   reverseRawMaterialDispatchImpact,

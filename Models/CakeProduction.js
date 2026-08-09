@@ -92,6 +92,27 @@ const CakeProductionSchema = new Schema(
       type: String,
       default: "",
     },
+    /** Ustad / karegar who prepared this batch. */
+    ustad_name: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    /** Registered Ustad master reference. */
+    ustad_id: {
+      type: Schema.Types.ObjectId,
+      ref: "Ustad",
+      default: null,
+      index: true,
+    },
+    /** Optional link to RM issue voucher (Ustad Job). */
+    ustad_job_id: {
+      type: Schema.Types.ObjectId,
+      ref: "UstadJob",
+      default: null,
+      index: true,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   { timestamps: true },

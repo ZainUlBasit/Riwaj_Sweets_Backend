@@ -11,6 +11,7 @@ router.get("/inventory", verifyShopToken, controller.inventory);
 router.get("/sync/catalog", verifyShopToken, controller.syncCatalog);
 router.get("/sales/today", verifyShopToken, controller.todaySales);
 router.post("/scan-product-barcode", verifyShopToken, controller.scanProductBarcode);
+router.post("/receive-transfer", verifyShopToken, controller.receiveTransfer);
 router.post("/cash-sale", verifyShopToken, controller.cashBarcodeSale);
 router.post("/pos/sale", verifyShopToken, controller.posSale);
 

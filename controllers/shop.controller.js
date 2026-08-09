@@ -6,6 +6,8 @@ const Order = require("../Models/Order");
 const Product = require("../Models/Products");
 const DispatchLocation = require("../Models/DispatchLocation");
 const LocationInventory = require("../Models/LocationInventory");
+const ProductTransfer = require("../Models/ProductTransfer");
+const { TRANSFER_STATUS } = require("../Models/ProductTransfer");
 const { createFromOrder } = require("./sale-invoice.controller");
 const { resolveProductBarcodeItem } = require("./order.controller");
 const { createError, successMessage } = require("../utils/ResponseMessage");
@@ -19,6 +21,7 @@ const {
   adjustLocationInventory,
   getLocationInventoryQty,
   adjustProduct,
+  getInventoryTypeForLocation,
   withTransaction,
 } = require("../Services/inventoryService");
 
@@ -920,6 +923,145 @@ const posSale = async (req, res) => {
   }
 };
 
+/**
+ * POST /api/shop/receive-transfer
+ * Scan Product Store → Shop transfer barcode (PT-…).
+ * Credits this shop's inventory for pending lines on that shipment.
+ */
+const receiveTransfer = async (req, res) => {
+  try {
+    const shop = req.shop;
+    const code = String(
+      req.body?.barcode || req.body?.transfer_code || req.body?.code || "",
+    )
+      .trim()
+      .toUpperCase();
+
+    if (!code) {
+      return createError(res, 400, "Transfer barcode is required.");
+    }
+    if (!shop?.location_id) {
+      return createError(res, 400, "Shop has no linked location.");
+    }
+
+    const pending = await ProductTransfer.find({
+      transfer_code: code,
+      to_location_id: shop.location_id,
+      status: TRANSFER_STATUS.PENDING,
+      isDeleted: false,
+    }).populate("product_id", "name id unit price");
+
+    if (!pending.length) {
+      const any = await ProductTransfer.findOne({
+        transfer_code: code,
+        isDeleted: false,
+      });
+      if (!any) {
+        return createError(res, 404, `Transfer barcode not found: ${code}`);
+      }
+      if (String(any.to_location_id) !== String(shop.location_id)) {
+        return createError(
+          res,
+          403,
+          "Yeh transfer kisi aur shop ke liye hai.",
+        );
+      }
+      if (Number(any.status) === TRANSFER_STATUS.RECEIVED) {
+        return createError(res, 409, "Yeh transfer pehle hi receive ho chuka hai.");
+      }
+      return createError(res, 404, "Is barcode pe koi pending stock nahi.");
+    }
+
+    const toLoc = await DispatchLocation.findById(shop.location_id).where({
+      isDeleted: false,
+    });
+    if (!toLoc) return createError(res, 404, "Shop location not found.");
+
+    const toInvType = getInventoryTypeForLocation(LOCATION_TYPE.SHOP);
+    const now = new Date();
+
+    const receivedItems = await withTransaction(async (session) => {
+      const out = [];
+      for (const row of pending) {
+        const qty = Number(row.quantity || 0);
+        const productId = row.product_id?._id || row.product_id;
+        const prevQty = await getLocationInventoryQty(
+          shop.location_id,
+          productId,
+          toInvType,
+          session,
+        );
+
+        await adjustLocationInventory(
+          shop.location_id,
+          productId,
+          qty,
+          toInvType,
+          session,
+        );
+
+        await writeLedger(
+          {
+            transactionType: TX.SHOP_TRANSFER,
+            direction: DIR.IN,
+            productId,
+            quantity: qty,
+            locationId: shop.location_id,
+            storeId: toLoc.store_id,
+            referenceType: "ProductTransfer",
+            referenceId: row._id,
+            userId: null,
+            notes: `Shop receive [${code}] · ${shop.name}`,
+            previousBalance: prevQty,
+            newBalance: prevQty + qty,
+          },
+          session,
+        );
+
+        await ProductTransfer.updateOne(
+          { _id: row._id },
+          {
+            $set: {
+              status: TRANSFER_STATUS.RECEIVED,
+              received_at: now,
+              received_by_shop_id: shop._id,
+            },
+          },
+          { session },
+        );
+
+        out.push({
+          transfer_id: row._id,
+          product_id: productId,
+          product_code: row.product_id?.id ?? null,
+          name: row.product_id?.name || "Product",
+          unit: row.product_id?.unit ?? null,
+          quantity: qty,
+          available_qty: prevQty + qty,
+        });
+      }
+      return out;
+    });
+
+    return successMessage(
+      res,
+      {
+        transfer_code: code,
+        received_count: receivedItems.length,
+        items: receivedItems,
+      },
+      `${receivedItems.length} item(s) shop stock me add ho gaye.`,
+    );
+  } catch (err) {
+    console.error("Shop receiveTransfer error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to receive transfer.",
+    );
+  }
+};
+
 module.exports = {
   list,
   getOne,
@@ -934,4 +1076,5 @@ module.exports = {
   scanProductBarcode,
   cashBarcodeSale,
   posSale,
+  receiveTransfer,
 };

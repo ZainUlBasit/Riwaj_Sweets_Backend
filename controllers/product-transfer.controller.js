@@ -1,11 +1,12 @@
+const crypto = require("crypto");
 const ProductTransfer = require("../Models/ProductTransfer");
+const { TRANSFER_STATUS } = require("../Models/ProductTransfer");
 const Product = require("../Models/Products");
 const DispatchLocation = require("../Models/DispatchLocation");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const {
   TX,
   DIR,
-  INV_TYPE,
   LOCATION_TYPE,
   getUserId,
   writeAudit,
@@ -15,7 +16,10 @@ const {
   getInventoryTypeForLocation,
   withTransaction,
 } = require("../Services/inventoryService");
-const { assertRmManagerStoreAccess, applyStoreLocationFilter } = require("../utils/storeScope");
+const {
+  assertRmManagerStoreAccess,
+  applyStoreLocationFilter,
+} = require("../utils/storeScope");
 
 const populateRefs = (q) =>
   q
@@ -24,24 +28,46 @@ const populateRefs = (q) =>
     .populate("to_location_id")
     .populate("created_by", "name email");
 
+const generateTransferCode = () => {
+  const rand = crypto.randomBytes(4).toString("hex").toUpperCase();
+  return `PT-${rand}`;
+};
+
 const list = async (req, res) => {
   try {
     const filter = { isDeleted: false };
     if (req.query.start_date || req.query.end_date) {
       filter.transfer_date = {};
-      if (req.query.start_date) filter.transfer_date.$gte = new Date(req.query.start_date);
-      if (req.query.end_date) filter.transfer_date.$lte = new Date(req.query.end_date);
+      if (req.query.start_date)
+        filter.transfer_date.$gte = new Date(req.query.start_date);
+      if (req.query.end_date)
+        filter.transfer_date.$lte = new Date(req.query.end_date);
     }
     if (req.query.product_id) filter.product_id = req.query.product_id;
     if (req.query.to_location_id) filter.to_location_id = req.query.to_location_id;
+    if (req.query.status != null && req.query.status !== "") {
+      filter.status = Number(req.query.status);
+    }
+    if (req.query.transfer_code) {
+      filter.transfer_code = String(req.query.transfer_code).trim().toUpperCase();
+    }
 
-    const scopedFilter = await applyStoreLocationFilter(req, filter, "from_location_id");
+    const scopedFilter = await applyStoreLocationFilter(
+      req,
+      filter,
+      "from_location_id",
+    );
 
     const items = await populateRefs(
-      ProductTransfer.find(scopedFilter).sort({ transfer_date: -1, createdAt: -1 }),
+      ProductTransfer.find(scopedFilter).sort({
+        transfer_date: -1,
+        createdAt: -1,
+      }),
     );
     const deletedItems = await populateRefs(
-      ProductTransfer.find({ ...scopedFilter, isDeleted: true }).sort({ transfer_date: -1 }),
+      ProductTransfer.find({ ...scopedFilter, isDeleted: true }).sort({
+        transfer_date: -1,
+      }),
     );
 
     return successMessage(
@@ -68,6 +94,12 @@ const getOne = async (req, res) => {
   }
 };
 
+/**
+ * Create transfer batch:
+ * - Debit Product Store only (stock in transit)
+ * - Do NOT credit shop yet
+ * - Return shared transfer_code barcode for shop receive
+ */
 const create = async (req, res) => {
   try {
     const body = req.body || {};
@@ -75,8 +107,6 @@ const create = async (req, res) => {
     const notes = body.notes ?? "";
     const from_location_id = body.from_location_id;
 
-    // Batch: { from_location_id, transfer_date, notes, lines: [{ to_location_id, product_id, quantity }] }
-    // Single (legacy): { from_location_id, to_location_id, product_id, quantity, ... }
     let lines = Array.isArray(body.lines) ? body.lines : null;
     if (!lines) {
       if (body.to_location_id && body.product_id) {
@@ -107,7 +137,9 @@ const create = async (req, res) => {
     });
     if (!fromLoc) return createError(res, 404, "From location not found.");
 
-    const fromType = Number(fromLoc.location_type || LOCATION_TYPE.PRODUCTION_AREA);
+    const fromType = Number(
+      fromLoc.location_type || LOCATION_TYPE.PRODUCTION_AREA,
+    );
     if (fromType !== LOCATION_TYPE.FINISHED_GOODS_STORE) {
       return createError(
         res,
@@ -146,17 +178,15 @@ const create = async (req, res) => {
       });
     }
 
-    // Aggregate qty needed per product from Product Store
     const neededByProduct = new Map();
     for (const row of normalized) {
       const key = String(row.product_id);
-      neededByProduct.set(
-        key,
-        (neededByProduct.get(key) || 0) + row.quantity,
-      );
+      neededByProduct.set(key, (neededByProduct.get(key) || 0) + row.quantity);
     }
 
-    const shopIds = [...new Set(normalized.map((r) => String(r.to_location_id)))];
+    const shopIds = [
+      ...new Set(normalized.map((r) => String(r.to_location_id))),
+    ];
     const productIds = [...neededByProduct.keys()];
 
     const [shops, products] = await Promise.all([
@@ -183,13 +213,9 @@ const create = async (req, res) => {
       }
     }
 
-    await assertRmManagerStoreAccess(req, [
-      from_location_id,
-      ...shopIds,
-    ]);
+    await assertRmManagerStoreAccess(req, [from_location_id, ...shopIds]);
 
     const fromInvType = getInventoryTypeForLocation(fromType);
-    const toInvType = getInventoryTypeForLocation(LOCATION_TYPE.SHOP);
 
     for (const [productId, needQty] of neededByProduct.entries()) {
       const available = await getLocationInventoryQty(
@@ -208,12 +234,12 @@ const create = async (req, res) => {
     }
 
     const userId = getUserId(req);
+    const transfer_code = generateTransferCode();
 
     const createdIds = await withTransaction(async (session) => {
       const ids = [];
-      // Track remaining availability as we deduct across lines
       const remaining = new Map();
-      for (const [productId, needQty] of neededByProduct.entries()) {
+      for (const [productId] of neededByProduct.entries()) {
         const available = await getLocationInventoryQty(
           from_location_id,
           productId,
@@ -229,18 +255,12 @@ const create = async (req, res) => {
         const qty = row.quantity;
         const prevFrom = remaining.get(String(productId)) ?? 0;
 
+        // Only leave Product Store — shop credit happens on barcode receive
         await adjustLocationInventory(
           from_location_id,
           productId,
           -qty,
           fromInvType,
-          session,
-        );
-        await adjustLocationInventory(
-          row.to_location_id,
-          productId,
-          qty,
-          toInvType,
           session,
         );
         remaining.set(String(productId), prevFrom - qty);
@@ -254,6 +274,8 @@ const create = async (req, res) => {
               quantity: qty,
               transfer_date: new Date(transfer_date),
               notes: notes ?? "",
+              transfer_code,
+              status: TRANSFER_STATUS.PENDING,
               created_by: userId,
               isDeleted: false,
             },
@@ -272,33 +294,9 @@ const create = async (req, res) => {
             referenceType: "ProductTransfer",
             referenceId: item._id,
             userId,
-            notes: `Transfer out → ${toLoc.name}`,
+            notes: `Transfer out (in transit) → ${toLoc.name} [${transfer_code}]`,
             previousBalance: prevFrom,
             newBalance: prevFrom - qty,
-          },
-          session,
-        );
-
-        const toPrev = await getLocationInventoryQty(
-          row.to_location_id,
-          productId,
-          toInvType,
-          session,
-        );
-        await writeLedger(
-          {
-            transactionType: TX.SHOP_TRANSFER,
-            direction: DIR.IN,
-            productId,
-            quantity: qty,
-            locationId: row.to_location_id,
-            storeId: toLoc.store_id,
-            referenceType: "ProductTransfer",
-            referenceId: item._id,
-            userId,
-            notes: `Transfer in ← ${fromLoc.name}`,
-            previousBalance: toPrev - qty,
-            newBalance: toPrev,
           },
           session,
         );
@@ -326,17 +324,28 @@ const create = async (req, res) => {
       {
         items: populatedResult,
         count: createdIds.length,
+        transfer_code,
+        status: TRANSFER_STATUS.PENDING,
       },
       createdIds.length > 1
-        ? `${createdIds.length} shop transfers recorded successfully.`
-        : "Product transfer recorded successfully.",
+        ? `${createdIds.length} lines dispatched. Shop barcode: ${transfer_code}`
+        : `Transfer dispatched. Shop barcode: ${transfer_code}`,
     );
   } catch (err) {
     console.error("ProductTransfer create error:", err);
-    return createError(res, err.status || 500, err.message || "Failed to create transfer.");
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to create transfer.",
+    );
   }
 };
 
+/**
+ * Reverse a transfer.
+ * - Pending: return qty to Product Store only
+ * - Received: reverse shop + Product Store
+ */
 const remove = async (req, res) => {
   try {
     const existing = await ProductTransfer.findById(req.params.id).where({
@@ -350,20 +359,27 @@ const remove = async (req, res) => {
       DispatchLocation.findById(existing.to_location_id),
     ]);
 
-    const fromType = Number(fromLoc?.location_type || LOCATION_TYPE.PRODUCTION_AREA);
+    const fromType = Number(
+      fromLoc?.location_type || LOCATION_TYPE.PRODUCTION_AREA,
+    );
     const toType = Number(toLoc?.location_type || LOCATION_TYPE.PRODUCTION_AREA);
     const fromInvType = getInventoryTypeForLocation(fromType);
     const toInvType = getInventoryTypeForLocation(toType);
+    const status = Number(existing.status || TRANSFER_STATUS.RECEIVED);
 
     const item = await withTransaction(async (session) => {
       const qty = Number(existing.quantity || 0);
-      await adjustLocationInventory(
-        existing.to_location_id,
-        existing.product_id,
-        -qty,
-        toInvType,
-        session,
-      );
+
+      if (status === TRANSFER_STATUS.RECEIVED) {
+        await adjustLocationInventory(
+          existing.to_location_id,
+          existing.product_id,
+          -qty,
+          toInvType,
+          session,
+        );
+      }
+
       await adjustLocationInventory(
         existing.from_location_id,
         existing.product_id,
@@ -374,7 +390,7 @@ const remove = async (req, res) => {
 
       const deleted = await ProductTransfer.findOneAndUpdate(
         { _id: req.params.id, isDeleted: false },
-        { isDeleted: true },
+        { isDeleted: true, status: TRANSFER_STATUS.CANCELLED },
         { new: true, session },
       );
 
@@ -393,8 +409,19 @@ const remove = async (req, res) => {
     return successMessage(res, item, "Transfer reversed successfully.");
   } catch (err) {
     console.error("ProductTransfer remove error:", err);
-    return createError(res, err.status || 500, err.message || "Failed to reverse transfer.");
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to reverse transfer.",
+    );
   }
 };
 
-module.exports = { list, getOne, create, remove };
+module.exports = {
+  list,
+  getOne,
+  create,
+  remove,
+  TRANSFER_STATUS,
+  generateTransferCode,
+};

@@ -29,6 +29,28 @@ const ProductStoreReceiptSchema = new Schema(
     quantity: { type: Number, required: true, min: 0.001 },
     receipt_date: { type: Date, required: true, index: true },
     notes: { type: String, default: "" },
+    /** Printable batch barcode for Product Store label (PSR-…). */
+    receipt_code: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      default: null,
+      index: true,
+    },
+    /** Ustad / karegar who prepared this batch. */
+    ustad_name: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    /** Registered Ustad master reference. */
+    ustad_id: {
+      type: Schema.Types.ObjectId,
+      ref: "Ustad",
+      default: null,
+      index: true,
+    },
     /** Optional link when auto-created from cake production. */
     cake_production_id: {
       type: Schema.Types.ObjectId,
@@ -45,5 +67,7 @@ const ProductStoreReceiptSchema = new Schema(
   },
   { timestamps: true },
 );
+
+ProductStoreReceiptSchema.index({ receipt_code: 1, isDeleted: 1 });
 
 module.exports = mongoose.model("ProductStoreReceipt", ProductStoreReceiptSchema);

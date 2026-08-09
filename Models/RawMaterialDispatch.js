@@ -67,6 +67,13 @@ const RawMaterialDispatchSchema = new Schema(
       type: String,
       default: "",
     },
+    /** Optional link when created from an Ustad Job issue. */
+    ustad_job_id: {
+      type: Schema.Types.ObjectId,
+      ref: "UstadJob",
+      default: null,
+      index: true,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   { timestamps: true },

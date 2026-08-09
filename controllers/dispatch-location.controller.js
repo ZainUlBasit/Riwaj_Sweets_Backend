@@ -9,9 +9,9 @@ const LOCATION_TYPE = {
   FINISHED_GOODS_STORE: 4,
 };
 
-// Product Store is unique per godown. RM Store is unique for the WHOLE system
-// (one central raw-material store; production areas can be many).
-const PER_GODOWN_SINGLETON_TYPES = [LOCATION_TYPE.FINISHED_GOODS_STORE];
+// RM Store is still unique system-wide. Multiple Product Stores (FG) and
+// Shops are allowed so godowns can expand (Store 1, Store 2, Shop 1…).
+const PER_GODOWN_SINGLETON_TYPES = [];
 
 const getSingletonLabel = (type) => {
   if (type === LOCATION_TYPE.RAW_MATERIAL_STORE) return "Raw Material Store";
@@ -294,7 +294,41 @@ async function getOrCreateLocation(name) {
   }
 }
 
+async function ensureDefaultStockLocations() {
+  const defaults = [
+    { name: "Store 1", location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
+    { name: "Store 2", location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
+    { name: "Shop 1", location_type: LOCATION_TYPE.SHOP },
+    { name: "Shop 2", location_type: LOCATION_TYPE.SHOP },
+  ];
+
+  for (const row of defaults) {
+    const existing = await findByName(row.name);
+    if (existing) {
+      // Keep name; upgrade type if legacy blank/wrong
+      if (Number(existing.location_type) !== Number(row.location_type)) {
+        existing.location_type = row.location_type;
+        await existing.save();
+      }
+      continue;
+    }
+    try {
+      await DispatchLocation.create({
+        name: row.name,
+        description: "",
+        store_id: null,
+        location_type: row.location_type,
+        isDeleted: false,
+      });
+    } catch (err) {
+      if (err.code !== 11000) throw err;
+    }
+  }
+}
+
 async function syncLegacyDispatchLocations() {
+  await ensureDefaultStockLocations();
+
   const RawMaterialDispatch = require("../Models/RawMaterialDispatch");
   const legacyNames = await RawMaterialDispatch.distinct("location", {
     isDeleted: false,
@@ -327,5 +361,6 @@ module.exports = {
   update,
   remove,
   getOrCreateLocation,
+  ensureDefaultStockLocations,
   findGlobalRmStore,
 };

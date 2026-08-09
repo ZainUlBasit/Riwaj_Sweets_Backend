@@ -2,6 +2,9 @@ const CakeProduction = require("../Models/CakeProduction");
 const Product = require("../Models/Products");
 const ProductStock = require("../Models/ProductStock");
 const DispatchLocation = require("../Models/DispatchLocation");
+const UstadJob = require("../Models/UstadJob");
+const { JOB_STATUS } = require("../Models/UstadJob");
+const Ustad = require("../Models/Ustad");
 const { getOrCreateLocation } = require("./dispatch-location.controller");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const {
@@ -17,11 +20,12 @@ const {
   reverseBomConsumption,
   reverseManualProductionConsumption,
   findFinishedGoodsStore,
+  findProductionArea,
   executeStoreReceipt,
   reverseStoreReceipt,
   withTransaction,
 } = require("../Services/inventoryService");
-const { assertRmManagerStoreAccess, applyStoreLocationFilter } = require("../utils/storeScope");
+const { assertRmManagerStoreAccess, applyStoreLocationFilter, getAssignedStoreId } = require("../utils/storeScope");
 
 const escapeRegex = (value = "") =>
   String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -33,7 +37,10 @@ const populateRefs = (q) =>
     .populate("location_id")
     .populate({
       path: "store_receipt_id",
-      populate: { path: "to_location_id", select: "name location_type" },
+      populate: [
+        { path: "to_location_id", select: "name location_type" },
+        { path: "product_id", select: "name id unit" },
+      ],
     })
     .populate({
       path: "raw_materials_consumed.raw_material_id",
@@ -42,7 +49,9 @@ const populateRefs = (q) =>
     .populate({
       path: "raw_material_stock_id",
       populate: { path: "raw_material_id" },
-    });
+    })
+    .populate("ustad_job_id", "job_code ustad_name rm_value_issued status")
+    .populate("ustad_id", "name phone");
 
 async function resolveProductionLocation({ location_id, location, required = false }) {
   if (location_id) {
@@ -160,6 +169,8 @@ async function applyProductionImpact({
   userId,
   referenceType,
   referenceId,
+  ustadName = "",
+  ustadId = null,
   session = null,
 }) {
   const opts = session ? { session } : {};
@@ -225,8 +236,12 @@ async function applyProductionImpact({
           userId,
           referenceType: "CakeProduction",
           referenceId,
-          notes: `Auto from ${productionLocation.name}`,
+          notes: `Auto from ${productionLocation.name}${
+            ustadName ? ` · Ustad: ${ustadName}` : ""
+          }`,
           cakeProductionId: referenceId,
+          ustadName,
+          ustadId,
           session,
         });
       } else {
@@ -276,6 +291,9 @@ const create = async (req, res) => {
       location_id,
       location,
       notes,
+      ustad_name,
+      ustad_id,
+      ustad_job_id,
     } = req.body || {};
 
     if (!production_date) {
@@ -283,6 +301,38 @@ const create = async (req, res) => {
     }
     if (!product_id) {
       return createError(res, 400, "product_id is required.");
+    }
+
+    let ustadName = String(ustad_name || "").trim();
+    let ustadDocId = null;
+    let linkedJob = null;
+    if (ustad_job_id) {
+      linkedJob = await UstadJob.findById(ustad_job_id).where({
+        isDeleted: false,
+      });
+      if (!linkedJob) {
+        return createError(res, 404, "Ustad job not found.");
+      }
+      if (Number(linkedJob.status) === JOB_STATUS.CLOSED) {
+        return createError(res, 400, "Yeh ustad job band ho chuki hai.");
+      }
+      if (!ustadName) ustadName = linkedJob.ustad_name;
+      if (!ustad_id && linkedJob.ustad_id) ustadDocId = linkedJob.ustad_id;
+    }
+    if (ustad_id || ustadDocId) {
+      const u = await Ustad.findById(ustad_id || ustadDocId).where({
+        isDeleted: false,
+      });
+      if (!u) return createError(res, 404, "Registered ustad not found.");
+      ustadName = u.name;
+      ustadDocId = u._id;
+    }
+    if (!ustadName) {
+      return createError(
+        res,
+        400,
+        "Registered ustad select karein (kis ne tayar kiya).",
+      );
     }
     const cakes = Number(cakes_produced ?? 0);
     if (!Number.isFinite(cakes) || cakes < 0) {
@@ -300,13 +350,53 @@ const create = async (req, res) => {
 
     let productionLocation = null;
     try {
-      productionLocation = await resolveProductionLocation({
-        location_id,
-        location,
-        required: cakes > 0,
-      });
+      const effectiveLocationId =
+        location_id || (linkedJob ? linkedJob.location_id : null);
+      if (effectiveLocationId) {
+        productionLocation = await resolveProductionLocation({
+          location_id: effectiveLocationId,
+          location,
+          required: false,
+        });
+      }
+      if (!productionLocation && cakes > 0) {
+        // Prefer store from linked job's production location
+        let storeId = getAssignedStoreId(req);
+        if (linkedJob?.location_id) {
+          const jobLoc = await DispatchLocation.findById(linkedJob.location_id);
+          storeId = jobLoc?.store_id || storeId;
+        }
+        productionLocation = await findProductionArea(storeId);
+        if (!productionLocation) {
+          productionLocation = await DispatchLocation.findOne({
+            location_type: 2,
+            isDeleted: false,
+          }).sort({ createdAt: 1 });
+        }
+      }
+      if (cakes > 0 && !productionLocation) {
+        return createError(
+          res,
+          400,
+          "Production area configure nahi hai. Stores & Locations me store setup karein.",
+        );
+      }
     } catch (err) {
       return createError(res, err.status || 400, err.message);
+    }
+
+    // Job location check only when both exist and were explicitly mismatched via job
+    if (
+      linkedJob &&
+      productionLocation?._id &&
+      linkedJob.location_id &&
+      String(linkedJob.location_id) !== String(productionLocation._id)
+    ) {
+      // Prefer job's production location for inventory consistency
+      const jobLoc = await DispatchLocation.findById(linkedJob.location_id).where({
+        isDeleted: false,
+      });
+      if (jobLoc) productionLocation = jobLoc;
     }
 
     if (productionLocation?._id) {
@@ -330,6 +420,9 @@ const create = async (req, res) => {
             location_id: productionLocation?._id ?? null,
             location: productionLocation?.name ?? "",
             notes: notes ?? "",
+            ustad_name: ustadName,
+            ustad_id: ustadDocId,
+            ustad_job_id: linkedJob?._id ?? null,
             isDeleted: false,
           },
         ],
@@ -344,6 +437,8 @@ const create = async (req, res) => {
         userId,
         referenceType: "CakeProduction",
         referenceId: created._id,
+        ustadName,
+        ustadId: ustadDocId,
         session,
       });
 
@@ -390,6 +485,9 @@ const update = async (req, res) => {
       location_id,
       location,
       notes,
+      ustad_name,
+      ustad_id,
+      ustad_job_id,
     } = req.body || {};
 
     const existing = await CakeProduction.findById(req.params.id);
@@ -410,6 +508,37 @@ const update = async (req, res) => {
         );
       }
       updatePayload.cakes_produced = cakes;
+    }
+    if (ustad_name !== undefined) {
+      const ustadName = String(ustad_name || "").trim();
+      if (!ustadName) {
+        return createError(res, 400, "Ustad name is required (kis ne tayar kiya).");
+      }
+      updatePayload.ustad_name = ustadName;
+    }
+    if (ustad_id !== undefined) {
+      if (!ustad_id) {
+        updatePayload.ustad_id = null;
+      } else {
+        const u = await Ustad.findById(ustad_id).where({ isDeleted: false });
+        if (!u) return createError(res, 404, "Registered ustad not found.");
+        updatePayload.ustad_id = u._id;
+        updatePayload.ustad_name = u.name;
+      }
+    }
+    if (ustad_job_id !== undefined) {
+      if (!ustad_job_id) {
+        updatePayload.ustad_job_id = null;
+      } else {
+        const linkedJob = await UstadJob.findById(ustad_job_id).where({
+          isDeleted: false,
+        });
+        if (!linkedJob) return createError(res, 404, "Ustad job not found.");
+        updatePayload.ustad_job_id = linkedJob._id;
+        if (ustad_name === undefined) {
+          updatePayload.ustad_name = linkedJob.ustad_name;
+        }
+      }
     }
     if (product_id !== undefined) {
       const product = await Product.findById(product_id).where({
@@ -497,6 +626,8 @@ const update = async (req, res) => {
         userId,
         referenceType: "CakeProduction",
         referenceId: updated._id,
+        ustadName: updatePayload.ustad_name ?? existing.ustad_name ?? "",
+        ustadId: updatePayload.ustad_id ?? existing.ustad_id ?? null,
         session,
       });
 
