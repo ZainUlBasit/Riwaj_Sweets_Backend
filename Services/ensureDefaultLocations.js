@@ -50,14 +50,40 @@ async function ensureNamedLocation(mainId, { name, location_type, description })
 }
 
 /**
- * Simple masters defaults (shown on /stores):
- * - RM Store 1 / RM Store 2
- * - Product Store 1 / Product Store 2
- * - Shop 1 / Shop 2
- * - Hidden Main godown + Production (for inventory)
+ * Legacy "Shop 1/2" → "Store 1/2" (same location_type = 3).
+ * Keeps inventory links; only renames the master label.
+ */
+async function renameLegacyShopsToStores() {
+  for (const n of [1, 2]) {
+    const shop = await DispatchLocation.findOne({
+      name: new RegExp(`^Shop\\s*${n}$`, "i"),
+      location_type: LOCATION_TYPE.SHOP,
+      isDeleted: false,
+    });
+    if (!shop) continue;
+
+    const storeName = `Store ${n}`;
+    const conflict = await findByExactName(storeName);
+    if (conflict && String(conflict._id) !== String(shop._id)) {
+      // Store N already exists — hide the old Shop N name from masters.
+      shop.isDeleted = true;
+      await shop.save();
+      continue;
+    }
+
+    shop.name = storeName;
+    shop.description = shop.description || "Sale / outlet store";
+    await shop.save();
+  }
+}
+
+/**
+ * Simple masters only (shown on /stores):
+ *   RM Store 1 / RM Store 2
+ *   Product Store 1 / Product Store 2
+ *   Store 1 / Store 2
  *
- * Do NOT auto soft-delete Product Stores — that hid them from RM Managers
- * on every /dispatch-location list call.
+ * Production + internal Main godown stay auto/hidden for inventory ops.
  */
 async function ensureDefaultLocations() {
   let main = await Store.findOne({
@@ -72,8 +98,8 @@ async function ensureDefaultLocations() {
     });
   }
 
-  // Production stays auto/hidden for manufacturing flows
-  let production = await DispatchLocation.findOne({
+  // Production stays auto/hidden — not on /stores masters UI
+  const production = await DispatchLocation.findOne({
     store_id: main._id,
     location_type: LOCATION_TYPE.PRODUCTION_AREA,
     isDeleted: false,
@@ -99,6 +125,8 @@ async function ensureDefaultLocations() {
     }
   }
 
+  await renameLegacyShopsToStores();
+
   const defaults = [
     {
       name: "RM Store 1",
@@ -121,31 +149,19 @@ async function ensureDefaultLocations() {
       description: "Finished goods store",
     },
     {
-      name: "Shop 1",
+      name: "Store 1",
       location_type: LOCATION_TYPE.SHOP,
-      description: "Retail shop",
+      description: "Sale / outlet store",
     },
     {
-      name: "Shop 2",
+      name: "Store 2",
       location_type: LOCATION_TYPE.SHOP,
-      description: "Retail shop",
+      description: "Sale / outlet store",
     },
   ];
 
   for (const d of defaults) {
     await ensureNamedLocation(main._id, d);
-  }
-
-  // Legacy singular "Product Store" (older seed) — restore if soft-deleted so
-  // existing inventory links keep working, then keep it visible on /stores.
-  const legacyPs = await DispatchLocation.findOne({
-    name: /^Product Store$/i,
-    location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
-  });
-  if (legacyPs && legacyPs.isDeleted) {
-    legacyPs.isDeleted = false;
-    if (!legacyPs.store_id) legacyPs.store_id = main._id;
-    await legacyPs.save();
   }
 }
 
