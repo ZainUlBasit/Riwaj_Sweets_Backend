@@ -143,45 +143,83 @@ const parseRecipeExpenses = (raw) => {
   return out;
 };
 
-/** Aggregates per-product qty totals + per-location breakdown from LocationInventory. */
+/** Aggregates stock per product × location (stores + shops). */
 async function buildLocationStockMaps() {
-  const rows = await LocationInventory.aggregate([
-    { $match: { isDeleted: false, quantity: { $gt: 0 } } },
-    {
-      $lookup: {
-        from: "dispatchlocations",
-        localField: "location_id",
-        foreignField: "_id",
-        as: "location",
+  const [locations, rows] = await Promise.all([
+    DispatchLocation.find({
+      isDeleted: false,
+      location_type: {
+        $in: [LOCATION_TYPE.FINISHED_GOODS_STORE, LOCATION_TYPE.SHOP],
       },
-    },
-    { $unwind: { path: "$location", preserveNullAndEmptyArrays: false } },
-    { $match: { "location.isDeleted": false } },
-    {
-      $group: {
-        _id: {
-          product_id: "$product_id",
-          location_id: "$location_id",
-          location_type: "$location.location_type",
+    })
+      .populate("store_id", "name")
+      .select("_id name location_type store_id")
+      .sort({ location_type: 1, name: 1 })
+      .lean(),
+    LocationInventory.aggregate([
+      { $match: { isDeleted: false } },
+      {
+        $lookup: {
+          from: "dispatchlocations",
+          localField: "location_id",
+          foreignField: "_id",
+          as: "location",
         },
-        totalQty: { $sum: "$quantity" },
       },
-    },
+      { $unwind: { path: "$location", preserveNullAndEmptyArrays: false } },
+      {
+        $match: {
+          "location.isDeleted": false,
+          "location.location_type": {
+            $in: [
+              LOCATION_TYPE.FINISHED_GOODS_STORE,
+              LOCATION_TYPE.SHOP,
+            ],
+          },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            product_id: "$product_id",
+            location_id: "$location_id",
+            location_type: "$location.location_type",
+          },
+          totalQty: { $sum: "$quantity" },
+        },
+      },
+    ]),
   ]);
+
+  const location_columns = locations.map((loc) => {
+    const isShop = Number(loc.location_type) === LOCATION_TYPE.SHOP;
+    const storeName =
+      loc.store_id && typeof loc.store_id === "object"
+        ? loc.store_id.name
+        : null;
+    // Prefer godown name for FG columns ("Store 1") so titles stay short.
+    const displayName =
+      !isShop && storeName ? storeName : loc.name;
+    return {
+      _id: String(loc._id),
+      name: displayName,
+      location_type: Number(loc.location_type),
+      kind: isShop ? "shop" : "store",
+    };
+  });
 
   const mainStore = new Map();
   const shop = new Map();
-  /** Map productId -> { [locationId]: qty } */
-  const byLocation = new Map();
+  /** productId -> { locationId: qty } */
+  const byProduct = new Map();
 
   for (const row of rows) {
     const pid = String(row._id.product_id);
     const lid = String(row._id.location_id);
     const locType = Number(row._id.location_type);
     const qty = Number(row.totalQty || 0);
-
-    if (!byLocation.has(pid)) byLocation.set(pid, {});
-    byLocation.get(pid)[lid] = (byLocation.get(pid)[lid] || 0) + qty;
+    if (!byProduct.has(pid)) byProduct.set(pid, {});
+    byProduct.get(pid)[lid] = (byProduct.get(pid)[lid] || 0) + qty;
 
     if (locType === LOCATION_TYPE.FINISHED_GOODS_STORE) {
       mainStore.set(pid, (mainStore.get(pid) || 0) + qty);
@@ -189,57 +227,151 @@ async function buildLocationStockMaps() {
       shop.set(pid, (shop.get(pid) || 0) + qty);
     }
   }
-  return { mainStore, shop, byLocation };
+
+  return { mainStore, shop, byProduct, location_columns };
 }
 
-const attachLocationStock = (product, mainStore, shop, byLocation) => {
+const attachLocationStock = (product, mainStore, shop, byProduct) => {
   const doc = product.toObject ? product.toObject() : { ...product };
   const pid = String(doc._id);
   doc.main_store_quantity = mainStore.get(pid) || 0;
   doc.shop_quantity = shop.get(pid) || 0;
-  doc.location_quantities = byLocation.get(pid) || {};
+  doc.location_quantities = byProduct.get(pid) || {};
   return doc;
 };
 
-const list = async (req, res) => {
-  try {
-    // Ensure Store 1/2 + Shop 1/2 exist (idempotent)
-    const defaults = [
-      { name: "Store 1", location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
-      { name: "Store 2", location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
-      { name: "Shop 1", location_type: LOCATION_TYPE.SHOP },
-      { name: "Shop 2", location_type: LOCATION_TYPE.SHOP },
-    ];
-    for (const row of defaults) {
-      const existing = await DispatchLocation.findOne({
-        name: new RegExp(`^${row.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+/**
+ * Ensure Store 1 / Store 2 (godown + FG location) and Shop 1 / Shop 2 exist.
+ * Safe to call repeatedly — skips existing names.
+ */
+async function ensureDefaultStoresAndShops() {
+  const Store = require("../Models/Store");
+  const pairs = [
+    { storeName: "Store 1", shopName: "Shop 1" },
+    { storeName: "Store 2", shopName: "Shop 2" },
+  ];
+
+  for (const { storeName, shopName } of pairs) {
+    let store = await Store.findOne({
+      name: new RegExp(`^${storeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+      isDeleted: false,
+    });
+    if (!store) {
+      store = await Store.create({
+        name: storeName,
+        description: "Auto-created product/outlet store",
         isDeleted: false,
       });
-      if (existing) {
-        if (Number(existing.location_type) !== Number(row.location_type)) {
-          existing.location_type = row.location_type;
-          await existing.save();
+    }
+
+    let fg = await DispatchLocation.findOne({
+      store_id: store._id,
+      location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+      isDeleted: false,
+    });
+    if (!fg) {
+      const nameTaken = await DispatchLocation.findOne({
+        name: new RegExp(
+          `^${storeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+          "i",
+        ),
+        isDeleted: false,
+      });
+      if (
+        nameTaken &&
+        Number(nameTaken.location_type) === LOCATION_TYPE.FINISHED_GOODS_STORE
+      ) {
+        fg = nameTaken;
+        if (!fg.store_id || String(fg.store_id) !== String(store._id)) {
+          fg.store_id = store._id;
+          await fg.save();
         }
-        continue;
-      }
-      try {
-        await DispatchLocation.create({
-          name: row.name,
-          description: "",
-          store_id: null,
-          location_type: row.location_type,
+      } else if (!nameTaken) {
+        fg = await DispatchLocation.create({
+          name: storeName,
+          description: "Finished goods store",
+          store_id: store._id,
+          location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
           isDeleted: false,
         });
-      } catch (err) {
-        if (err.code !== 11000) throw err;
+      } else {
+        const altName = `${storeName} — Product Store`;
+        const alt = await DispatchLocation.findOne({
+          name: new RegExp(
+            `^${altName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+            "i",
+          ),
+          isDeleted: false,
+        });
+        if (!alt) {
+          fg = await DispatchLocation.create({
+            name: altName,
+            description: "Finished goods store",
+            store_id: store._id,
+            location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+            isDeleted: false,
+          });
+        }
       }
     }
 
+    const production = await DispatchLocation.findOne({
+      store_id: store._id,
+      location_type: LOCATION_TYPE.PRODUCTION_AREA,
+      isDeleted: false,
+    });
+    if (!production) {
+      const prodName = `${storeName} — Production`;
+      const prodTaken = await DispatchLocation.findOne({
+        name: new RegExp(
+          `^${prodName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+          "i",
+        ),
+        isDeleted: false,
+      });
+      if (!prodTaken) {
+        await DispatchLocation.create({
+          name: prodName,
+          description: "Production area",
+          store_id: store._id,
+          location_type: LOCATION_TYPE.PRODUCTION_AREA,
+          isDeleted: false,
+        });
+      }
+    }
+
+    let shopLoc = await DispatchLocation.findOne({
+      name: new RegExp(
+        `^${shopName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+        "i",
+      ),
+      isDeleted: false,
+    });
+    if (!shopLoc) {
+      shopLoc = await DispatchLocation.create({
+        name: shopName,
+        description: "Retail shop outlet",
+        store_id: store._id,
+        location_type: LOCATION_TYPE.SHOP,
+        isDeleted: false,
+      });
+    } else if (Number(shopLoc.location_type) !== LOCATION_TYPE.SHOP) {
+      // name exists as non-shop — leave it; do not overwrite
+    } else if (!shopLoc.store_id) {
+      shopLoc.store_id = store._id;
+      await shopLoc.save();
+    }
+  }
+}
+
+const list = async (req, res) => {
+  try {
+    await ensureDefaultStoresAndShops();
+
     const [
-      { mainStore, shop, byLocation },
+      { mainStore, shop, byProduct, location_columns },
       rawItems,
       rawDeleted,
-      stockLocations,
     ] = await Promise.all([
       buildLocationStockMaps(),
       Product.find({ isDeleted: false })
@@ -252,22 +384,13 @@ const list = async (req, res) => {
         .populate("counter_id")
         .populate("bom.rawMaterialId")
         .sort({ createdAt: -1 }),
-      DispatchLocation.find({
-        isDeleted: false,
-        location_type: {
-          $in: [LOCATION_TYPE.FINISHED_GOODS_STORE, LOCATION_TYPE.SHOP],
-        },
-      })
-        .select("_id name location_type store_id")
-        .sort({ location_type: 1, name: 1 })
-        .lean(),
     ]);
 
     const items = rawItems.map((p) =>
-      attachLocationStock(p, mainStore, shop, byLocation),
+      attachLocationStock(p, mainStore, shop, byProduct),
     );
     const deletedItems = rawDeleted.map((p) =>
-      attachLocationStock(p, mainStore, shop, byLocation),
+      attachLocationStock(p, mainStore, shop, byProduct),
     );
 
     return successMessage(
@@ -277,7 +400,7 @@ const list = async (req, res) => {
         deletedItems,
         products: items,
         deletedProducts: deletedItems,
-        stock_locations: stockLocations,
+        location_columns,
       },
       "Products fetched successfully.",
     );
