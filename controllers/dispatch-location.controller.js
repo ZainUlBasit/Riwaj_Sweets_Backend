@@ -52,25 +52,57 @@ const findByName = (name) =>
     isDeleted: false,
   });
 
+/**
+ * RM Manager store scope for /stores masters.
+ * Include:
+ *  - locations on their assigned godown
+ *  - unscoped legacy rows (store_id null) for RM / Product Store / Shop
+ *  - system-wide RM Stores (type 1)
+ *
+ * Product Stores used to vanish for managers when store_id was null, or when
+ * ensureDefaultLocations soft-deleted the only Product Store rows.
+ */
+const buildListFilter = (req, { deleted }) => {
+  const filter = { isDeleted: !!deleted };
+  const scopedStore =
+    getAssignedStoreId(req) ||
+    (req.query.store_id ? String(req.query.store_id) : null);
+
+  if (!scopedStore) return filter;
+
+  return {
+    ...filter,
+    $or: [
+      { store_id: scopedStore },
+      {
+        store_id: null,
+        location_type: {
+          $in: [
+            LOCATION_TYPE.RAW_MATERIAL_STORE,
+            LOCATION_TYPE.SHOP,
+            LOCATION_TYPE.FINISHED_GOODS_STORE,
+          ],
+        },
+      },
+      { location_type: LOCATION_TYPE.RAW_MATERIAL_STORE },
+      { location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
+    ],
+  };
+};
+
 const list = async (req, res) => {
   try {
     await syncLegacyDispatchLocations();
     await ensureDefaultLocations();
 
-    const filter = { isDeleted: false };
-    const scopedStore =
-      getAssignedStoreId(req) ||
-      (req.query.store_id ? String(req.query.store_id) : null);
-    if (scopedStore) filter.store_id = scopedStore;
-
-    const items = await DispatchLocation.find(filter)
+    const items = await DispatchLocation.find(buildListFilter(req, { deleted: false }))
       .populate("store_id", "name")
       .sort({
       name: 1,
     });
-    const deletedFilter = { isDeleted: true };
-    if (scopedStore) deletedFilter.store_id = scopedStore;
-    const deletedItems = await DispatchLocation.find(deletedFilter)
+    const deletedItems = await DispatchLocation.find(
+      buildListFilter(req, { deleted: true }),
+    )
       .populate("store_id", "name")
       .sort({
       name: 1,
@@ -128,11 +160,14 @@ const create = async (req, res) => {
     }
 
     const locType = location_type != null ? Number(location_type) : 2;
+    // RM Manager new masters always attach to their assigned godown.
+    const assignedStoreId = getAssignedStoreId(req);
+    const resolvedStoreId = assignedStoreId || store_id || null;
 
     if (locType === LOCATION_TYPE.RAW_MATERIAL_STORE) {
       // Multiple RM Stores allowed (RM Store 1, RM Store 2, …).
-    } else if (store_id) {
-      const duplicate = await assertSingletonLocation(store_id, locType);
+    } else if (resolvedStoreId) {
+      const duplicate = await assertSingletonLocation(resolvedStoreId, locType);
       if (duplicate) {
         return createError(
           res,
@@ -145,7 +180,7 @@ const create = async (req, res) => {
     const item = await DispatchLocation.create({
       name: normalized,
       description: description ?? "",
-      store_id: store_id || null,
+      store_id: resolvedStoreId,
       location_type: locType,
       isDeleted: false,
     });

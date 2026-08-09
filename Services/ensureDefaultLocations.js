@@ -11,12 +11,53 @@ const findByExactName = (name) =>
   });
 
 /**
- * Simple masters defaults:
+ * Ensure a named default location exists (active). Soft-deleted matches
+ * with the same type are restored instead of creating a duplicate.
+ */
+async function ensureNamedLocation(mainId, { name, location_type, description }) {
+  const nameRe = new RegExp(`^${escapeRe(name)}$`, "i");
+
+  const softDeleted = await DispatchLocation.findOne({
+    name: nameRe,
+    location_type,
+    isDeleted: true,
+  });
+  if (softDeleted) {
+    softDeleted.isDeleted = false;
+    softDeleted.description = softDeleted.description || description;
+    if (!softDeleted.store_id) softDeleted.store_id = mainId;
+    await softDeleted.save();
+    return softDeleted;
+  }
+
+  const existing = await findByExactName(name);
+  if (existing) {
+    if (Number(existing.location_type) !== location_type) return existing;
+    if (!existing.store_id) {
+      existing.store_id = mainId;
+      await existing.save();
+    }
+    return existing;
+  }
+
+  return DispatchLocation.create({
+    name,
+    description,
+    store_id: mainId,
+    location_type,
+    isDeleted: false,
+  });
+}
+
+/**
+ * Simple masters defaults (shown on /stores):
  * - RM Store 1 / RM Store 2
+ * - Product Store 1 / Product Store 2
  * - Shop 1 / Shop 2
  * - Hidden Main godown + Production (for inventory)
  *
- * Product Stores are user-managed only — legacy auto "Product Store" is removed.
+ * Do NOT auto soft-delete Product Stores — that hid them from RM Managers
+ * on every /dispatch-location list call.
  */
 async function ensureDefaultLocations() {
   let main = await Store.findOne({
@@ -30,22 +71,6 @@ async function ensureDefaultLocations() {
       isDeleted: false,
     });
   }
-
-  // Remove legacy auto-seeded Product Store (user manages Product Stores via UI).
-  // Exact name "Product Store" was the default seed — soft-delete it for good.
-  await DispatchLocation.updateMany(
-    {
-      isDeleted: false,
-      location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
-      $or: [
-        { name: /^Product Store$/i },
-        { description: /hidden from masters UI/i },
-        { description: /^Auto — finished goods/i },
-        { description: /^Finished goods product store$/i },
-      ],
-    },
-    { $set: { isDeleted: true } },
-  );
 
   // Production stays auto/hidden for manufacturing flows
   let production = await DispatchLocation.findOne({
@@ -86,6 +111,16 @@ async function ensureDefaultLocations() {
       description: "Raw material store",
     },
     {
+      name: "Product Store 1",
+      location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+      description: "Finished goods store",
+    },
+    {
+      name: "Product Store 2",
+      location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+      description: "Finished goods store",
+    },
+    {
       name: "Shop 1",
       location_type: LOCATION_TYPE.SHOP,
       description: "Retail shop",
@@ -98,22 +133,19 @@ async function ensureDefaultLocations() {
   ];
 
   for (const d of defaults) {
-    const existing = await findByExactName(d.name);
-    if (existing) {
-      if (Number(existing.location_type) !== d.location_type) continue;
-      if (!existing.store_id) {
-        existing.store_id = main._id;
-        await existing.save();
-      }
-      continue;
-    }
-    await DispatchLocation.create({
-      name: d.name,
-      description: d.description,
-      store_id: main._id,
-      location_type: d.location_type,
-      isDeleted: false,
-    });
+    await ensureNamedLocation(main._id, d);
+  }
+
+  // Legacy singular "Product Store" (older seed) — restore if soft-deleted so
+  // existing inventory links keep working, then keep it visible on /stores.
+  const legacyPs = await DispatchLocation.findOne({
+    name: /^Product Store$/i,
+    location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
+  });
+  if (legacyPs && legacyPs.isDeleted) {
+    legacyPs.isDeleted = false;
+    if (!legacyPs.store_id) legacyPs.store_id = main._id;
+    await legacyPs.save();
   }
 }
 
