@@ -7,6 +7,7 @@ router.use(verifyToken);
 router.get("/logs", controller.listLogs);
 router.get("/", controller.list);
 router.get("/:id", controller.getOne);
+router.post("/:id/ensure-code", controller.ensureCode);
 router.post("/", controller.create);
 router.patch("/:id", controller.update);
 router.delete("/:id", controller.remove);

@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const ProductStock = require("../Models/ProductStock");
 const Product = require("../Models/Products");
 const RawMaterial = require("../Models/RawMaterial");
@@ -22,6 +23,25 @@ const {
 } = require("../Services/inventoryService");
 
 const STOCK_SOURCE = { SELF_PRODUCTION: 1, SUPPLIER: 2 };
+
+const generateStockCode = () => {
+  const rand = crypto.randomBytes(4).toString("hex").toUpperCase();
+  return `PS-${rand}`;
+};
+
+/** Assign stock_code if missing (legacy rows). */
+async function ensureStockCode(doc, session = null) {
+  if (!doc) return doc;
+  if (doc.stock_code) return doc;
+  const code = generateStockCode();
+  const opts = session ? { session, new: true } : { new: true };
+  const updated = await ProductStock.findByIdAndUpdate(
+    doc._id,
+    { stock_code: code },
+    opts,
+  );
+  return updated || doc;
+}
 
 async function resolveProductStoreLocation(locationId, session = null) {
   if (!locationId) {
@@ -134,16 +154,74 @@ const list = async (req, res) => {
 
 const getOne = async (req, res) => {
   try {
-    const item = await ProductStock.findById(req.params.id)
+    let item = await ProductStock.findById(req.params.id)
       .populate("product_id")
       .populate("location_id")
       .populate("raw_materials_used.raw_material_id")
       .where({ isDeleted: false });
     if (!item) return createError(res, 404, "Product stock entry not found.");
+    if (!item.stock_code) {
+      await ensureStockCode(item);
+      item = await ProductStock.findById(req.params.id)
+        .populate("product_id")
+        .populate("location_id")
+        .populate("raw_materials_used.raw_material_id");
+    }
     return successMessage(res, item, "Product stock fetched successfully.");
   } catch (err) {
     console.error("ProductStock getOne error:", err);
     return createError(res, 500, err.message || "Failed to fetch product stock.");
+  }
+};
+
+/**
+ * POST /api/product-stock/:id/ensure-code
+ * Ensure printable batch barcode exists (legacy rows) + label payload.
+ */
+const ensureCode = async (req, res) => {
+  try {
+    let item = await ProductStock.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!item) return createError(res, 404, "Product stock entry not found.");
+    item = await ensureStockCode(item);
+    const populated = await ProductStock.findById(item._id)
+      .populate("product_id", "name unit id")
+      .populate("location_id", "name")
+      .populate("supplier_id", "name");
+
+    const sourceNum = Number(populated.source || STOCK_SOURCE.SELF_PRODUCTION);
+    const source_label =
+      sourceNum === STOCK_SOURCE.SUPPLIER
+        ? "Supplier"
+        : "Production / Adjustment";
+
+    return successMessage(
+      res,
+      {
+        stock: populated,
+        label: {
+          stock_code: populated.stock_code,
+          product_name: populated.product_id?.name || "Product",
+          quantity: Number(populated.quantity || 0),
+          unit: populated.product_id?.unit ?? null,
+          store_name: populated.location_id?.name || "Product Store",
+          source: sourceNum,
+          source_label,
+          supplier_name: populated.supplier_id?.name || null,
+          desc: populated.desc || "",
+          date: populated.createdAt,
+        },
+      },
+      "Stock barcode ready.",
+    );
+  } catch (err) {
+    console.error("ProductStock ensureCode error:", err);
+    return createError(
+      res,
+      500,
+      err.message || "Failed to prepare stock barcode.",
+    );
   }
 };
 
@@ -231,6 +309,7 @@ const create = async (req, res) => {
             source: sourceNum,
             supplier_id:
               sourceNum === STOCK_SOURCE.SUPPLIER ? supplier._id : null,
+            stock_code: generateStockCode(),
             isDeleted: false,
           },
         ],
@@ -726,4 +805,4 @@ const listLogs = async (req, res) => {
   }
 };
 
-module.exports = { list, getOne, create, update, remove, listLogs };
+module.exports = { list, getOne, create, update, remove, listLogs, ensureCode };

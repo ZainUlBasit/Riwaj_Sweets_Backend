@@ -69,6 +69,18 @@ const ProductStockSchema = new Schema(
       default: null,
       index: true,
     },
+    /**
+     * Printable batch barcode for this Product Store stock-in
+     * (e.g. PS-A1B2C3D4). Shows product + qty on label.
+     */
+    stock_code: {
+      type: String,
+      default: null,
+      index: true,
+      trim: true,
+      uppercase: true,
+      sparse: true,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {
