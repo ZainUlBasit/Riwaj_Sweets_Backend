@@ -641,7 +641,9 @@ const reopen = async (req, res) => {
 
 /**
  * DELETE /api/ustad-job/:id
- * Soft-delete + reverse dispatches. Blocked if productions linked.
+ * Soft-delete + reverse RM dispatches.
+ * Admin may cascade-delete linked productions (FG/RM restored) then delete job.
+ * Non-admin still blocked when productions are linked.
  */
 const remove = async (req, res) => {
   try {
@@ -659,22 +661,52 @@ const remove = async (req, res) => {
       return createError(res, err.status || 403, err.message);
     }
 
-    const linked = await CakeProduction.countDocuments({
+    const linkedProductions = await CakeProduction.find({
       ustad_job_id: job._id,
       isDeleted: false,
     });
-    if (linked > 0) {
+    const linked = linkedProductions.length;
+    const isAdmin = Number(req.user?.role) === 1;
+
+    if (linked > 0 && !isAdmin) {
       return createError(
         res,
         400,
-        `Is job pe ${linked} production(s) linked hain. Pehle unhe delete/unlink karein.`,
+        `Is job pe ${linked} production(s) linked hain. Pehle unhe delete/unlink karein. (Admin cascade delete kar sakta hai.)`,
       );
     }
 
     const userId = getUserId(req);
+    // Lazy require avoids circular load with cake-production ↔ ustad-job
+    const { reverseProductionImpact } = require("./cake-production.controller");
 
     await withTransaction(async (session) => {
       const opts = { session };
+
+      // Admin cascade: reverse each linked production (Product Store + Product qty)
+      for (const prod of linkedProductions) {
+        await reverseProductionImpact(prod, userId, session);
+        await CakeProduction.findByIdAndUpdate(
+          prod._id,
+          {
+            isDeleted: true,
+            product_stock_id: null,
+            raw_materials_consumed: [],
+            store_receipt_id: null,
+          },
+          { session },
+        );
+        await writeAudit({
+          entityType: "CakeProduction",
+          entityId: prod._id,
+          action: "delete",
+          previousValue: prod.toObject?.() ?? prod,
+          userId,
+          notes: `Cascade from UstadJob ${job.job_code || job._id}`,
+          session,
+        });
+      }
+
       for (const line of job.lines || []) {
         if (!line.dispatch_id) continue;
         const dispatch = await RawMaterialDispatch.findById(line.dispatch_id)
@@ -709,11 +741,21 @@ const remove = async (req, res) => {
         action: "delete",
         previousValue: job.toObject?.() ?? job,
         userId,
+        notes:
+          linked > 0
+            ? `Admin cascade: ${linked} production(s) reversed + RM restored`
+            : "RM dispatches reversed",
         session,
       });
     });
 
-    return successMessage(res, { _id: job._id }, "Ustad job deleted.");
+    return successMessage(
+      res,
+      { _id: job._id, productions_reversed: linked },
+      linked > 0
+        ? `Ustad job deleted — ${linked} production(s) + RM stock restored.`
+        : "Ustad job deleted — RM stock restored.",
+    );
   } catch (err) {
     console.error("UstadJob remove error:", err);
     return createError(

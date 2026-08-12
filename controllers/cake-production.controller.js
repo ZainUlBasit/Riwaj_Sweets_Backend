@@ -828,4 +828,4 @@ async function reverseProductionImpact(record, userId = null, session = null) {
   await ProductStock.findByIdAndUpdate(stock._id, { isDeleted: true }, opts);
 }
 
-module.exports = { list, getOne, create, update, remove };
+module.exports = { list, getOne, create, update, remove, reverseProductionImpact };
