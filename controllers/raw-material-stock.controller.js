@@ -428,24 +428,38 @@ const update = async (req, res) => {
       }
 
       if (oldRawMaterial) {
+        // Only remaining (not yet dispatched) still sits in available / RM Store.
+        const oldRemaining = Math.max(
+          0,
+          Number(oldItem.quantity || 0) - alreadyOut,
+        );
         await adjustRawMaterial(
           oldItem.raw_material_id,
-          { inDelta: -oldItem.quantity, availDelta: -oldItem.quantity },
+          {
+            inDelta: -Number(oldItem.quantity || 0),
+            availDelta: -oldRemaining,
+          },
           session,
         );
       }
 
       if (oldRmStoreId) {
-        await debitRmStoreOnPurchaseReverse({
-          rmStoreLocationId: oldRmStoreId,
-          rawMaterialId: oldItem.raw_material_id,
-          quantity: oldItem.quantity,
-          referenceType: "RawMaterialStock",
-          referenceId: oldItem._id,
-          userId,
-          notes: "Purchase stock entry updated (reverse old)",
-          session,
-        });
+        const oldRemaining = Math.max(
+          0,
+          Number(oldItem.quantity || 0) - alreadyOut,
+        );
+        if (oldRemaining > 0) {
+          await debitRmStoreOnPurchaseReverse({
+            rmStoreLocationId: oldRmStoreId,
+            rawMaterialId: oldItem.raw_material_id,
+            quantity: oldRemaining,
+            referenceType: "RawMaterialStock",
+            referenceId: oldItem._id,
+            userId,
+            notes: "Purchase stock entry updated (reverse old remaining)",
+            session,
+          });
+        }
       }
 
       const updated = await RawMaterialStock.findByIdAndUpdate(
@@ -480,20 +494,22 @@ const update = async (req, res) => {
 
       await adjustRawMaterial(
         newRawMaterialId,
-        { inDelta: qty, availDelta: qty },
+        { inDelta: qty, availDelta: remainingQty },
         session,
       );
 
-      await creditRmStoreOnPurchase({
-        rmStoreLocationId: newRmStoreId,
-        rawMaterialId: newRawMaterialId,
-        quantity: qty,
-        referenceType: "RawMaterialStock",
-        referenceId: updated._id,
-        userId,
-        notes: "Purchase stock entry updated",
-        session,
-      });
+      if (remainingQty > 0) {
+        await creditRmStoreOnPurchase({
+          rmStoreLocationId: newRmStoreId,
+          rawMaterialId: newRawMaterialId,
+          quantity: remainingQty,
+          referenceType: "RawMaterialStock",
+          referenceId: updated._id,
+          userId,
+          notes: "Purchase stock entry updated",
+          session,
+        });
+      }
 
       await writeAudit({
         entityType: "RawMaterialStock",
@@ -539,16 +555,10 @@ const remove = async (req, res) => {
       );
     }
 
-    if (Number(item.out_quantity || 0) > 0) {
-      return createError(
-        res,
-        400,
-        "Cannot delete a batch that has already been partially dispatched. Reverse those dispatches first.",
-      );
-    }
-
     const userId = getUserId(req);
     const totalPrice = item.total_price || 0;
+    const alreadyOut = Number(item.out_quantity || 0);
+    const remaining = Math.max(0, Number(item.quantity || 0) - alreadyOut);
     const rmStoreId = await resolvePurchaseRmStoreId(item);
 
     const deleted = await withTransaction(async (session) => {
@@ -569,9 +579,13 @@ const remove = async (req, res) => {
 
       if (rawMaterial) {
         const prevAvail = Number(rawMaterial.available_quantity || 0);
+        // Reverse full purchase `in`, but only remaining still in available/RM Store.
         const updated = await adjustRawMaterial(
           item.raw_material_id,
-          { inDelta: -item.quantity, availDelta: -item.quantity },
+          {
+            inDelta: -Number(item.quantity || 0),
+            availDelta: -remaining,
+          },
           session,
         );
         await writeLedger(
@@ -579,30 +593,33 @@ const remove = async (req, res) => {
             transactionType: TX.ADJUSTMENT,
             direction: DIR.OUT,
             rawMaterialId: item.raw_material_id,
-            quantity: item.quantity,
+            quantity: Number(item.quantity || 0),
             locationId: rmStoreId,
             referenceType: "RawMaterialStock",
             referenceId: item._id,
             userId,
-            notes: "Purchase stock entry deleted",
+            notes:
+              alreadyOut > 0
+                ? `Purchase deleted (remaining ${remaining} restored reverse; ${alreadyOut} already dispatched)`
+                : "Purchase stock entry deleted",
             previousBalance: prevAvail,
             newBalance: Number(
-              updated?.available_quantity ?? prevAvail - item.quantity,
+              updated?.available_quantity ?? prevAvail - remaining,
             ),
           },
           session,
         );
       }
 
-      if (rmStoreId) {
+      if (rmStoreId && remaining > 0) {
         await debitRmStoreOnPurchaseReverse({
           rmStoreLocationId: rmStoreId,
           rawMaterialId: item.raw_material_id,
-          quantity: item.quantity,
+          quantity: remaining,
           referenceType: "RawMaterialStock",
           referenceId: item._id,
           userId,
-          notes: "Purchase stock entry deleted",
+          notes: "Purchase stock entry deleted (remaining reverse)",
           session,
         });
       }
@@ -619,6 +636,10 @@ const remove = async (req, res) => {
         action: "delete",
         previousValue: item.toObject?.() ?? item,
         userId,
+        notes:
+          alreadyOut > 0
+            ? `Admin delete with partial dispatch out=${alreadyOut}`
+            : undefined,
         session,
       });
 
@@ -628,7 +649,9 @@ const remove = async (req, res) => {
     return successMessage(
       res,
       deleted,
-      "Raw material stock deleted successfully.",
+      alreadyOut > 0
+        ? "Raw material stock deleted — remaining qty + supplier payable restored (dispatched portion stays at destination)."
+        : "Raw material stock deleted successfully.",
     );
   } catch (err) {
     console.error("RawMaterialStock remove error:", err);

@@ -211,12 +211,34 @@ const getByBarcode = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
+    const existing = await SaleInvoice.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!existing) return createError(res, 404, "Sale invoice not found.");
+
+    // Prefer deleting via Order so delivered stock is restored correctly.
+    if (existing.order_id) {
+      const Order = require("../Models/Order");
+      const order = await Order.findById(existing.order_id).where({
+        isDeleted: false,
+      });
+      if (order) {
+        // Delegate to order remove semantics by soft-calling restore path:
+        // Keep invoice soft-delete here only if order already deleted; otherwise
+        // tell admin to delete the Order (which restores qty + deletes invoice).
+        return createError(
+          res,
+          400,
+          "Is invoice ka order abhi maujood hai. Order delete karein — product qty restore ho jayegi aur invoice bhi soft-delete ho jayega.",
+        );
+      }
+    }
+
     const item = await SaleInvoice.findOneAndUpdate(
       { _id: req.params.id, isDeleted: false },
       { isDeleted: true },
       { new: true },
     );
-    if (!item) return createError(res, 404, "Sale invoice not found.");
     return successMessage(res, item, "Sale invoice deleted successfully.");
   } catch (err) {
     console.error("SaleInvoice remove error:", err);

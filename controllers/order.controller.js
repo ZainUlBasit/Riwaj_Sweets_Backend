@@ -2,8 +2,21 @@ const crypto = require("crypto");
 const Order = require("../Models/Order");
 const Product = require("../Models/Products");
 const Counter = require("../Models/Counter");
+const SaleInvoice = require("../Models/SaleInvoice");
 const { createFromOrder } = require("./sale-invoice.controller");
 const { createError, successMessage } = require("../utils/ResponseMessage");
+const {
+  TX,
+  DIR,
+  INV_TYPE,
+  getUserId,
+  writeLedger,
+  writeAudit,
+  adjustProduct,
+  adjustLocationInventory,
+  getLocationInventoryQty,
+  withTransaction,
+} = require("../Services/inventoryService");
 
 const ORDER_STATUS = { PENDING: 1, BILLED: 2, DELIVERED: 3, CANCELLED: 4 };
 const PAYMENT_STATUS = { UNPAID: 1, PARTIAL: 2, PAID: 3 };
@@ -949,16 +962,124 @@ const batchReceive = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
-    const order = await Order.findOneAndUpdate(
-      { _id: req.params.id, isDeleted: false },
-      { isDeleted: true },
-      { new: true },
+    const existing = await Order.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!existing) return createError(res, 404, "Order not found.");
+
+    const userId = getUserId(req);
+    const status = Number(existing.status);
+
+    const order = await withTransaction(async (session) => {
+      // Delivered sales deducted Product (and shop location for shop POS).
+      // Admin delete must restore those quantities.
+      if (status === ORDER_STATUS.DELIVERED) {
+        const shopLocId = existing.shop_location_id || null;
+
+        for (const item of existing.items || []) {
+          const qty = Number(item.quantity || 0);
+          if (qty <= 0 || !item.product_id) continue;
+
+          await adjustProduct(
+            item.product_id,
+            { outDelta: -qty, availDelta: qty },
+            session,
+          );
+
+          if (shopLocId) {
+            const prevQty = await getLocationInventoryQty(
+              shopLocId,
+              item.product_id,
+              INV_TYPE.SHOP,
+              session,
+            );
+            await adjustLocationInventory(
+              shopLocId,
+              item.product_id,
+              qty,
+              INV_TYPE.SHOP,
+              session,
+            );
+            await writeLedger(
+              {
+                transactionType: TX.PRODUCT_SALE,
+                direction: DIR.IN,
+                productId: item.product_id,
+                quantity: qty,
+                locationId: shopLocId,
+                referenceType: "Order",
+                referenceId: existing._id,
+                userId,
+                notes: `Order delete restore (shop sale) #${existing.order_number || existing._id}`,
+                previousBalance: prevQty,
+                newBalance: prevQty + qty,
+              },
+              session,
+            );
+          } else {
+            await writeLedger(
+              {
+                transactionType: TX.ADJUSTMENT,
+                direction: DIR.IN,
+                productId: item.product_id,
+                quantity: qty,
+                referenceType: "Order",
+                referenceId: existing._id,
+                userId,
+                notes: `Order delete restore (counter delivery) #${existing.order_number || existing._id}`,
+                previousBalance: null,
+                newBalance: null,
+              },
+              session,
+            );
+          }
+        }
+
+        if (existing.sale_invoice_id) {
+          await SaleInvoice.findOneAndUpdate(
+            { _id: existing.sale_invoice_id, isDeleted: false },
+            { isDeleted: true },
+            { session },
+          );
+        }
+      }
+
+      const deleted = await Order.findOneAndUpdate(
+        { _id: existing._id, isDeleted: false },
+        { isDeleted: true },
+        { new: true, session },
+      );
+
+      await writeAudit({
+        entityType: "Order",
+        entityId: existing._id,
+        action: "delete",
+        previousValue: existing.toObject?.() ?? existing,
+        userId,
+        notes:
+          status === ORDER_STATUS.DELIVERED
+            ? "Deleted with stock restore"
+            : "Deleted (no stock impact)",
+        session,
+      });
+
+      return deleted;
+    });
+
+    return successMessage(
+      res,
+      order,
+      status === ORDER_STATUS.DELIVERED
+        ? "Order deleted — product qty restored."
+        : "Order deleted successfully.",
     );
-    if (!order) return createError(res, 404, "Order not found.");
-    return successMessage(res, order, "Order deleted successfully.");
   } catch (err) {
     console.error("Order remove error:", err);
-    return createError(res, 500, err.message || "Failed to delete order.");
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to delete order.",
+    );
   }
 };
 

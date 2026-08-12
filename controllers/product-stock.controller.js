@@ -668,7 +668,11 @@ const remove = async (req, res) => {
       return softDeleted;
     });
 
-    return successMessage(res, deleted, "Product stock deleted successfully.");
+    return successMessage(
+      res,
+      deleted,
+      "Product stock deleted — Product Store + Product qty restored (supplier payable bhi agar tha).",
+    );
   } catch (err) {
     console.error("ProductStock remove error:", err);
     return createError(
