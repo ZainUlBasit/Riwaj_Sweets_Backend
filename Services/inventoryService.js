@@ -41,6 +41,13 @@ const LOCATION_TYPE = {
 
 const INV_TYPE = { PRODUCTION: 1, SHOP: 2, STORE: 3 };
 
+/** Round qty to 3dp — avoids float noise like 45.95999999999999 vs 45.96 */
+const roundQty = (n) => Math.round((Number(n) || 0) * 1000) / 1000;
+
+/** True if available covers requested (within 3dp rounding). */
+const hasEnoughQty = (available, requested) =>
+  roundQty(available) + 1e-9 >= roundQty(requested);
+
 function getInventoryTypeForLocation(locationType) {
   const t = Number(locationType || LOCATION_TYPE.PRODUCTION_AREA);
   if (t === LOCATION_TYPE.SHOP) return INV_TYPE.SHOP;
@@ -93,7 +100,7 @@ async function getLocationRawMaterialQty(
   });
   if (session) q.session(session);
   const row = await q;
-  return row ? Number(row.quantity || 0) : 0;
+  return row ? roundQty(row.quantity || 0) : 0;
 }
 
 async function adjustLocationRawMaterialInventory(
@@ -122,7 +129,7 @@ async function adjustLocationRawMaterialInventory(
         {
           location_id: locationId,
           raw_material_id: rawMaterialId,
-          quantity: delta,
+          quantity: roundQty(delta),
           isDeleted: false,
         },
       ],
@@ -131,10 +138,12 @@ async function adjustLocationRawMaterialInventory(
     return created;
   }
 
-  const nextQty = Number(row.quantity || 0) + delta;
-  if (nextQty < 0) {
+  const available = roundQty(row.quantity || 0);
+  const deltaQty = roundQty(delta);
+  const nextQty = roundQty(available + deltaQty);
+  if (deltaQty < 0 && !hasEnoughQty(available, Math.abs(deltaQty))) {
     const err = new Error(
-      `Insufficient raw material at location. Available: ${row.quantity}, requested: ${Math.abs(delta)}.`,
+      `Insufficient raw material at location. Available: ${available}, requested: ${Math.abs(deltaQty)}.`,
     );
     err.status = 409;
     throw err;
@@ -691,7 +700,7 @@ async function getLocationInventoryQty(
     .lean();
   if (session) q.session(session);
   const row = await q;
-  return row ? Number(row.quantity || 0) : 0;
+  return row ? roundQty(row.quantity || 0) : 0;
 }
 
 async function adjustLocationInventory(
@@ -723,7 +732,7 @@ async function adjustLocationInventory(
           location_id: locationId,
           product_id: productId,
           inventory_type: inventoryType,
-          quantity: delta,
+          quantity: roundQty(delta),
           isDeleted: false,
         },
       ],
@@ -732,10 +741,12 @@ async function adjustLocationInventory(
     return created;
   }
 
-  const nextQty = Number(row.quantity || 0) + delta;
-  if (nextQty < 0) {
+  const available = roundQty(row.quantity || 0);
+  const deltaQty = roundQty(delta);
+  const nextQty = roundQty(available + deltaQty);
+  if (deltaQty < 0 && !hasEnoughQty(available, Math.abs(deltaQty))) {
     const err = new Error(
-      `Insufficient inventory. Available: ${row.quantity}, requested: ${Math.abs(delta)}.`,
+      `Insufficient inventory. Available: ${available}, requested: ${Math.abs(deltaQty)}.`,
     );
     err.status = 409;
     throw err;
@@ -1474,7 +1485,8 @@ async function reverseStoreReceipt(
   const receipt = await q;
   if (!receipt) return null;
 
-  const qty = Number(receipt.quantity || 0);
+  const qty = roundQty(receipt.quantity || 0);
+  let storeShortfall = 0;
   if (qty > 0) {
     if (restoreToProduction) {
       await adjustLocationInventory(
@@ -1484,19 +1496,44 @@ async function reverseStoreReceipt(
         INV_TYPE.PRODUCTION,
         session,
       );
+      await adjustLocationInventory(
+        receipt.to_location_id,
+        receipt.product_id,
+        -qty,
+        INV_TYPE.STORE,
+        session,
+      );
+    } else {
+      const storeAvailable = await getLocationInventoryQty(
+        receipt.to_location_id,
+        receipt.product_id,
+        INV_TYPE.STORE,
+        session,
+      );
+      const deductQty = roundQty(Math.min(qty, storeAvailable));
+      storeShortfall = roundQty(qty - deductQty);
+      if (deductQty > 0) {
+        await adjustLocationInventory(
+          receipt.to_location_id,
+          receipt.product_id,
+          -deductQty,
+          INV_TYPE.STORE,
+          session,
+        );
+      }
     }
-    await adjustLocationInventory(
-      receipt.to_location_id,
-      receipt.product_id,
-      -qty,
-      INV_TYPE.STORE,
-      session,
-    );
   }
 
   receipt.isDeleted = true;
   if (session) await receipt.save({ session });
   else await receipt.save();
+
+  let auditNotes = restoreToProduction
+    ? "Receipt reversed"
+    : "Receipt reversed (production delete)";
+  if (storeShortfall > 0) {
+    auditNotes += `; ${storeShortfall} already moved/sold — store not fully reversed`;
+  }
 
   await writeAudit({
     entityType: "ProductStoreReceipt",
@@ -1504,7 +1541,7 @@ async function reverseStoreReceipt(
     action: "delete",
     previousValue: receipt.toObject?.() ?? receipt,
     userId,
-    notes: restoreToProduction ? "Receipt reversed" : "Receipt reversed (production delete)",
+    notes: auditNotes,
     session,
   });
 
@@ -1519,6 +1556,8 @@ module.exports = {
   DIR,
   LOCATION_TYPE,
   INV_TYPE,
+  roundQty,
+  hasEnoughQty,
   getUserId,
   writeAudit,
   writeLedger,

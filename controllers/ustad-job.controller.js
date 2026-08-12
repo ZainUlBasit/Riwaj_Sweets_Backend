@@ -167,12 +167,14 @@ const buildSummary = async (job) => {
  */
 const list = async (req, res) => {
   try {
-    const { status, ustad_name, location_id, start_date, end_date } =
+    const { status, ustad_name, ustad_id, location_id, start_date, end_date } =
       req.query || {};
 
     const baseFilter = { isDeleted: false };
     if (status != null && status !== "") baseFilter.status = Number(status);
-    if (ustad_name) {
+    if (ustad_id) {
+      baseFilter.ustad_id = ustad_id;
+    } else if (ustad_name) {
       baseFilter.ustad_name = new RegExp(
         String(ustad_name).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
         "i",
@@ -181,8 +183,16 @@ const list = async (req, res) => {
     if (location_id) baseFilter.location_id = location_id;
     if (start_date || end_date) {
       baseFilter.issue_date = {};
-      if (start_date) baseFilter.issue_date.$gte = new Date(start_date);
-      if (end_date) baseFilter.issue_date.$lte = new Date(end_date);
+      if (start_date) {
+        const start = new Date(start_date);
+        start.setHours(0, 0, 0, 0);
+        baseFilter.issue_date.$gte = start;
+      }
+      if (end_date) {
+        const end = new Date(end_date);
+        end.setHours(23, 59, 59, 999);
+        baseFilter.issue_date.$lte = end;
+      }
     }
 
     const scopedFilter = await applyStoreLocationFilter(
@@ -267,6 +277,169 @@ const listOpen = async (req, res) => {
   } catch (err) {
     console.error("UstadJob listOpen error:", err);
     return createError(res, 500, err.message || "Failed to fetch open jobs.");
+  }
+};
+
+/**
+ * GET /api/ustad-job/report?ustad_id=&start_date=&end_date=
+ * Weekly / monthly hisaab for one ustad: RM issued + FG returned.
+ */
+const report = async (req, res) => {
+  try {
+    const { ustad_id, start_date, end_date } = req.query || {};
+    if (!ustad_id) {
+      return createError(res, 400, "Ustad select karein.");
+    }
+    if (!start_date || !end_date) {
+      return createError(res, 400, "Date range required.");
+    }
+
+    const ustad = await Ustad.findById(ustad_id).where({ isDeleted: false });
+    if (!ustad) return createError(res, 404, "Ustad not found.");
+
+    const start = new Date(start_date);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(end_date);
+    end.setHours(23, 59, 59, 999);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+      return createError(res, 400, "Invalid date range.");
+    }
+
+    const baseFilter = {
+      isDeleted: false,
+      ustad_id,
+      issue_date: { $gte: start, $lte: end },
+    };
+    const scopedFilter = await applyStoreLocationFilter(
+      req,
+      baseFilter,
+      "location_id",
+    );
+
+    const jobs = await populateJob(
+      UstadJob.find(scopedFilter).sort({ issue_date: 1, createdAt: 1 }),
+    );
+
+    const rmMap = new Map();
+    for (const job of jobs) {
+      for (const line of job.lines || []) {
+        const id = String(line.raw_material_id?._id || line.raw_material_id || "");
+        if (!id) continue;
+        const prev = rmMap.get(id) || {
+          raw_material_id: id,
+          name: line.raw_material_id?.name || "RM",
+          unit: line.raw_material_id?.unit ?? null,
+          quantity: 0,
+          value: 0,
+        };
+        prev.quantity += Number(line.quantity || 0);
+        prev.value += Number(line.line_value || 0);
+        rmMap.set(id, prev);
+      }
+    }
+
+    const jobIds = jobs.map((j) => j._id);
+    const productions = jobIds.length
+      ? await CakeProduction.find({
+          ustad_job_id: { $in: jobIds },
+          isDeleted: false,
+        }).populate("product_id", "name id unit price")
+      : [];
+
+    const fgMap = new Map();
+    const jobsFg = new Map();
+    for (const p of productions) {
+      const qty = Number(p.cakes_produced || 0);
+      const unitPrice = Number(p.product_id?.price || 0);
+      const value = Math.round(qty * unitPrice * 100) / 100;
+      const pid = String(p.product_id?._id || p.product_id || "");
+      if (pid) {
+        const prev = fgMap.get(pid) || {
+          product_id: pid,
+          name: p.product_id?.name || "Product",
+          unit: p.product_id?.unit ?? null,
+          quantity: 0,
+          value: 0,
+        };
+        prev.quantity += qty;
+        prev.value += value;
+        fgMap.set(pid, prev);
+      }
+      const jid = String(p.ustad_job_id);
+      const jprev = jobsFg.get(jid) || { qty: 0, value: 0, count: 0 };
+      jprev.qty += qty;
+      jprev.value += value;
+      jprev.count += 1;
+      jobsFg.set(jid, jprev);
+    }
+
+    const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+    const round3 = (n) => Math.round(Number(n || 0) * 1000) / 1000;
+
+    const jobRows = jobs.map((job) => {
+      const fg = jobsFg.get(String(job._id)) || { qty: 0, value: 0, count: 0 };
+      const rmVal = Number(job.rm_value_issued || 0);
+      return {
+        _id: job._id,
+        job_code: job.job_code,
+        issue_date: job.issue_date,
+        status: job.status,
+        location: job.location_id?.name || "",
+        rm_value_issued: round2(rmVal),
+        fg_qty: round3(fg.qty),
+        fg_value: round2(fg.value),
+        fg_count: fg.count,
+        value_difference: round2(fg.value - rmVal),
+      };
+    });
+
+    const rm_summary = Array.from(rmMap.values())
+      .map((r) => ({
+        ...r,
+        quantity: round3(r.quantity),
+        value: round2(r.value),
+      }))
+      .sort((a, b) => b.value - a.value);
+
+    const fg_summary = Array.from(fgMap.values())
+      .map((r) => ({
+        ...r,
+        quantity: round3(r.quantity),
+        value: round2(r.value),
+      }))
+      .sort((a, b) => b.value - a.value);
+
+    const rm_value_issued = jobRows.reduce((s, j) => s + j.rm_value_issued, 0);
+    const fg_qty_returned = jobRows.reduce((s, j) => s + j.fg_qty, 0);
+    const fg_value_returned = jobRows.reduce((s, j) => s + j.fg_value, 0);
+
+    return successMessage(
+      res,
+      {
+        ustad: {
+          _id: ustad._id,
+          name: ustad.name,
+          phone: ustad.phone || "",
+        },
+        range: { start_date, end_date },
+        jobs: jobRows,
+        rm_summary,
+        fg_summary,
+        totals: {
+          jobs_count: jobRows.length,
+          open_jobs: jobRows.filter((j) => Number(j.status) === 1).length,
+          closed_jobs: jobRows.filter((j) => Number(j.status) === 2).length,
+          rm_value_issued: round2(rm_value_issued),
+          fg_qty_returned: round3(fg_qty_returned),
+          fg_value_returned: round2(fg_value_returned),
+          value_difference: round2(fg_value_returned - rm_value_issued),
+        },
+      },
+      "Ustad report fetched.",
+    );
+  } catch (err) {
+    console.error("UstadJob report error:", err);
+    return createError(res, 500, err.message || "Failed to generate ustad report.");
   }
 };
 
@@ -769,6 +942,7 @@ const remove = async (req, res) => {
 module.exports = {
   list,
   listOpen,
+  report,
   getOne,
   create,
   close,

@@ -23,6 +23,8 @@ const {
   adjustProduct,
   getInventoryTypeForLocation,
   withTransaction,
+  roundQty,
+  hasEnoughQty,
 } = require("../Services/inventoryService");
 
 const SHOP_TOKEN_TTL = "12h";
@@ -574,11 +576,11 @@ const cashBarcodeSale = async (req, res) => {
     );
 
     for (const check of stockChecks) {
-      if (check.available < check.requiredQty) {
+      if (!hasEnoughQty(check.available, check.requiredQty)) {
         return createError(
           res,
           409,
-          `Insufficient shop stock for "${check.name}". Available: ${check.available}, requested: ${round3(check.requiredQty)}.`,
+          `Insufficient shop stock for "${check.name}". Available: ${roundQty(check.available)}, requested: ${roundQty(check.requiredQty)}.`,
         );
       }
     }
@@ -751,11 +753,11 @@ const posSale = async (req, res) => {
         product._id,
         INV_TYPE.SHOP,
       );
-      if (locationQty < qty) {
+      if (!hasEnoughQty(locationQty, qty)) {
         return createError(
           res,
           409,
-          `Insufficient shop stock for "${product.name}". Available: ${locationQty}, requested: ${qty}. Transfer stock from main store first.`,
+          `Insufficient shop stock for "${product.name}". Available: ${roundQty(locationQty)}, requested: ${roundQty(qty)}. Transfer stock from main store first.`,
         );
       }
       const unitPrice = round2(raw.unit_price ?? product.price ?? 0);

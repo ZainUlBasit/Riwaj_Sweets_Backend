@@ -6,6 +6,7 @@ const controller = require("../controllers/ustad-job.controller");
 router.use(verifyToken);
 router.get("/", controller.list);
 router.get("/open", controller.listOpen);
+router.get("/report", controller.report);
 router.get("/:id", controller.getOne);
 router.post("/", controller.create);
 router.patch("/:id/close", controller.close);

@@ -15,6 +15,8 @@ const {
   getLocationInventoryQty,
   getInventoryTypeForLocation,
   withTransaction,
+  roundQty,
+  hasEnoughQty,
 } = require("../Services/inventoryService");
 const {
   assertRmManagerStoreAccess,
@@ -223,12 +225,13 @@ const create = async (req, res) => {
         productId,
         fromInvType,
       );
-      if (needQty > available) {
+      const need = roundQty(needQty);
+      if (!hasEnoughQty(available, need)) {
         const product = productMap.get(productId);
         return createError(
           res,
           409,
-          `Insufficient stock of "${product?.name || productId}" at ${fromLoc.name}. Available: ${available}, requested: ${needQty}.`,
+          `Insufficient stock of "${product?.name || productId}" at ${fromLoc.name}. Available: ${roundQty(available)}, requested: ${need}.`,
         );
       }
     }
