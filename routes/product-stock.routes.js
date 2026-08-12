@@ -4,6 +4,7 @@ const { verifyToken } = require("../Middleware/auth");
 const controller = require("../controllers/product-stock.controller");
 
 router.use(verifyToken);
+router.get("/logs", controller.listLogs);
 router.get("/", controller.list);
 router.get("/:id", controller.getOne);
 router.post("/", controller.create);

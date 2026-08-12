@@ -3,6 +3,7 @@ const Product = require("../Models/Products");
 const RawMaterial = require("../Models/RawMaterial");
 const Supplier = require("../Models/Supplier");
 const DispatchLocation = require("../Models/DispatchLocation");
+const InventoryLedger = require("../Models/InventoryLedger");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const {
   TX,
@@ -678,4 +679,47 @@ const remove = async (req, res) => {
   }
 };
 
-module.exports = { list, getOne, create, update, remove };
+/**
+ * GET /api/product-stock/logs
+ * InventoryLedger rows for Product Store qty movements (direct stock-in, etc.).
+ * Does not change stock — read-only audit trail.
+ */
+const listLogs = async (req, res) => {
+  try {
+    const { product_id, location_id, start_date, end_date } = req.query || {};
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+
+    const filter = {
+      isDeleted: false,
+      product_id: { $ne: null },
+      transaction_type: {
+        $in: [TX.PRODUCT_STOCK_IN, TX.STORE_RECEIPT, TX.ADJUSTMENT, TX.SHOP_TRANSFER],
+      },
+    };
+    if (product_id) filter.product_id = product_id;
+    if (location_id) filter.location_id = location_id;
+    if (start_date || end_date) {
+      filter.createdAt = {};
+      if (start_date) filter.createdAt.$gte = new Date(start_date);
+      if (end_date) filter.createdAt.$lte = new Date(end_date);
+    }
+
+    const items = await InventoryLedger.find(filter)
+      .populate("product_id", "name unit id")
+      .populate("location_id", "name location_type")
+      .populate("user_id", "name email")
+      .sort({ createdAt: -1 })
+      .limit(limit);
+
+    return successMessage(
+      res,
+      { items },
+      "Product Store qty logs fetched.",
+    );
+  } catch (err) {
+    console.error("ProductStock listLogs error:", err);
+    return createError(res, 500, err.message || "Failed to fetch stock logs.");
+  }
+};
+
+module.exports = { list, getOne, create, update, remove, listLogs };
