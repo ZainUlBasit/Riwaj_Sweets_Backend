@@ -331,8 +331,8 @@ app.use("/api/sale-invoice", SaleInvoiceRoutes);
 //==============================================
 // Reports
 //==============================================
-const DailyReportRoutes = require("../routes/daily-report.routes");
-app.use("/api/daily-report", DailyReportRoutes);
+// const ReportRoutes = require("../routes/report.routes");
+// app.use("/api/daily-report", ReportRoutes);
 // Routes
 // app.use("/api/auth", AuthRoutes);
 
