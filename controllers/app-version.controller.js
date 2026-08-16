@@ -6,14 +6,10 @@
  */
 const getAppVersion = async (req, res) => {
   try {
-    const latestVersion =
-      process.env.APP_LATEST_VERSION || "1.0.6";
-    const minimumVersion =
-      process.env.APP_MINIMUM_VERSION || "1.0.5";
-    const forceUpdate =
-      String(process.env.APP_FORCE_UPDATE || "true").toLowerCase() ===
-      "true";
-    const downloadUrl = process.env.APP_DOWNLOAD_URL || "";
+    const latestVersion = "1.0.7";
+    const minimumVersion = "1.0.8";
+    const forceUpdate = false;
+    const downloadUrl = "";
 
     return res.status(200).json({
       latestVersion,
