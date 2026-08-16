@@ -214,6 +214,11 @@ app.use("/api/product-transfer", ProductTransferRoutes);
 const InventoryReportRoutes = require("../routes/inventory-report.routes");
 app.use("/api/inventory-reports", InventoryReportRoutes);
 // ===================================================
+// App Version (Electron update check — public)
+// ===================================================
+const AppVersionRoutes = require("../routes/app-version.routes");
+app.use("/api/app-version", AppVersionRoutes);
+// ===================================================
 // Auth Routes
 // ===================================================
 const AuthRoutes = require("../routes/auth.routes");
