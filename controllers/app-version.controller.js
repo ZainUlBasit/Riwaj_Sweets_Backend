@@ -6,9 +6,9 @@
  */
 const getAppVersion = async (req, res) => {
   try {
-    const latestVersion = "1.0.7";
-    const minimumVersion = "1.0.8";
-    const forceUpdate = false;
+    const latestVersion = "1.0.8";
+    const minimumVersion = "1.0.7";
+    const forceUpdate = true;
     const downloadUrl = "";
 
     return res.status(200).json({
