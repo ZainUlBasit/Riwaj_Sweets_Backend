@@ -1,10 +1,13 @@
 {
   "name": "riwajsweets-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "Riwaj Sweets Express API",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "node api/index.js",
+    "start": "node server.js",
     "dev": "nodemon api/index.js"
   },
   "keywords": [],
