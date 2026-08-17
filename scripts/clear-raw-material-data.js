@@ -16,7 +16,7 @@
  *   - CakeProduction.raw_materials_consumed  (-> khaali)
  *   - ProductStock.raw_materials_used        (-> khaali)
  *
- * Requires `mongooseUrl` env var (wahi jo API use karti hai).
+ * Requires `MONGOOSEURL` env var (wahi jo API use karti hai).
  *
  * Usage:
  *   node scripts/clear-raw-material-data.js --dry-run   # sirf counts, kuch delete nahi
@@ -98,9 +98,9 @@ async function main() {
     process.exit(1);
   }
 
-  const uri = process.env.mongooseUrl;
+  const uri = process.env.MONGOOSEURL;
   if (!uri) {
-    console.error("ERROR: `mongooseUrl` env var set nahi hai. Aborting.");
+    console.error("ERROR: `MONGOOSEURL` env var set nahi hai. Aborting.");
     process.exit(1);
   }
 

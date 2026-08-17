@@ -10,7 +10,7 @@
  *   - LocationInventory.quantity → 0
  *   - ProductStock.quantity / total_price → 0
  *
- * Requires `mongooseUrl` env var.
+ * Requires `MONGOOSEURL` env var.
  *
  * Usage:
  *   node scripts/clear-product-qty.js --dry-run
@@ -69,12 +69,12 @@ async function main() {
     process.exit(1);
   }
 
-  if (!process.env.mongooseUrl) {
-    console.error("mongooseUrl env var missing.");
+  if (!process.env.MONGOOSEURL) {
+    console.error("MONGOOSEURL env var missing.");
     process.exit(1);
   }
 
-  await mongoose.connect(process.env.mongooseUrl);
+  await mongoose.connect(process.env.MONGOOSEURL);
   console.log("Connected.");
 
   await printCounts("BEFORE");

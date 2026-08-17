@@ -18,7 +18,7 @@
  * Run with:
  *   node scripts/fix-counters-collection.js
  *
- * Requires `mongooseUrl` in the environment (same var the API uses).
+ * Requires `MONGOOSEURL` in the environment (same var the API uses).
  */
 require("dotenv").config();
 const mongoose = require("mongoose");
@@ -27,10 +27,10 @@ const SOURCE = "counters"; // legacy + mongoose-sequence shared collection
 const TARGET = "sale_counters"; // new domain Counter collection
 
 async function main() {
-  const uri = process.env.mongooseUrl;
+  const uri = process.env.MONGOOSEURL;
   if (!uri) {
     console.error(
-      "ERROR: `mongooseUrl` env var is not set. Aborting migration.",
+      "ERROR: `MONGOOSEURL` env var is not set. Aborting migration.",
     );
     process.exit(1);
   }

@@ -4,16 +4,16 @@
  * Run with:
  *   node scripts/seed-products.js
  *
- * Requires `mongooseUrl` in the environment (same var the API uses).
+ * Requires `MONGOOSEURL` in the environment (same var the API uses).
  */
 require("dotenv").config();
 const mongoose = require("mongoose");
 const Product = require("../Models/Products");
 
 async function main() {
-  const uri = process.env.mongooseUrl;
+  const uri = process.env.MONGOOSEURL;
   if (!uri) {
-    console.error("ERROR: `mongooseUrl` env var is not set. Aborting seed.");
+    console.error("ERROR: `MONGOOSEURL` env var is not set. Aborting seed.");
     process.exit(1);
   }
 

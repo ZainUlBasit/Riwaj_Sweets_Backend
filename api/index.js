@@ -137,7 +137,7 @@ async function connectToDatabase() {
     };
 
     cached.promise = mongoose
-      .connect(process.env.mongooseUrl, opts)
+      .connect(process.env.MONGOOSEURL, opts)
       .then((mongoose) => {
         console.log("✅ Database connected");
         return mongoose;
