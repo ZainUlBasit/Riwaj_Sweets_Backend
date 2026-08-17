@@ -35,6 +35,10 @@ const UstadJobLineSchema = new Schema(
       ref: "RawMaterialDispatch",
       default: null,
     },
+    /** When this RM was given (extra top-ups can be later than job.issue_date). */
+    issued_at: { type: Date, default: null, index: true },
+    /** Extra RM given after the original job (weekly hisaab). */
+    is_extra: { type: Boolean, default: false },
   },
   { _id: true },
 );

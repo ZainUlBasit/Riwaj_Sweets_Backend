@@ -9,6 +9,7 @@ router.get("/open", controller.listOpen);
 router.get("/report", controller.report);
 router.get("/:id", controller.getOne);
 router.post("/", controller.create);
+router.post("/:id/rm", controller.addRm);
 router.patch("/:id/close", controller.close);
 router.patch("/:id/reopen", controller.reopen);
 router.delete("/:id", controller.remove);

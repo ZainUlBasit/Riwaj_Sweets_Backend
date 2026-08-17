@@ -98,6 +98,152 @@ const populateJob = (q) =>
     .populate("lines.dispatch_id")
     .populate("planned_products.product_id", "name id unit");
 
+const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+const round3 = (n) => Math.round(Number(n || 0) * 1000) / 1000;
+
+function lineIssuedAt(line, job) {
+  return line?.issued_at || job?.issue_date || null;
+}
+
+function inDateRange(dateVal, start, end) {
+  if (!dateVal) return false;
+  const d = new Date(dateVal);
+  return d >= start && d <= end;
+}
+
+async function snapshotRmLines(lines) {
+  const normalized = [];
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i] || {};
+    const qty = Number(row.quantity);
+    if (!row.raw_material_id || !row.raw_material_stock_id) {
+      const err = new Error(
+        `Line ${i + 1}: raw_material_id and raw_material_stock_id are required.`,
+      );
+      err.status = 400;
+      throw err;
+    }
+    if (!Number.isFinite(qty) || qty <= 0) {
+      const err = new Error(`Line ${i + 1}: quantity must be > 0.`);
+      err.status = 400;
+      throw err;
+    }
+
+    const [rm, stock] = await Promise.all([
+      RawMaterial.findById(row.raw_material_id).where({ isDeleted: false }),
+      RawMaterialStock.findById(row.raw_material_stock_id).where({
+        isDeleted: false,
+      }),
+    ]);
+    if (!rm) {
+      const err = new Error(`Line ${i + 1}: raw material not found.`);
+      err.status = 404;
+      throw err;
+    }
+    if (!stock) {
+      const err = new Error(`Line ${i + 1}: stock batch not found.`);
+      err.status = 404;
+      throw err;
+    }
+    if (Number(stock.purpose) !== 1) {
+      const err = new Error(`Line ${i + 1}: must use a purchase stock batch.`);
+      err.status = 400;
+      throw err;
+    }
+    if (String(stock.raw_material_id) !== String(rm._id)) {
+      const err = new Error(
+        `Line ${i + 1}: stock batch does not match raw material.`,
+      );
+      err.status = 400;
+      throw err;
+    }
+    const remaining =
+      stock.remaining_quantity != null
+        ? Number(stock.remaining_quantity)
+        : Number(stock.quantity || 0) - Number(stock.out_quantity || 0);
+    if (qty > remaining) {
+      const err = new Error(
+        `Line ${i + 1}: insufficient batch. Remaining ${remaining}, requested ${qty}.`,
+      );
+      err.status = 409;
+      throw err;
+    }
+
+    const unit_price = Number(stock.price || rm.price || 0);
+    const line_value = round2(qty * unit_price);
+    normalized.push({
+      raw_material_id: rm._id,
+      raw_material_stock_id: stock._id,
+      quantity: qty,
+      unit_price,
+      line_value,
+    });
+  }
+  return normalized;
+}
+
+async function issueRmLines({
+  job,
+  fromLoc,
+  toLoc,
+  ustadName,
+  userId,
+  rows,
+  issueDate,
+  isExtra = false,
+  session,
+}) {
+  const opts = session ? { session } : {};
+  const issuedAt = issueDate instanceof Date ? issueDate : new Date(issueDate);
+  const savedLines = [];
+
+  for (const row of rows) {
+    const [dispatch] = await RawMaterialDispatch.create(
+      [
+        {
+          from_location_id: fromLoc._id,
+          location_id: toLoc._id,
+          location: toLoc.name,
+          raw_material_id: row.raw_material_id,
+          raw_material_stock_id: row.raw_material_stock_id,
+          quantity: row.quantity,
+          dispatch_date: issuedAt,
+          notes: isExtra
+            ? `Ustad Job ${job.job_code} extra RM · ${ustadName}`
+            : `Ustad Job ${job.job_code} · ${ustadName}`,
+          ustad_job_id: job._id,
+          isDeleted: false,
+        },
+      ],
+      opts,
+    );
+
+    await applyRawMaterialDispatchImpact({
+      rawMaterialId: row.raw_material_id,
+      quantity: row.quantity,
+      fromLocationId: fromLoc._id,
+      toLocationId: toLoc._id,
+      storeId: fromLoc.store_id ?? toLoc.store_id ?? null,
+      rawMaterialStockId: row.raw_material_stock_id,
+      referenceId: dispatch._id,
+      userId,
+      notes: isExtra
+        ? `Ustad Job ${job.job_code} extra RM → ${toLoc.name} · ${ustadName}`
+        : `Ustad Job ${job.job_code} → ${toLoc.name} · ${ustadName}`,
+      session,
+    });
+
+    savedLines.push({
+      ...row,
+      dispatch_id: dispatch._id,
+      issued_at: issuedAt,
+      is_extra: Boolean(isExtra),
+    });
+  }
+
+  return savedLines;
+}
+
 const buildSummary = async (job) => {
   const productions = await CakeProduction.find({
     ustad_job_id: job._id,
@@ -149,6 +295,8 @@ const buildSummary = async (job) => {
       line_value: line.line_value,
       batch_desc: line.raw_material_stock_id?.desc || null,
       dispatch_id: line.dispatch_id?._id || line.dispatch_id,
+      issued_at: line.issued_at || job.issue_date || null,
+      is_extra: Boolean(line.is_extra),
     })),
     fg_items: fgItems,
     totals: {
@@ -308,7 +456,6 @@ const report = async (req, res) => {
     const baseFilter = {
       isDeleted: false,
       ustad_id,
-      issue_date: { $gte: start, $lte: end },
     };
     const scopedFilter = await applyStoreLocationFilter(
       req,
@@ -321,8 +468,10 @@ const report = async (req, res) => {
     );
 
     const rmMap = new Map();
+    const jobsRm = new Map();
     for (const job of jobs) {
       for (const line of job.lines || []) {
+        if (!inDateRange(lineIssuedAt(line, job), start, end)) continue;
         const id = String(line.raw_material_id?._id || line.raw_material_id || "");
         if (!id) continue;
         const prev = rmMap.get(id) || {
@@ -335,6 +484,12 @@ const report = async (req, res) => {
         prev.quantity += Number(line.quantity || 0);
         prev.value += Number(line.line_value || 0);
         rmMap.set(id, prev);
+
+        const jid = String(job._id);
+        const jprev = jobsRm.get(jid) || { value: 0, extra: 0 };
+        jprev.value += Number(line.line_value || 0);
+        if (line.is_extra) jprev.extra += Number(line.line_value || 0);
+        jobsRm.set(jid, jprev);
       }
     }
 
@@ -343,6 +498,7 @@ const report = async (req, res) => {
       ? await CakeProduction.find({
           ustad_job_id: { $in: jobIds },
           isDeleted: false,
+          production_date: { $gte: start, $lte: end },
         }).populate("product_id", "name id unit price")
       : [];
 
@@ -373,25 +529,26 @@ const report = async (req, res) => {
       jobsFg.set(jid, jprev);
     }
 
-    const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
-    const round3 = (n) => Math.round(Number(n || 0) * 1000) / 1000;
-
-    const jobRows = jobs.map((job) => {
-      const fg = jobsFg.get(String(job._id)) || { qty: 0, value: 0, count: 0 };
-      const rmVal = Number(job.rm_value_issued || 0);
-      return {
-        _id: job._id,
-        job_code: job.job_code,
-        issue_date: job.issue_date,
-        status: job.status,
-        location: job.location_id?.name || "",
-        rm_value_issued: round2(rmVal),
-        fg_qty: round3(fg.qty),
-        fg_value: round2(fg.value),
-        fg_count: fg.count,
-        value_difference: round2(fg.value - rmVal),
-      };
-    });
+    const jobRows = jobs
+      .map((job) => {
+        const fg = jobsFg.get(String(job._id)) || { qty: 0, value: 0, count: 0 };
+        const rm = jobsRm.get(String(job._id)) || { value: 0, extra: 0 };
+        if (!rm.value && !fg.count) return null;
+        return {
+          _id: job._id,
+          job_code: job.job_code,
+          issue_date: job.issue_date,
+          status: job.status,
+          location: job.location_id?.name || "",
+          rm_value_issued: round2(rm.value),
+          extra_rm_value: round2(rm.extra),
+          fg_qty: round3(fg.qty),
+          fg_value: round2(fg.value),
+          fg_count: fg.count,
+          value_difference: round2(fg.value - rm.value),
+        };
+      })
+      .filter(Boolean);
 
     const rm_summary = Array.from(rmMap.values())
       .map((r) => ({
@@ -410,6 +567,7 @@ const report = async (req, res) => {
       .sort((a, b) => b.value - a.value);
 
     const rm_value_issued = jobRows.reduce((s, j) => s + j.rm_value_issued, 0);
+    const extra_rm_value = jobRows.reduce((s, j) => s + j.extra_rm_value, 0);
     const fg_qty_returned = jobRows.reduce((s, j) => s + j.fg_qty, 0);
     const fg_value_returned = jobRows.reduce((s, j) => s + j.fg_value, 0);
 
@@ -430,6 +588,7 @@ const report = async (req, res) => {
           open_jobs: jobRows.filter((j) => Number(j.status) === 1).length,
           closed_jobs: jobRows.filter((j) => Number(j.status) === 2).length,
           rm_value_issued: round2(rm_value_issued),
+          extra_rm_value: round2(extra_rm_value),
           fg_qty_returned: round3(fg_qty_returned),
           fg_value_returned: round2(fg_value_returned),
           value_difference: round2(fg_value_returned - rm_value_issued),
@@ -567,75 +726,16 @@ const create = async (req, res) => {
       return createError(res, err.status || 403, err.message);
     }
 
-    // Validate & snapshot prices for each line
-    const normalized = [];
-    for (let i = 0; i < lines.length; i++) {
-      const row = lines[i] || {};
-      const qty = Number(row.quantity);
-      if (!row.raw_material_id || !row.raw_material_stock_id) {
-        return createError(
-          res,
-          400,
-          `Line ${i + 1}: raw_material_id and raw_material_stock_id are required.`,
-        );
-      }
-      if (!Number.isFinite(qty) || qty <= 0) {
-        return createError(res, 400, `Line ${i + 1}: quantity must be > 0.`);
-      }
-
-      const [rm, stock] = await Promise.all([
-        RawMaterial.findById(row.raw_material_id).where({ isDeleted: false }),
-        RawMaterialStock.findById(row.raw_material_stock_id).where({
-          isDeleted: false,
-        }),
-      ]);
-      if (!rm) {
-        return createError(res, 404, `Line ${i + 1}: raw material not found.`);
-      }
-      if (!stock) {
-        return createError(res, 404, `Line ${i + 1}: stock batch not found.`);
-      }
-      if (Number(stock.purpose) !== 1) {
-        return createError(
-          res,
-          400,
-          `Line ${i + 1}: must use a purchase stock batch.`,
-        );
-      }
-      if (String(stock.raw_material_id) !== String(rm._id)) {
-        return createError(
-          res,
-          400,
-          `Line ${i + 1}: stock batch does not match raw material.`,
-        );
-      }
-      const remaining =
-        stock.remaining_quantity != null
-          ? Number(stock.remaining_quantity)
-          : Number(stock.quantity || 0) - Number(stock.out_quantity || 0);
-      if (qty > remaining) {
-        return createError(
-          res,
-          409,
-          `Line ${i + 1}: insufficient batch. Remaining ${remaining}, requested ${qty}.`,
-        );
-      }
-
-      const unit_price = Number(stock.price || rm.price || 0);
-      const line_value = Math.round(qty * unit_price * 100) / 100;
-      normalized.push({
-        raw_material_id: rm._id,
-        raw_material_stock_id: stock._id,
-        quantity: qty,
-        unit_price,
-        line_value,
-      });
+    let normalized;
+    try {
+      normalized = await snapshotRmLines(lines);
+    } catch (err) {
+      return createError(res, err.status || 400, err.message);
     }
 
-    const rm_value_issued =
-      Math.round(
-        normalized.reduce((s, r) => s + Number(r.line_value || 0), 0) * 100,
-      ) / 100;
+    const rm_value_issued = round2(
+      normalized.reduce((s, r) => s + Number(r.line_value || 0), 0),
+    );
 
     const planned = [];
     if (Array.isArray(planned_products)) {
@@ -672,46 +772,17 @@ const create = async (req, res) => {
         opts,
       );
 
-      const savedLines = [];
-      for (const row of normalized) {
-        const [dispatch] = await RawMaterialDispatch.create(
-          [
-            {
-              from_location_id: fromLoc._id,
-              location_id: toLoc._id,
-              location: toLoc.name,
-              raw_material_id: row.raw_material_id,
-              raw_material_stock_id: row.raw_material_stock_id,
-              quantity: row.quantity,
-              dispatch_date: new Date(issue_date),
-              notes: `Ustad Job ${job_code} · ${ustadName}`,
-              ustad_job_id: job._id,
-              isDeleted: false,
-            },
-          ],
-          opts,
-        );
-
-        await applyRawMaterialDispatchImpact({
-          rawMaterialId: row.raw_material_id,
-          quantity: row.quantity,
-          fromLocationId: fromLoc._id,
-          toLocationId: toLoc._id,
-          storeId: fromLoc.store_id ?? toLoc.store_id ?? null,
-          rawMaterialStockId: row.raw_material_stock_id,
-          referenceId: dispatch._id,
-          userId,
-          notes: `Ustad Job ${job_code} → ${toLoc.name} · ${ustadName}`,
-          session,
-        });
-
-        savedLines.push({
-          ...row,
-          dispatch_id: dispatch._id,
-        });
-      }
-
-      job.lines = savedLines;
+      job.lines = await issueRmLines({
+        job,
+        fromLoc,
+        toLoc,
+        ustadName,
+        userId,
+        rows: normalized,
+        issueDate: new Date(issue_date),
+        isExtra: false,
+        session,
+      });
       await job.save(opts);
 
       await writeAudit({
@@ -740,6 +811,108 @@ const create = async (req, res) => {
       res,
       err.status || 500,
       err.message || "Failed to create ustad job.",
+    );
+  }
+};
+
+/**
+ * POST /api/ustad-job/:id/rm
+ * Extra RM on an open job (weekly top-up, not a new job).
+ * Body: { issue_date?, lines: [{ raw_material_id, raw_material_stock_id, quantity }] }
+ */
+const addRm = async (req, res) => {
+  try {
+    const job = await UstadJob.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!job) return createError(res, 404, "Ustad job not found.");
+    if (Number(job.status) === JOB_STATUS.CLOSED) {
+      return createError(
+        res,
+        409,
+        "Job closed hai. Extra RM ke liye pehle reopen karein.",
+      );
+    }
+
+    const { lines, issue_date } = req.body || {};
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return createError(res, 400, "At least one RM line is required.");
+    }
+
+    const issuedAt = issue_date ? new Date(issue_date) : new Date();
+    if (Number.isNaN(issuedAt.getTime())) {
+      return createError(res, 400, "Invalid issue_date.");
+    }
+
+    try {
+      await assertRmManagerStoreAccess(req, [
+        job.from_location_id,
+        job.location_id,
+      ]);
+    } catch (err) {
+      return createError(res, err.status || 403, err.message);
+    }
+
+    const fromLoc = await DispatchLocation.findById(job.from_location_id).where({
+      isDeleted: false,
+    });
+    const toLoc = await DispatchLocation.findById(job.location_id).where({
+      isDeleted: false,
+    });
+    if (!fromLoc) return createError(res, 404, "RM Store not found.");
+    if (!toLoc) return createError(res, 404, "Production area not found.");
+
+    let normalized;
+    try {
+      normalized = await snapshotRmLines(lines);
+    } catch (err) {
+      return createError(res, err.status || 400, err.message);
+    }
+
+    const extraValue = round2(
+      normalized.reduce((s, r) => s + Number(r.line_value || 0), 0),
+    );
+    const userId = getUserId(req);
+
+    await withTransaction(async (session) => {
+      const saved = await issueRmLines({
+        job,
+        fromLoc,
+        toLoc,
+        ustadName: job.ustad_name,
+        userId,
+        rows: normalized,
+        issueDate: issuedAt,
+        isExtra: true,
+        session,
+      });
+      job.lines = [...(job.lines || []), ...saved];
+      job.rm_value_issued = round2(Number(job.rm_value_issued || 0) + extraValue);
+      await job.save({ session });
+      await writeAudit({
+        entityType: "UstadJob",
+        entityId: job._id,
+        action: "update",
+        newValue: { extra_rm: saved, extra_value: extraValue },
+        userId,
+        notes: `Extra RM Rs ${extraValue.toLocaleString("en-IN")} issued`,
+        session,
+      });
+    });
+
+    const populated = await populateJob(UstadJob.findById(job._id));
+    const summary = await buildSummary(populated);
+    return successMessage(
+      res,
+      summary,
+      `Extra RM Rs ${extraValue.toLocaleString("en-IN")} issued.`,
+    );
+  } catch (err) {
+    console.error("UstadJob addRm error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to issue extra RM.",
     );
   }
 };
@@ -945,6 +1118,7 @@ module.exports = {
   report,
   getOne,
   create,
+  addRm,
   close,
   reopen,
   remove,
