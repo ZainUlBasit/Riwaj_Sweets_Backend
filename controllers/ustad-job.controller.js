@@ -735,6 +735,7 @@ const report = async (req, res) => {
           _id: ustad._id,
           name: ustad.name,
           phone: ustad.phone || "",
+          salary: round2(Number(ustad.salary || 0)),
         },
         range: { start_date, end_date },
         jobs: jobRows,

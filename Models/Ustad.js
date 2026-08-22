@@ -23,6 +23,12 @@ const UstadSchema = new Schema(
       trim: true,
       default: "",
     },
+    /** Monthly salary (PKR). */
+    salary: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     /** Optional godown scope for RM managers. */
     store_id: {
       type: Schema.Types.ObjectId,
