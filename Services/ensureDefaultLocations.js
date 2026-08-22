@@ -13,8 +13,16 @@ const findByExactName = (name) =>
 /**
  * Ensure a named default location exists (active). Soft-deleted matches
  * with the same type are restored instead of creating a duplicate.
+ *
+ * @param {number} minCountForType — if this many (or more) locations of
+ *   `location_type` already exist, skip creating a missing default name
+ *   (user may have renamed "Shop 1" without wanting a new "Shop 1").
  */
-async function ensureNamedLocation(mainId, { name, location_type, description }) {
+async function ensureNamedLocation(
+  mainId,
+  { name, location_type, description },
+  minCountForType = 1,
+) {
   const nameRe = new RegExp(`^${escapeRe(name)}$`, "i");
 
   const softDeleted = await DispatchLocation.findOne({
@@ -38,6 +46,14 @@ async function ensureNamedLocation(mainId, { name, location_type, description })
       await existing.save();
     }
     return existing;
+  }
+
+  const typeCount = await DispatchLocation.countDocuments({
+    location_type,
+    isDeleted: false,
+  });
+  if (typeCount >= minCountForType) {
+    return null;
   }
 
   return DispatchLocation.create({
@@ -132,8 +148,13 @@ async function ensureDefaultLocations() {
     },
   ];
 
+  const quotaByType = defaults.reduce((acc, d) => {
+    acc[d.location_type] = (acc[d.location_type] || 0) + 1;
+    return acc;
+  }, {});
+
   for (const d of defaults) {
-    await ensureNamedLocation(main._id, d);
+    await ensureNamedLocation(main._id, d, quotaByType[d.location_type]);
   }
 
   // Legacy singular "Product Store" (older seed) — restore if soft-deleted so
