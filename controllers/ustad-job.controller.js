@@ -736,6 +736,8 @@ const report = async (req, res) => {
           name: ustad.name,
           phone: ustad.phone || "",
           salary: round2(Number(ustad.salary || 0)),
+          bejli_expense: round2(Number(ustad.bejli_expense || 0)),
+          meal_expense: round2(Number(ustad.meal_expense || 0)),
         },
         range: { start_date, end_date },
         jobs: jobRows,

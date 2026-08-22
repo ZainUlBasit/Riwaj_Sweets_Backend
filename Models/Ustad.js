@@ -29,6 +29,18 @@ const UstadSchema = new Schema(
       default: 0,
       min: 0,
     },
+    /** Monthly bejli / electricity expense (PKR). */
+    bejli_expense: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    /** Monthly meal expense (PKR). */
+    meal_expense: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     /** Optional godown scope for RM managers. */
     store_id: {
       type: Schema.Types.ObjectId,

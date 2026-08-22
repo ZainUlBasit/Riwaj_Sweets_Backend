@@ -2,13 +2,12 @@ const Ustad = require("../Models/Ustad");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const { getAssignedStoreId } = require("../utils/storeScope");
 
-const parseSalary = (raw) => {
+const parseMoney = (raw) => {
   if (raw === undefined || raw === null || raw === "") return 0;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return null;
   return Math.round(n * 100) / 100;
 };
-
 /**
  * GET /api/ustad
  */
@@ -62,13 +61,30 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, phone, notes, store_id, isActive, salary } = req.body || {};
+    const {
+      name,
+      phone,
+      notes,
+      store_id,
+      isActive,
+      salary,
+      bejli_expense,
+      meal_expense,
+    } = req.body || {};
     const trimmed = String(name || "").trim();
     if (!trimmed) return createError(res, 400, "Ustad name is required.");
 
-    const parsedSalary = parseSalary(salary);
+    const parsedSalary = parseMoney(salary);
+    const parsedBejli = parseMoney(bejli_expense);
+    const parsedMeal = parseMoney(meal_expense);
     if (parsedSalary === null) {
       return createError(res, 400, "Valid salary enter karein (0 ya zyada).");
+    }
+    if (parsedBejli === null) {
+      return createError(res, 400, "Valid bejli expense enter karein (0 ya zyada).");
+    }
+    if (parsedMeal === null) {
+      return createError(res, 400, "Valid meal expense enter karein (0 ya zyada).");
     }
 
     const assignedStoreId = getAssignedStoreId(req);
@@ -91,6 +107,8 @@ const create = async (req, res) => {
       phone: String(phone || "").trim(),
       notes: String(notes || "").trim(),
       salary: parsedSalary,
+      bejli_expense: parsedBejli,
+      meal_expense: parsedMeal,
       store_id: storeId,
       isActive: isActive === false ? false : true,
       isDeleted: false,
@@ -110,7 +128,16 @@ const update = async (req, res) => {
     });
     if (!existing) return createError(res, 404, "Ustad not found.");
 
-    const { name, phone, notes, store_id, isActive, salary } = req.body || {};
+    const {
+      name,
+      phone,
+      notes,
+      store_id,
+      isActive,
+      salary,
+      bejli_expense,
+      meal_expense,
+    } = req.body || {};
     const payload = {};
     if (name !== undefined) {
       const trimmed = String(name || "").trim();
@@ -120,11 +147,25 @@ const update = async (req, res) => {
     if (phone !== undefined) payload.phone = String(phone || "").trim();
     if (notes !== undefined) payload.notes = String(notes || "").trim();
     if (salary !== undefined) {
-      const parsedSalary = parseSalary(salary);
+      const parsedSalary = parseMoney(salary);
       if (parsedSalary === null) {
         return createError(res, 400, "Valid salary enter karein (0 ya zyada).");
       }
       payload.salary = parsedSalary;
+    }
+    if (bejli_expense !== undefined) {
+      const parsedBejli = parseMoney(bejli_expense);
+      if (parsedBejli === null) {
+        return createError(res, 400, "Valid bejli expense enter karein (0 ya zyada).");
+      }
+      payload.bejli_expense = parsedBejli;
+    }
+    if (meal_expense !== undefined) {
+      const parsedMeal = parseMoney(meal_expense);
+      if (parsedMeal === null) {
+        return createError(res, 400, "Valid meal expense enter karein (0 ya zyada).");
+      }
+      payload.meal_expense = parsedMeal;
     }
     if (store_id !== undefined) payload.store_id = store_id || null;
     if (isActive !== undefined) payload.isActive = !!isActive;
