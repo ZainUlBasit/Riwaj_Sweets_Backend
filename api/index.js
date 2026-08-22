@@ -126,6 +126,17 @@ async function connectToDatabase() {
     return cached.conn;
   }
 
+  const uri =
+    process.env.MONGOOSEURL ||
+    process.env.MONGODB_URI ||
+    process.env.MONGO_URI;
+
+  if (!uri || typeof uri !== "string") {
+    throw new Error(
+      "MongoDB URI missing. Set MONGOOSEURL (or MONGODB_URI) in environment variables.",
+    );
+  }
+
   if (!cached.promise) {
     const opts = {
       bufferCommands: false,
@@ -137,7 +148,7 @@ async function connectToDatabase() {
     };
 
     cached.promise = mongoose
-      .connect(process.env.MONGOOSEURL, opts)
+      .connect(uri, opts)
       .then((mongoose) => {
         console.log("✅ Database connected");
         return mongoose;
