@@ -3,6 +3,8 @@ const UstadJob = require("../Models/UstadJob");
 const { JOB_STATUS } = require("../Models/UstadJob");
 const Ustad = require("../Models/Ustad");
 const CakeProduction = require("../Models/CakeProduction");
+const ProductTransfer = require("../Models/ProductTransfer");
+const { TRANSFER_STATUS } = require("../Models/ProductTransfer");
 const RawMaterial = require("../Models/RawMaterial");
 const RawMaterialStock = require("../Models/RawMaterialStock");
 const RawMaterialDispatch = require("../Models/RawMaterialDispatch");
@@ -566,10 +568,80 @@ const report = async (req, res) => {
       }))
       .sort((a, b) => b.value - a.value);
 
+    const fgProductIds = Array.from(fgMap.keys());
+    const shopMap = new Map();
+    const shopDestMap = new Map();
+    if (fgProductIds.length) {
+      const transferFilter = {
+        isDeleted: false,
+        product_id: { $in: fgProductIds },
+        transfer_date: { $gte: start, $lte: end },
+        status: { $ne: TRANSFER_STATUS.CANCELLED },
+      };
+      const scopedTransferFilter = await applyStoreLocationFilter(
+        req,
+        transferFilter,
+        "from_location_id",
+      );
+      const transfers = await ProductTransfer.find(scopedTransferFilter)
+        .populate("product_id", "name unit price")
+        .populate("to_location_id", "name");
+
+      for (const t of transfers) {
+        const qty = Number(t.quantity || 0);
+        const pid = String(t.product_id?._id || t.product_id || "");
+        const unitPrice = Number(t.product_id?.price || 0);
+        const value = round2(qty * unitPrice);
+
+        if (pid) {
+          const prev = shopMap.get(pid) || {
+            product_id: pid,
+            name: t.product_id?.name || "Product",
+            unit: t.product_id?.unit ?? null,
+            quantity: 0,
+            value: 0,
+          };
+          prev.quantity += qty;
+          prev.value += value;
+          shopMap.set(pid, prev);
+        }
+
+        const destId = String(t.to_location_id?._id || t.to_location_id || "");
+        const destName = t.to_location_id?.name || "Shop";
+        const dprev = shopDestMap.get(destId || destName) || {
+          to_location_id: destId || null,
+          name: destName,
+          quantity: 0,
+          value: 0,
+        };
+        dprev.quantity += qty;
+        dprev.value += value;
+        shopDestMap.set(destId || destName, dprev);
+      }
+    }
+
+    const shop_summary = Array.from(shopMap.values())
+      .map((r) => ({
+        ...r,
+        quantity: round3(r.quantity),
+        value: round2(r.value),
+      }))
+      .sort((a, b) => b.value - a.value);
+
+    const shop_destination_summary = Array.from(shopDestMap.values())
+      .map((r) => ({
+        ...r,
+        quantity: round3(r.quantity),
+        value: round2(r.value),
+      }))
+      .sort((a, b) => b.value - a.value);
+
     const rm_value_issued = jobRows.reduce((s, j) => s + j.rm_value_issued, 0);
     const extra_rm_value = jobRows.reduce((s, j) => s + j.extra_rm_value, 0);
     const fg_qty_returned = jobRows.reduce((s, j) => s + j.fg_qty, 0);
     const fg_value_returned = jobRows.reduce((s, j) => s + j.fg_value, 0);
+    const shop_qty_sent = shop_summary.reduce((s, r) => s + r.quantity, 0);
+    const shop_value_sent = shop_summary.reduce((s, r) => s + r.value, 0);
 
     return successMessage(
       res,
@@ -583,6 +655,8 @@ const report = async (req, res) => {
         jobs: jobRows,
         rm_summary,
         fg_summary,
+        shop_summary,
+        shop_destination_summary,
         totals: {
           jobs_count: jobRows.length,
           open_jobs: jobRows.filter((j) => Number(j.status) === 1).length,
@@ -591,6 +665,8 @@ const report = async (req, res) => {
           extra_rm_value: round2(extra_rm_value),
           fg_qty_returned: round3(fg_qty_returned),
           fg_value_returned: round2(fg_value_returned),
+          shop_qty_sent: round3(shop_qty_sent),
+          shop_value_sent: round2(shop_value_sent),
           value_difference: round2(fg_value_returned - rm_value_issued),
         },
       },
