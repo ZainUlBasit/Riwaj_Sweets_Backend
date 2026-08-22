@@ -23,7 +23,7 @@ const UstadSchema = new Schema(
       trim: true,
       default: "",
     },
-    /** Monthly salary (PKR). */
+    /** Daily salary (PKR). */
     salary: {
       type: Number,
       default: 0,
