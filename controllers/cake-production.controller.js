@@ -23,6 +23,7 @@ const {
   findProductionArea,
   executeStoreReceipt,
   reverseStoreReceipt,
+  getLocationInventoryQty,
   withTransaction,
 } = require("../Services/inventoryService");
 const { assertRmManagerStoreAccess, applyStoreLocationFilter, getAssignedStoreId } = require("../utils/storeScope");
@@ -184,13 +185,17 @@ async function applyProductionImpact({
 
   if (cakes > 0) {
     let fgStore = productStoreLocation || null;
-    if (
-      fgStore &&
-      Number(fgStore.location_type) !== LOCATION_TYPE.FINISHED_GOODS_STORE
-    ) {
-      const err = new Error("to_location_id must be a Product Store.");
-      err.status = 400;
-      throw err;
+    if (fgStore) {
+      const destType = Number(fgStore.location_type);
+      const isProductStore = destType === LOCATION_TYPE.FINISHED_GOODS_STORE;
+      const isShop = destType === LOCATION_TYPE.SHOP;
+      if (!isProductStore && !isShop) {
+        const err = new Error(
+          "to_location_id must be a Product Store or Shop.",
+        );
+        err.status = 400;
+        throw err;
+      }
     }
     if (!fgStore && productionLocation?.store_id) {
       fgStore = await findFinishedGoodsStore(
@@ -199,8 +204,14 @@ async function applyProductionImpact({
       );
     }
 
+    const isShopDest =
+      fgStore && Number(fgStore.location_type) === LOCATION_TYPE.SHOP;
+    const stockInvType = fgStore
+      ? isShopDest
+        ? INV_TYPE.SHOP
+        : INV_TYPE.STORE
+      : INV_TYPE.PRODUCTION;
     const stockLocationId = fgStore?._id ?? productionLocation?._id ?? null;
-    const stockInvType = fgStore ? INV_TYPE.STORE : INV_TYPE.PRODUCTION;
 
     const [createdStock] = await ProductStock.create(
       [
@@ -240,23 +251,84 @@ async function applyProductionImpact({
           INV_TYPE.PRODUCTION,
           session,
         );
-        storeReceipt = await executeStoreReceipt({
-          fromLocationId: productionLocation._id,
-          toLocationId: fgStore._id,
-          productId: product._id,
-          quantity: cakes,
-          receiptDate: productionDate,
-          userId,
-          referenceType: "CakeProduction",
-          referenceId,
-          notes: `Auto from ${productionLocation.name}${
-            ustadName ? ` · Ustad: ${ustadName}` : ""
-          }`,
-          cakeProductionId: referenceId,
-          ustadName,
-          ustadId,
-          session,
-        });
+        if (isShopDest) {
+          const shopPrev = await getLocationInventoryQty(
+            fgStore._id,
+            product._id,
+            INV_TYPE.SHOP,
+            session,
+          );
+          await adjustLocationInventory(
+            productionLocation._id,
+            product._id,
+            -cakes,
+            INV_TYPE.PRODUCTION,
+            session,
+          );
+          await adjustLocationInventory(
+            fgStore._id,
+            product._id,
+            cakes,
+            INV_TYPE.SHOP,
+            session,
+          );
+          await writeLedger(
+            {
+              transactionType: TX.SHOP_TRANSFER,
+              direction: DIR.OUT,
+              productId: product._id,
+              quantity: cakes,
+              locationId: productionLocation._id,
+              storeId: productionLocation.store_id ?? null,
+              referenceType: "CakeProduction",
+              referenceId,
+              userId,
+              notes: `Ustad receive → ${fgStore.name}${
+                ustadName ? ` · Ustad: ${ustadName}` : ""
+              }`,
+              previousBalance: cakes,
+              newBalance: 0,
+            },
+            session,
+          );
+          await writeLedger(
+            {
+              transactionType: TX.SHOP_TRANSFER,
+              direction: DIR.IN,
+              productId: product._id,
+              quantity: cakes,
+              locationId: fgStore._id,
+              storeId: fgStore.store_id ?? null,
+              referenceType: "CakeProduction",
+              referenceId,
+              userId,
+              notes: `Ustad receive ← ${productionLocation.name}${
+                ustadName ? ` · Ustad: ${ustadName}` : ""
+              }`,
+              previousBalance: shopPrev,
+              newBalance: shopPrev + cakes,
+            },
+            session,
+          );
+        } else {
+          storeReceipt = await executeStoreReceipt({
+            fromLocationId: productionLocation._id,
+            toLocationId: fgStore._id,
+            productId: product._id,
+            quantity: cakes,
+            receiptDate: productionDate,
+            userId,
+            referenceType: "CakeProduction",
+            referenceId,
+            notes: `Auto from ${productionLocation.name}${
+              ustadName ? ` · Ustad: ${ustadName}` : ""
+            }`,
+            cakeProductionId: referenceId,
+            ustadName,
+            ustadId,
+            session,
+          });
+        }
       } else {
         await adjustLocationInventory(
           productionLocation._id,
@@ -430,19 +502,29 @@ const create = async (req, res) => {
         return createError(
           res,
           400,
-          "Product Store select karein — finished goods kahan add honge.",
+          linkedJob
+            ? "Shop select karein — finished goods kahan add honge."
+            : "Product Store select karein — finished goods kahan add honge.",
         );
       }
       productStoreLocation = await DispatchLocation.findById(fgLocationId).where({
         isDeleted: false,
       });
       if (!productStoreLocation) {
-        return createError(res, 404, "Product Store not found.");
+        return createError(
+          res,
+          404,
+          linkedJob ? "Shop not found." : "Product Store not found.",
+        );
       }
-      if (
-        Number(productStoreLocation.location_type) !==
-        LOCATION_TYPE.FINISHED_GOODS_STORE
-      ) {
+      const destType = Number(productStoreLocation.location_type);
+      const isProductStore = destType === LOCATION_TYPE.FINISHED_GOODS_STORE;
+      const isShop = destType === LOCATION_TYPE.SHOP;
+      if (linkedJob) {
+        if (!isShop) {
+          return createError(res, 400, "to_location_id must be a Shop.");
+        }
+      } else if (!isProductStore) {
         return createError(res, 400, "to_location_id must be a Product Store.");
       }
       try {

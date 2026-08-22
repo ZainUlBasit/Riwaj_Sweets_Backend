@@ -269,6 +269,11 @@ const buildSummary = async (job) => {
   })
     .populate("product_id", "name id unit price")
     .populate({
+      path: "product_stock_id",
+      select: "location_id",
+      populate: { path: "location_id", select: "name" },
+    })
+    .populate({
       path: "store_receipt_id",
       select: "receipt_code quantity ustad_name receipt_date to_location_id",
       populate: { path: "to_location_id", select: "name" },
@@ -289,7 +294,10 @@ const buildSummary = async (job) => {
       unit_price: unitPrice,
       line_value: Math.round(qty * unitPrice * 100) / 100,
       receipt_code: p.store_receipt_id?.receipt_code || null,
-      store_name: p.store_receipt_id?.to_location_id?.name || null,
+      store_name:
+        p.store_receipt_id?.to_location_id?.name ||
+        p.product_stock_id?.location_id?.name ||
+        null,
       ustad_name: p.ustad_name || job.ustad_name,
     };
   });
