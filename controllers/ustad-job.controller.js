@@ -113,6 +113,22 @@ function inDateRange(dateVal, start, end) {
   return d >= start && d <= end;
 }
 
+function toDateStr(dateVal) {
+  if (!dateVal) return "";
+  const d = new Date(dateVal);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toISOString().slice(0, 10);
+}
+
+function sortByDateThenName(rows, dateKey = "date", nameKey = "name") {
+  return rows.sort((a, b) => {
+    const da = String(a[dateKey] || "");
+    const db = String(b[dateKey] || "");
+    if (da !== db) return da.localeCompare(db);
+    return String(a[nameKey] || "").localeCompare(String(b[nameKey] || ""));
+  });
+}
+
 async function snapshotRmLines(lines) {
   const normalized = [];
   for (let i = 0; i < lines.length; i++) {
@@ -471,11 +487,15 @@ const report = async (req, res) => {
 
     const rmMap = new Map();
     const jobsRm = new Map();
+    const rmDetails = [];
     for (const job of jobs) {
       for (const line of job.lines || []) {
-        if (!inDateRange(lineIssuedAt(line, job), start, end)) continue;
+        const issuedAt = lineIssuedAt(line, job);
+        if (!inDateRange(issuedAt, start, end)) continue;
         const id = String(line.raw_material_id?._id || line.raw_material_id || "");
         if (!id) continue;
+        const qty = Number(line.quantity || 0);
+        const value = Number(line.line_value || 0);
         const prev = rmMap.get(id) || {
           raw_material_id: id,
           name: line.raw_material_id?.name || "RM",
@@ -483,14 +503,24 @@ const report = async (req, res) => {
           quantity: 0,
           value: 0,
         };
-        prev.quantity += Number(line.quantity || 0);
-        prev.value += Number(line.line_value || 0);
+        prev.quantity += qty;
+        prev.value += value;
         rmMap.set(id, prev);
+
+        rmDetails.push({
+          date: toDateStr(issuedAt),
+          raw_material_id: id,
+          name: line.raw_material_id?.name || "RM",
+          unit: line.raw_material_id?.unit ?? null,
+          quantity: round3(qty),
+          value: round2(value),
+          job_code: job.job_code || "",
+        });
 
         const jid = String(job._id);
         const jprev = jobsRm.get(jid) || { value: 0, extra: 0 };
-        jprev.value += Number(line.line_value || 0);
-        if (line.is_extra) jprev.extra += Number(line.line_value || 0);
+        jprev.value += value;
+        if (line.is_extra) jprev.extra += value;
         jobsRm.set(jid, jprev);
       }
     }
@@ -504,8 +534,12 @@ const report = async (req, res) => {
         }).populate("product_id", "name id unit price")
       : [];
 
+    const jobCodeById = new Map(
+      jobs.map((j) => [String(j._id), j.job_code || ""]),
+    );
     const fgMap = new Map();
     const jobsFg = new Map();
+    const fgDetails = [];
     for (const p of productions) {
       const qty = Number(p.cakes_produced || 0);
       const unitPrice = Number(p.product_id?.price || 0);
@@ -523,6 +557,18 @@ const report = async (req, res) => {
         prev.value += value;
         fgMap.set(pid, prev);
       }
+
+      const job = jobs.find((j) => String(j._id) === String(p.ustad_job_id));
+      fgDetails.push({
+        date: toDateStr(p.production_date),
+        product_id: pid,
+        name: p.product_id?.name || "Product",
+        unit: p.product_id?.unit ?? null,
+        quantity: round3(qty),
+        value: round2(value),
+        job_code: jobCodeById.get(String(p.ustad_job_id)) || "",
+      });
+
       const jid = String(p.ustad_job_id);
       const jprev = jobsFg.get(jid) || { qty: 0, value: 0, count: 0 };
       jprev.qty += qty;
@@ -571,6 +617,8 @@ const report = async (req, res) => {
     const fgProductIds = Array.from(fgMap.keys());
     const shopMap = new Map();
     const shopDestMap = new Map();
+    const shopDetails = [];
+    const shopDestDetailsMap = new Map();
     if (fgProductIds.length) {
       const transferFilter = {
         isDeleted: false,
@@ -592,6 +640,9 @@ const report = async (req, res) => {
         const pid = String(t.product_id?._id || t.product_id || "");
         const unitPrice = Number(t.product_id?.price || 0);
         const value = round2(qty * unitPrice);
+        const transferDate = toDateStr(t.transfer_date);
+        const destId = String(t.to_location_id?._id || t.to_location_id || "");
+        const destName = t.to_location_id?.name || "Shop";
 
         if (pid) {
           const prev = shopMap.get(pid) || {
@@ -606,8 +657,17 @@ const report = async (req, res) => {
           shopMap.set(pid, prev);
         }
 
-        const destId = String(t.to_location_id?._id || t.to_location_id || "");
-        const destName = t.to_location_id?.name || "Shop";
+        shopDetails.push({
+          date: transferDate,
+          product_id: pid,
+          name: t.product_id?.name || "Product",
+          shop_name: destName,
+          unit: t.product_id?.unit ?? null,
+          quantity: round3(qty),
+          value,
+          transfer_code: t.transfer_code || "",
+        });
+
         const dprev = shopDestMap.get(destId || destName) || {
           to_location_id: destId || null,
           name: destName,
@@ -617,6 +677,18 @@ const report = async (req, res) => {
         dprev.quantity += qty;
         dprev.value += value;
         shopDestMap.set(destId || destName, dprev);
+
+        const destDetailKey = `${transferDate}|${destId || destName}`;
+        const ddprev = shopDestDetailsMap.get(destDetailKey) || {
+          date: transferDate,
+          to_location_id: destId || null,
+          name: destName,
+          quantity: 0,
+          value: 0,
+        };
+        ddprev.quantity += qty;
+        ddprev.value += value;
+        shopDestDetailsMap.set(destDetailKey, ddprev);
       }
     }
 
@@ -635,6 +707,19 @@ const report = async (req, res) => {
         value: round2(r.value),
       }))
       .sort((a, b) => b.value - a.value);
+
+    const rm_details = sortByDateThenName(rmDetails);
+    const fg_details = sortByDateThenName(fgDetails);
+    const shop_details = sortByDateThenName(shopDetails, "date", "name");
+    const shop_destination_details = sortByDateThenName(
+      Array.from(shopDestDetailsMap.values()).map((r) => ({
+        ...r,
+        quantity: round3(r.quantity),
+        value: round2(r.value),
+      })),
+      "date",
+      "name",
+    );
 
     const rm_value_issued = jobRows.reduce((s, j) => s + j.rm_value_issued, 0);
     const extra_rm_value = jobRows.reduce((s, j) => s + j.extra_rm_value, 0);
@@ -657,6 +742,10 @@ const report = async (req, res) => {
         fg_summary,
         shop_summary,
         shop_destination_summary,
+        rm_details,
+        fg_details,
+        shop_details,
+        shop_destination_details,
         totals: {
           jobs_count: jobRows.length,
           open_jobs: jobRows.filter((j) => Number(j.status) === 1).length,
