@@ -129,55 +129,6 @@ function sortByDateThenName(rows, dateKey = "date", nameKey = "name") {
   });
 }
 
-function buildDayTotals(rmDetails, fgDetails, shopDetails) {
-  const dayMap = new Map();
-  const ensure = (date) => {
-    if (!date) return null;
-    if (!dayMap.has(date)) {
-      dayMap.set(date, {
-        date,
-        rm_value: 0,
-        fg_qty: 0,
-        fg_value: 0,
-        shop_qty: 0,
-        shop_value: 0,
-      });
-    }
-    return dayMap.get(date);
-  };
-
-  for (const r of rmDetails) {
-    const d = ensure(r.date);
-    if (d) d.rm_value += Number(r.value || 0);
-  }
-  for (const r of fgDetails) {
-    const d = ensure(r.date);
-    if (d) {
-      d.fg_qty += Number(r.quantity || 0);
-      d.fg_value += Number(r.value || 0);
-    }
-  }
-  for (const r of shopDetails) {
-    const d = ensure(r.date);
-    if (d) {
-      d.shop_qty += Number(r.quantity || 0);
-      d.shop_value += Number(r.value || 0);
-    }
-  }
-
-  return Array.from(dayMap.values())
-    .map((d) => ({
-      date: d.date,
-      rm_value: round2(d.rm_value),
-      fg_qty: round3(d.fg_qty),
-      fg_value: round2(d.fg_value),
-      shop_qty: round3(d.shop_qty),
-      shop_value: round2(d.shop_value),
-      value_difference: round2(d.fg_value - d.rm_value),
-    }))
-    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
-}
-
 async function snapshotRmLines(lines) {
   const normalized = [];
   for (let i = 0; i < lines.length; i++) {
@@ -770,8 +721,6 @@ const report = async (req, res) => {
       "name",
     );
 
-    const day_totals = buildDayTotals(rm_details, fg_details, shop_details);
-
     const rm_value_issued = jobRows.reduce((s, j) => s + j.rm_value_issued, 0);
     const extra_rm_value = jobRows.reduce((s, j) => s + j.extra_rm_value, 0);
     const fg_qty_returned = jobRows.reduce((s, j) => s + j.fg_qty, 0);
@@ -797,7 +746,6 @@ const report = async (req, res) => {
         fg_details,
         shop_details,
         shop_destination_details,
-        day_totals,
         totals: {
           jobs_count: jobRows.length,
           open_jobs: jobRows.filter((j) => Number(j.status) === 1).length,
