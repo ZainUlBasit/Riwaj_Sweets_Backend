@@ -41,6 +41,12 @@ const UstadSchema = new Schema(
       default: 0,
       min: 0,
     },
+    /** Daily tea (tae) expense (PKR). */
+    tea_expense: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     /** Optional godown scope for RM managers. */
     store_id: {
       type: Schema.Types.ObjectId,

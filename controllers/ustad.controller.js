@@ -70,6 +70,7 @@ const create = async (req, res) => {
       salary,
       bejli_expense,
       meal_expense,
+      tea_expense,
     } = req.body || {};
     const trimmed = String(name || "").trim();
     if (!trimmed) return createError(res, 400, "Ustad name is required.");
@@ -77,6 +78,7 @@ const create = async (req, res) => {
     const parsedSalary = parseMoney(salary);
     const parsedBejli = parseMoney(bejli_expense);
     const parsedMeal = parseMoney(meal_expense);
+    const parsedTea = parseMoney(tea_expense);
     if (parsedSalary === null) {
       return createError(res, 400, "Valid salary enter karein (0 ya zyada).");
     }
@@ -85,6 +87,9 @@ const create = async (req, res) => {
     }
     if (parsedMeal === null) {
       return createError(res, 400, "Valid meal expense enter karein (0 ya zyada).");
+    }
+    if (parsedTea === null) {
+      return createError(res, 400, "Valid tae expense enter karein (0 ya zyada).");
     }
 
     const assignedStoreId = getAssignedStoreId(req);
@@ -109,6 +114,7 @@ const create = async (req, res) => {
       salary: parsedSalary,
       bejli_expense: parsedBejli,
       meal_expense: parsedMeal,
+      tea_expense: parsedTea,
       store_id: storeId,
       isActive: isActive === false ? false : true,
       isDeleted: false,
@@ -137,6 +143,7 @@ const update = async (req, res) => {
       salary,
       bejli_expense,
       meal_expense,
+      tea_expense,
     } = req.body || {};
     const payload = {};
     if (name !== undefined) {
@@ -166,6 +173,13 @@ const update = async (req, res) => {
         return createError(res, 400, "Valid meal expense enter karein (0 ya zyada).");
       }
       payload.meal_expense = parsedMeal;
+    }
+    if (tea_expense !== undefined) {
+      const parsedTea = parseMoney(tea_expense);
+      if (parsedTea === null) {
+        return createError(res, 400, "Valid tae expense enter karein (0 ya zyada).");
+      }
+      payload.tea_expense = parsedTea;
     }
     if (store_id !== undefined) payload.store_id = store_id || null;
     if (isActive !== undefined) payload.isActive = !!isActive;
