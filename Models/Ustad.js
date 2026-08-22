@@ -29,13 +29,13 @@ const UstadSchema = new Schema(
       default: 0,
       min: 0,
     },
-    /** Monthly bejli / electricity expense (PKR). */
+    /** Daily bejli / electricity expense (PKR). */
     bejli_expense: {
       type: Number,
       default: 0,
       min: 0,
     },
-    /** Monthly meal expense (PKR). */
+    /** Daily meal expense (PKR). */
     meal_expense: {
       type: Number,
       default: 0,
