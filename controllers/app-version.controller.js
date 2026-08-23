@@ -9,7 +9,7 @@ const getAppVersion = async (req, res) => {
     const latestVersion = "1.0.8";
     const minimumVersion = "1.0.7";
     const forceUpdate = true;
-    const downloadUrl = "https://drive.google.com/file/d/1nBoorMcjC12s1uooGG6nzDTvROHUfi9H/view?usp=sharing";
+    const downloadUrl = "https://drive.google.com/file/d/1nBoorMcjC12s1uooGG6nzDTvROHUfi9H";
     // Get the latest version from the database
 
     return res.status(200).json({
