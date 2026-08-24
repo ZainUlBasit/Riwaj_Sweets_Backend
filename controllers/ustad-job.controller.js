@@ -467,33 +467,13 @@ const listOpen = async (req, res) => {
 };
 
 /**
- * GET /api/ustad-job/report?ustad_id=&start_date=&end_date=
- * Weekly / monthly hisaab for one ustad: RM issued + FG returned.
+ * Build one ustad report payload (shared by /report and /report-all).
+ * Same hisaab logic — do not diverge.
  */
-const report = async (req, res) => {
-  try {
-    const { ustad_id, start_date, end_date } = req.query || {};
-    if (!ustad_id) {
-      return createError(res, 400, "Ustad select karein.");
-    }
-    if (!start_date || !end_date) {
-      return createError(res, 400, "Date range required.");
-    }
-
-    const ustad = await Ustad.findById(ustad_id).where({ isDeleted: false });
-    if (!ustad) return createError(res, 404, "Ustad not found.");
-
-    const start = new Date(start_date);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(end_date);
-    end.setHours(23, 59, 59, 999);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
-      return createError(res, 400, "Invalid date range.");
-    }
-
+async function buildOneUstadReportPayload(req, ustad, start_date, end_date, start, end) {
     const baseFilter = {
       isDeleted: false,
-      ustad_id,
+      ustad_id: ustad._id,
     };
     const scopedFilter = await applyStoreLocationFilter(
       req,
@@ -748,9 +728,7 @@ const report = async (req, res) => {
     const shop_qty_sent = shop_summary.reduce((s, r) => s + r.quantity, 0);
     const shop_value_sent = shop_summary.reduce((s, r) => s + r.value, 0);
 
-    return successMessage(
-      res,
-      {
+    return {
         ustad: {
           _id: ustad._id,
           name: ustad.name,
@@ -782,12 +760,98 @@ const report = async (req, res) => {
           shop_value_sent: round2(shop_value_sent),
           value_difference: round2(fg_value_returned - rm_value_issued),
         },
-      },
-      "Ustad report fetched.",
+    };
+}
+
+/**
+ * GET /api/ustad-job/report?ustad_id=&start_date=&end_date=
+ * Weekly / monthly hisaab for one ustad: RM issued + FG returned.
+ */
+const report = async (req, res) => {
+  try {
+    const { ustad_id, start_date, end_date } = req.query || {};
+    if (!ustad_id) {
+      return createError(res, 400, "Ustad select karein.");
+    }
+    if (!start_date || !end_date) {
+      return createError(res, 400, "Date range required.");
+    }
+
+    const ustad = await Ustad.findById(ustad_id).where({ isDeleted: false });
+    if (!ustad) return createError(res, 404, "Ustad not found.");
+
+    const start = new Date(start_date);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(end_date);
+    end.setHours(23, 59, 59, 999);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+      return createError(res, 400, "Invalid date range.");
+    }
+
+    const payload = await buildOneUstadReportPayload(
+      req,
+      ustad,
+      start_date,
+      end_date,
+      start,
+      end,
     );
+    return successMessage(res, payload, "Ustad report fetched.");
   } catch (err) {
     console.error("UstadJob report error:", err);
     return createError(res, 500, err.message || "Failed to generate ustad report.");
+  }
+};
+
+/**
+ * GET /api/ustad-job/report-all?start_date=&end_date=
+ * Same per-ustad report payload for every registered ustad (one response).
+ */
+const reportAll = async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query || {};
+    if (!start_date || !end_date) {
+      return createError(res, 400, "Date range required.");
+    }
+
+    const start = new Date(start_date);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(end_date);
+    end.setHours(23, 59, 59, 999);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+      return createError(res, 400, "Invalid date range.");
+    }
+
+    const ustads = await Ustad.find({ isDeleted: false }).sort({ name: 1 });
+    const items = [];
+    for (const ustad of ustads) {
+      const payload = await buildOneUstadReportPayload(
+        req,
+        ustad,
+        start_date,
+        end_date,
+        start,
+        end,
+      );
+      items.push(payload);
+    }
+
+    return successMessage(
+      res,
+      {
+        range: { start_date, end_date },
+        ustads_count: items.length,
+        items,
+      },
+      `All ustads report fetched (${items.length}).`,
+    );
+  } catch (err) {
+    console.error("UstadJob reportAll error:", err);
+    return createError(
+      res,
+      500,
+      err.message || "Failed to generate all-ustads report.",
+    );
   }
 };
 
@@ -1625,6 +1689,7 @@ module.exports = {
   list,
   listOpen,
   report,
+  reportAll,
   getOne,
   create,
   addRm,

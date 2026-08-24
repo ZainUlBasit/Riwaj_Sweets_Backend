@@ -7,6 +7,7 @@ router.use(verifyToken);
 router.get("/", controller.list);
 router.get("/open", controller.listOpen);
 router.get("/report", controller.report);
+router.get("/report-all", controller.reportAll);
 router.get("/:id/logs", controller.listLogs);
 router.get("/:id", controller.getOne);
 router.post("/", controller.create);
