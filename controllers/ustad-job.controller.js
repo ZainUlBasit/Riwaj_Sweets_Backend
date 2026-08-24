@@ -311,19 +311,31 @@ const buildSummary = async (job) => {
 
   return {
     job,
-    rm_lines: (job.lines || []).map((line) => ({
-      line_id: line._id,
-      raw_material_id: line.raw_material_id?._id || line.raw_material_id,
-      raw_material_name: line.raw_material_id?.name || "RM",
-      unit: line.raw_material_id?.unit ?? null,
-      quantity: line.quantity,
-      unit_price: line.unit_price,
-      line_value: line.line_value,
-      batch_desc: line.raw_material_stock_id?.desc || null,
-      dispatch_id: line.dispatch_id?._id || line.dispatch_id,
-      issued_at: line.issued_at || job.issue_date || null,
-      is_extra: Boolean(line.is_extra),
-    })),
+    rm_lines: (job.lines || []).map((line) => {
+      const stock = line.raw_material_stock_id;
+      const stockRemaining =
+        stock?.remaining_quantity != null
+          ? Number(stock.remaining_quantity)
+          : stock
+            ? Number(stock.quantity || 0) - Number(stock.out_quantity || 0)
+            : null;
+      return {
+        line_id: line._id,
+        raw_material_id: line.raw_material_id?._id || line.raw_material_id,
+        raw_material_name: line.raw_material_id?.name || "RM",
+        unit: line.raw_material_id?.unit ?? null,
+        raw_material_stock_id: stock?._id || stock || line.raw_material_stock_id,
+        quantity: line.quantity,
+        unit_price: line.unit_price,
+        line_value: line.line_value,
+        batch_desc: stock?.desc || null,
+        stock_remaining: stockRemaining,
+        stock_price: stock?.price != null ? Number(stock.price) : null,
+        dispatch_id: line.dispatch_id?._id || line.dispatch_id,
+        issued_at: line.issued_at || job.issue_date || null,
+        is_extra: Boolean(line.is_extra),
+      };
+    }),
     fg_items: fgItems,
     totals: {
       rm_value_issued,
@@ -968,6 +980,7 @@ const create = async (req, res) => {
         action: "create",
         newValue: job.toObject?.() ?? job,
         userId,
+        notes: `Job created · RM Rs ${Number(job.rm_value_issued || 0).toLocaleString("en-IN")} · ${ustadName}`,
         session,
       });
 
@@ -1090,6 +1103,325 @@ const addRm = async (req, res) => {
       res,
       err.status || 500,
       err.message || "Failed to issue extra RM.",
+    );
+  }
+};
+
+/**
+ * Reverse one job RM line's dispatch (stock restore) and soft-delete it.
+ */
+async function reverseJobRmLine(line, userId, session) {
+  const opts = session ? { session } : {};
+  if (!line?.dispatch_id) return;
+  const dispatch = await RawMaterialDispatch.findById(line.dispatch_id)
+    .where({ isDeleted: false })
+    .session(session);
+  if (!dispatch) return;
+
+  await reverseRawMaterialDispatchImpact(
+    {
+      rawMaterialId: dispatch.raw_material_id,
+      quantity: dispatch.quantity,
+      fromLocationId: dispatch.from_location_id,
+      toLocationId: dispatch.location_id,
+      generatedStockId: dispatch.generated_stock_id,
+      rawMaterialStockId: dispatch.raw_material_stock_id,
+      referenceId: dispatch._id,
+    },
+    userId,
+    session,
+  );
+  dispatch.isDeleted = true;
+  dispatch.generated_stock_id = null;
+  await dispatch.save(opts);
+}
+
+function recalcRmValue(lines) {
+  return round2(
+    (lines || []).reduce((s, r) => s + Number(r.line_value || 0), 0),
+  );
+}
+
+/**
+ * PATCH /api/ustad-job/:id/rm/:lineId
+ * Edit one RM line (qty / batch / date). Stock reverse + re-issue.
+ * Body: { quantity, raw_material_stock_id?, issue_date? }
+ */
+const updateRmLine = async (req, res) => {
+  try {
+    const job = await UstadJob.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!job) return createError(res, 404, "Ustad job not found.");
+
+    const lineId = req.params.lineId;
+    const lineIdx = (job.lines || []).findIndex(
+      (l) => String(l._id) === String(lineId),
+    );
+    if (lineIdx < 0) return createError(res, 404, "RM line not found.");
+
+    try {
+      await assertRmManagerStoreAccess(req, [
+        job.from_location_id,
+        job.location_id,
+      ]);
+    } catch (err) {
+      return createError(res, err.status || 403, err.message);
+    }
+
+    const existing = job.lines[lineIdx];
+    const { quantity, raw_material_stock_id, issue_date } = req.body || {};
+    const qty =
+      quantity !== undefined ? Number(quantity) : Number(existing.quantity);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      return createError(res, 400, "quantity must be > 0.");
+    }
+
+    let issuedAt = existing.issued_at || job.issue_date || new Date();
+    if (issue_date) {
+      issuedAt = new Date(issue_date);
+      if (Number.isNaN(issuedAt.getTime())) {
+        return createError(res, 400, "Invalid issue_date.");
+      }
+    }
+
+    const stockId =
+      raw_material_stock_id ||
+      existing.raw_material_stock_id?._id ||
+      existing.raw_material_stock_id;
+
+    const fromLoc = await DispatchLocation.findById(job.from_location_id).where({
+      isDeleted: false,
+    });
+    const toLoc = await DispatchLocation.findById(job.location_id).where({
+      isDeleted: false,
+    });
+    if (!fromLoc) return createError(res, 404, "RM Store not found.");
+    if (!toLoc) return createError(res, 404, "Production area not found.");
+
+    const previousSnapshot = {
+      line_id: existing._id,
+      raw_material_id: existing.raw_material_id,
+      raw_material_stock_id: existing.raw_material_stock_id,
+      quantity: existing.quantity,
+      unit_price: existing.unit_price,
+      line_value: existing.line_value,
+      issued_at: existing.issued_at,
+      is_extra: existing.is_extra,
+      dispatch_id: existing.dispatch_id,
+    };
+
+    const userId = getUserId(req);
+    const isExtra = Boolean(existing.is_extra);
+
+    await withTransaction(async (session) => {
+      await reverseJobRmLine(existing, userId, session);
+
+      let normalized;
+      try {
+        normalized = await snapshotRmLines([
+          {
+            raw_material_id: existing.raw_material_id,
+            raw_material_stock_id: stockId,
+            quantity: qty,
+          },
+        ]);
+      } catch (err) {
+        const e = new Error(err.message);
+        e.status = err.status || 400;
+        throw e;
+      }
+
+      const saved = await issueRmLines({
+        job,
+        fromLoc,
+        toLoc,
+        ustadName: job.ustad_name,
+        userId,
+        rows: normalized,
+        issueDate: issuedAt,
+        isExtra,
+        session,
+      });
+
+      const next = saved[0];
+      const lineDoc = job.lines[lineIdx];
+      lineDoc.raw_material_id = next.raw_material_id;
+      lineDoc.raw_material_stock_id = next.raw_material_stock_id;
+      lineDoc.quantity = next.quantity;
+      lineDoc.unit_price = next.unit_price;
+      lineDoc.line_value = next.line_value;
+      lineDoc.dispatch_id = next.dispatch_id;
+      lineDoc.issued_at = next.issued_at;
+      lineDoc.is_extra = isExtra;
+      job.markModified("lines");
+      job.rm_value_issued = recalcRmValue(job.lines);
+      await job.save({ session });
+
+      await writeAudit({
+        entityType: "UstadJob",
+        entityId: job._id,
+        action: "update",
+        previousValue: previousSnapshot,
+        newValue: {
+          line_id: existing._id,
+          ...next,
+          is_extra: isExtra,
+        },
+        userId,
+        notes: `RM line edited · qty ${previousSnapshot.quantity} → ${qty} · Rs ${Number(next.line_value).toLocaleString("en-IN")}`,
+        session,
+      });
+    });
+
+    const populated = await populateJob(UstadJob.findById(job._id));
+    const summary = await buildSummary(populated);
+    return successMessage(res, summary, "RM line updated — stock adjusted.");
+  } catch (err) {
+    console.error("UstadJob updateRmLine error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to update RM line.",
+    );
+  }
+};
+
+/**
+ * DELETE /api/ustad-job/:id/rm/:lineId
+ * Remove one RM line and restore stock.
+ */
+const removeRmLine = async (req, res) => {
+  try {
+    const job = await UstadJob.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!job) return createError(res, 404, "Ustad job not found.");
+
+    const lineId = req.params.lineId;
+    const lineIdx = (job.lines || []).findIndex(
+      (l) => String(l._id) === String(lineId),
+    );
+    if (lineIdx < 0) return createError(res, 404, "RM line not found.");
+
+    try {
+      await assertRmManagerStoreAccess(req, [
+        job.from_location_id,
+        job.location_id,
+      ]);
+    } catch (err) {
+      return createError(res, err.status || 403, err.message);
+    }
+
+    const existing = job.lines[lineIdx];
+    const previousSnapshot = {
+      line_id: existing._id,
+      raw_material_id: existing.raw_material_id,
+      raw_material_stock_id: existing.raw_material_stock_id,
+      quantity: existing.quantity,
+      unit_price: existing.unit_price,
+      line_value: existing.line_value,
+      issued_at: existing.issued_at,
+      is_extra: existing.is_extra,
+      dispatch_id: existing.dispatch_id,
+    };
+    const userId = getUserId(req);
+
+    await withTransaction(async (session) => {
+      await reverseJobRmLine(existing, userId, session);
+      job.lines.splice(lineIdx, 1);
+      job.markModified("lines");
+      job.rm_value_issued = recalcRmValue(job.lines);
+      await job.save({ session });
+
+      await writeAudit({
+        entityType: "UstadJob",
+        entityId: job._id,
+        action: "update",
+        previousValue: previousSnapshot,
+        newValue: { line_removed: true, line_id: existing._id },
+        userId,
+        notes: `RM line deleted · qty ${previousSnapshot.quantity} · Rs ${Number(previousSnapshot.line_value || 0).toLocaleString("en-IN")}`,
+        session,
+      });
+    });
+
+    const populated = await populateJob(UstadJob.findById(job._id));
+    const summary = await buildSummary(populated);
+    return successMessage(res, summary, "RM line deleted — stock restored.");
+  } catch (err) {
+    console.error("UstadJob removeRmLine error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to delete RM line.",
+    );
+  }
+};
+
+/**
+ * GET /api/ustad-job/:id/logs
+ * Activity logs for this job: RM (UstadJob) + Products wapas (CakeProduction).
+ */
+const listLogs = async (req, res) => {
+  try {
+    const job = await UstadJob.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!job) return createError(res, 404, "Ustad job not found.");
+
+    try {
+      await assertRmManagerStoreAccess(req, [
+        job.from_location_id,
+        job.location_id,
+      ]);
+    } catch (err) {
+      return createError(res, err.status || 403, err.message);
+    }
+
+    const InventoryAuditLog = require("../Models/InventoryAuditLog");
+    const productions = await CakeProduction.find({
+      ustad_job_id: job._id,
+    }).select("_id");
+    const productionIds = productions.map((p) => p._id);
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+
+    const rows = await InventoryAuditLog.find({
+      $or: [
+        { entity_type: "UstadJob", entity_id: job._id },
+        ...(productionIds.length
+          ? [{ entity_type: "CakeProduction", entity_id: { $in: productionIds } }]
+          : []),
+      ],
+    })
+      .populate("user_id", "name email")
+      .sort({ createdAt: -1 })
+      .limit(limit);
+
+    const items = rows.map((row) => {
+      const isFg = row.entity_type === "CakeProduction";
+      return {
+        _id: row._id,
+        section: isFg ? "fg" : "rm",
+        section_label: isFg ? "Products banaye (wapas)" : "RM diya",
+        entity_type: row.entity_type,
+        entity_id: row.entity_id,
+        action: row.action,
+        notes: row.notes || "",
+        previous_value: row.previous_value,
+        new_value: row.new_value,
+        user_name: row.user_id?.name || row.user_id?.email || "—",
+        createdAt: row.createdAt,
+      };
+    });
+
+    return successMessage(res, { items }, "Ustad job logs fetched.");
+  } catch (err) {
+    console.error("UstadJob listLogs error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to fetch job logs.",
     );
   }
 };
@@ -1296,6 +1628,9 @@ module.exports = {
   getOne,
   create,
   addRm,
+  updateRmLine,
+  removeRmLine,
+  listLogs,
   close,
   reopen,
   remove,

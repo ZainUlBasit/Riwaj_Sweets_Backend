@@ -581,6 +581,7 @@ const create = async (req, res) => {
         action: "create",
         newValue: created.toObject?.() ?? created,
         userId,
+        notes: `Product wapas · ${product?.name || "Product"} × ${cakes}`,
         session,
       });
 
@@ -771,6 +772,7 @@ const update = async (req, res) => {
         previousValue: existing.toObject?.() ?? existing,
         newValue: updated.toObject?.() ?? updated,
         userId,
+        notes: `Product wapas edited · ${finalProduct?.name || "Product"} × ${finalCakes}`,
         session,
       });
 
@@ -818,6 +820,7 @@ const remove = async (req, res) => {
         action: "delete",
         previousValue: existing.toObject?.() ?? existing,
         userId,
+        notes: `Product wapas deleted · qty ${existing.cakes_produced || 0}`,
         session,
       });
 
