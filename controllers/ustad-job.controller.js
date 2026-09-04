@@ -32,6 +32,32 @@ const generateJobCode = () => {
 };
 
 /**
+ * YYYY-MM-DD → UTC day bounds.
+ * Matches how issue_date is stored via `new Date("YYYY-MM-DD")` (UTC midnight).
+ * `date` alone = that single calendar day.
+ */
+function parseUtcDayRange(start_date, end_date, date) {
+  const parse = (s, endOfDay) => {
+    const m = String(s || "")
+      .trim()
+      .match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return null;
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    const d = Number(m[3]);
+    if (!y || !mo || !d) return null;
+    if (endOfDay) return new Date(Date.UTC(y, mo - 1, d, 23, 59, 59, 999));
+    return new Date(Date.UTC(y, mo - 1, d, 0, 0, 0, 0));
+  };
+  const fromStr = date || start_date;
+  const toStr = date || end_date;
+  return {
+    start: fromStr ? parse(fromStr, false) : null,
+    end: toStr ? parse(toStr, true) : null,
+  };
+}
+
+/**
  * Prefer Production under the manager/ustad/RM godown.
  * Creates a dedicated Production row for that store when missing so RM Managers
  * are not blocked by a Store-1-only Production + store-scope assert mismatch.
@@ -353,8 +379,15 @@ const buildSummary = async (job) => {
  */
 const list = async (req, res) => {
   try {
-    const { status, ustad_name, ustad_id, location_id, start_date, end_date } =
-      req.query || {};
+    const {
+      status,
+      ustad_name,
+      ustad_id,
+      location_id,
+      date,
+      start_date,
+      end_date,
+    } = req.query || {};
 
     const baseFilter = { isDeleted: false };
     if (status != null && status !== "") baseFilter.status = Number(status);
@@ -367,18 +400,17 @@ const list = async (req, res) => {
       );
     }
     if (location_id) baseFilter.location_id = location_id;
-    if (start_date || end_date) {
-      baseFilter.issue_date = {};
-      if (start_date) {
-        const start = new Date(start_date);
-        start.setHours(0, 0, 0, 0);
-        baseFilter.issue_date.$gte = start;
-      }
-      if (end_date) {
-        const end = new Date(end_date);
-        end.setHours(23, 59, 59, 999);
-        baseFilter.issue_date.$lte = end;
-      }
+
+    const { start, end } = parseUtcDayRange(start_date, end_date, date);
+    if (start || end) {
+      const dateClause = {};
+      if (start) dateClause.$gte = start;
+      if (end) dateClause.$lte = end;
+      // Job issue day OR RM line issued that day (extra RM / same-day activity)
+      baseFilter.$or = [
+        { issue_date: { ...dateClause } },
+        { "lines.issued_at": { ...dateClause } },
+      ];
     }
 
     const scopedFilter = await applyStoreLocationFilter(
@@ -780,11 +812,8 @@ const report = async (req, res) => {
     const ustad = await Ustad.findById(ustad_id).where({ isDeleted: false });
     if (!ustad) return createError(res, 404, "Ustad not found.");
 
-    const start = new Date(start_date);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(end_date);
-    end.setHours(23, 59, 59, 999);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+    const { start, end } = parseUtcDayRange(start_date, end_date);
+    if (!start || !end || start > end) {
       return createError(res, 400, "Invalid date range.");
     }
 
@@ -814,11 +843,8 @@ const reportAll = async (req, res) => {
       return createError(res, 400, "Date range required.");
     }
 
-    const start = new Date(start_date);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(end_date);
-    end.setHours(23, 59, 59, 999);
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+    const { start, end } = parseUtcDayRange(start_date, end_date);
+    if (!start || !end || start > end) {
       return createError(res, 400, "Invalid date range.");
     }
 

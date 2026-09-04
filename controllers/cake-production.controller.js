@@ -503,7 +503,7 @@ const create = async (req, res) => {
           res,
           400,
           linkedJob
-            ? "Shop select karein — finished goods kahan add honge."
+            ? "Shop ya Product Store select karein — finished goods kahan add honge."
             : "Product Store select karein — finished goods kahan add honge.",
         );
       }
@@ -514,15 +514,19 @@ const create = async (req, res) => {
         return createError(
           res,
           404,
-          linkedJob ? "Shop not found." : "Product Store not found.",
+          "Destination location not found.",
         );
       }
       const destType = Number(productStoreLocation.location_type);
       const isProductStore = destType === LOCATION_TYPE.FINISHED_GOODS_STORE;
       const isShop = destType === LOCATION_TYPE.SHOP;
       if (linkedJob) {
-        if (!isShop) {
-          return createError(res, 400, "to_location_id must be a Shop.");
+        if (!isShop && !isProductStore) {
+          return createError(
+            res,
+            400,
+            "to_location_id must be a Shop or Product Store.",
+          );
         }
       } else if (!isProductStore) {
         return createError(res, 400, "to_location_id must be a Product Store.");
