@@ -5,6 +5,10 @@ const RawMaterial = require("../Models/RawMaterial");
 const CakeOrder = require("../Models/CakeOrder");
 const CakeProduction = require("../Models/CakeProduction");
 const Shop = require("../Models/Shop");
+const UstadJob = require("../Models/UstadJob");
+const ProductTransfer = require("../Models/ProductTransfer");
+const { TRANSFER_STATUS } = require("../Models/ProductTransfer");
+const { LOCATION_TYPE } = require("../Services/inventoryService");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
@@ -27,10 +31,33 @@ const startOfMonth = (d = new Date()) => {
   return x;
 };
 
+const startOfYear = (d = new Date()) => {
+  const x = new Date(d.getFullYear(), 0, 1);
+  x.setHours(0, 0, 0, 0);
+  return x;
+};
+
 const addDays = (d, n) => {
   const x = new Date(d);
   x.setDate(x.getDate() + n);
   return x;
+};
+
+const toDateKey = (d = new Date()) => {
+  const x = new Date(d);
+  const y = x.getFullYear();
+  const m = String(x.getMonth() + 1).padStart(2, "0");
+  const day = String(x.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
+
+const fmtDateStr = (d) => {
+  if (!d) return "";
+  try {
+    return toDateKey(d);
+  } catch {
+    return "";
+  }
 };
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -48,6 +75,341 @@ const MONTH_LABELS = [
   "Nov",
   "Dec",
 ];
+
+const resolveOpsPeriod = (query = {}, now = new Date()) => {
+  const periodRaw = query.period || query;
+  const p = String(
+    typeof periodRaw === "object" ? periodRaw.period || "daily" : periodRaw || "daily",
+  ).toLowerCase();
+  const q = typeof query === "object" && query && !Array.isArray(query) ? query : {};
+
+  if (p === "monthly") {
+    let y = now.getFullYear();
+    let m = now.getMonth(); // 0-based
+    const monthStr = String(q.month || "").trim();
+    if (/^\d{4}-\d{2}$/.test(monthStr)) {
+      y = Number(monthStr.slice(0, 4));
+      m = Number(monthStr.slice(5, 7)) - 1;
+    }
+    const start = new Date(y, m, 1);
+    start.setHours(0, 0, 0, 0);
+    const endOfSelectedMonth = new Date(y, m + 1, 0, 23, 59, 59, 999);
+    const end =
+      y === now.getFullYear() && m === now.getMonth()
+        ? endOfDay(now)
+        : endOfSelectedMonth;
+    return {
+      period: "monthly",
+      start,
+      end,
+      start_date: toDateKey(start),
+      end_date: toDateKey(end),
+      label: `${MONTH_LABELS[m]} ${y}`,
+      month: `${y}-${String(m + 1).padStart(2, "0")}`,
+    };
+  }
+
+  if (p === "yearly") {
+    let y = now.getFullYear();
+    const yearStr = String(q.year || "").trim();
+    if (/^\d{4}$/.test(yearStr)) y = Number(yearStr);
+    const start = new Date(y, 0, 1);
+    start.setHours(0, 0, 0, 0);
+    const endOfSelectedYear = new Date(y, 11, 31, 23, 59, 59, 999);
+    const end = y === now.getFullYear() ? endOfDay(now) : endOfSelectedYear;
+    return {
+      period: "yearly",
+      start,
+      end,
+      start_date: toDateKey(start),
+      end_date: toDateKey(end),
+      label: String(y),
+      year: String(y),
+    };
+  }
+
+  let day = now;
+  const dateStr = String(q.date || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    const [yy, mm, dd] = dateStr.split("-").map(Number);
+    day = new Date(yy, mm - 1, dd);
+  }
+  const start = startOfDay(day);
+  const end = endOfDay(day);
+  return {
+    period: "daily",
+    start,
+    end,
+    start_date: toDateKey(start),
+    end_date: toDateKey(end),
+    label: toDateKey(start),
+    date: toDateKey(start),
+  };
+};
+
+/**
+ * Admin ops strip: RM Diya, Product Receive (shop/store), Shop IN.
+ * Details included for click-through — does not change other dashboard logic.
+ */
+async function buildOpsInRange(rangeStart, rangeEnd, meta = {}) {
+  const [jobs, productions, transfers] = await Promise.all([
+    UstadJob.find({ isDeleted: false })
+      .select("job_code ustad_name issue_date lines")
+      .populate("lines.raw_material_id", "name unit")
+      .lean(),
+    CakeProduction.find({
+      isDeleted: false,
+      production_date: { $gte: rangeStart, $lte: rangeEnd },
+    })
+      .populate("product_id", "name unit price")
+      .populate({
+        path: "store_receipt_id",
+        select: "receipt_code to_location_id",
+        populate: { path: "to_location_id", select: "name location_type" },
+      })
+      .populate({
+        path: "product_stock_id",
+        select: "location_id",
+        populate: { path: "location_id", select: "name location_type" },
+      })
+      .lean(),
+    ProductTransfer.find({
+      isDeleted: false,
+      status: { $ne: TRANSFER_STATUS.CANCELLED },
+      transfer_date: { $gte: rangeStart, $lte: rangeEnd },
+    })
+      .populate("product_id", "name unit price")
+      .populate("from_location_id", "name")
+      .populate("to_location_id", "name location_type")
+      .lean(),
+  ]);
+
+  const rmDetails = [];
+  for (const job of jobs) {
+    for (const line of job.lines || []) {
+      const issuedAt = line.issued_at || job.issue_date;
+      if (!issuedAt) continue;
+      const t = new Date(issuedAt).getTime();
+      if (t < rangeStart.getTime() || t > rangeEnd.getTime()) continue;
+      const qty = Number(line.quantity || 0);
+      const value = Number(line.line_value || 0);
+      rmDetails.push({
+        date: fmtDateStr(issuedAt),
+        job_code: job.job_code || "—",
+        ustad_name: job.ustad_name || "—",
+        material: line.raw_material_id?.name || "—",
+        unit: line.raw_material_id?.unit || "",
+        quantity: round2(qty),
+        unit_price: round2(line.unit_price),
+        line_value: round2(value),
+        is_extra: Boolean(line.is_extra),
+      });
+    }
+  }
+  rmDetails.sort((a, b) =>
+    String(b.ustad_name).localeCompare(String(a.ustad_name)),
+  );
+
+  const rm_diya = {
+    value: round2(rmDetails.reduce((s, r) => s + Number(r.line_value || 0), 0)),
+    quantity: round2(rmDetails.reduce((s, r) => s + Number(r.quantity || 0), 0)),
+    lines_count: rmDetails.length,
+    details: rmDetails,
+  };
+
+  const byLoc = new Map();
+  const bumpLoc = (loc, qty, value) => {
+    const id = String(loc?._id || loc?.id || "unknown");
+    const name = loc?.name || "—";
+    const type = Number(loc?.location_type || 0);
+    if (!byLoc.has(id)) {
+      byLoc.set(id, {
+        id,
+        name,
+        location_type: type,
+        quantity: 0,
+        value: 0,
+      });
+    }
+    const row = byLoc.get(id);
+    row.quantity = round2(row.quantity + qty);
+    row.value = round2(row.value + value);
+  };
+
+  const receiveDetails = [];
+  for (const p of productions) {
+    const qty = Number(p.cakes_produced || 0);
+    const unitPrice = Number(p.product_id?.price || 0);
+    const value = round2(qty * unitPrice);
+    const dest =
+      p.store_receipt_id?.to_location_id ||
+      p.product_stock_id?.location_id ||
+      null;
+    const destType = Number(dest?.location_type || 0);
+    const destKind =
+      destType === LOCATION_TYPE.SHOP
+        ? "shop"
+        : destType === LOCATION_TYPE.FINISHED_GOODS_STORE
+          ? "product_store"
+          : "other";
+    if (dest) bumpLoc(dest, qty, value);
+    receiveDetails.push({
+      date: fmtDateStr(p.production_date),
+      product_name: p.product_id?.name || "—",
+      unit: p.product_id?.unit || "",
+      quantity: round2(qty),
+      unit_price: round2(unitPrice),
+      value,
+      destination_name: dest?.name || "—",
+      destination_type: destKind,
+      ustad_name: p.ustad_name || "—",
+      receipt_code: p.store_receipt_id?.receipt_code || null,
+    });
+  }
+
+  const toShopLocs = [];
+  const toStoreLocs = [];
+  let shopQty = 0;
+  let shopVal = 0;
+  let storeQty = 0;
+  let storeVal = 0;
+  for (const row of byLoc.values()) {
+    if (row.location_type === LOCATION_TYPE.SHOP) {
+      toShopLocs.push(row);
+      shopQty += row.quantity;
+      shopVal += row.value;
+    } else if (row.location_type === LOCATION_TYPE.FINISHED_GOODS_STORE) {
+      toStoreLocs.push(row);
+      storeQty += row.quantity;
+      storeVal += row.value;
+    }
+  }
+  toShopLocs.sort((a, b) => a.name.localeCompare(b.name));
+  toStoreLocs.sort((a, b) => a.name.localeCompare(b.name));
+
+  const product_receive = {
+    total_qty: round2(
+      receiveDetails.reduce((s, r) => s + Number(r.quantity || 0), 0),
+    ),
+    total_value: round2(
+      receiveDetails.reduce((s, r) => s + Number(r.value || 0), 0),
+    ),
+    to_shop: {
+      quantity: round2(shopQty),
+      value: round2(shopVal),
+      by_location: toShopLocs,
+    },
+    to_product_store: {
+      quantity: round2(storeQty),
+      value: round2(storeVal),
+      by_location: toStoreLocs,
+    },
+    details: receiveDetails,
+  };
+
+  // Shop IN = everything that entered a shop:
+  // 1) Product Store → Shop transfers
+  // 2) Direct production receive into Shop (so every shop with inbound shows up)
+  const shopByLoc = new Map();
+  const shopDetails = [];
+  const bumpShop = (shopId, shopName, qty, value) => {
+    const id = String(shopId || "unknown");
+    if (!shopByLoc.has(id)) {
+      shopByLoc.set(id, {
+        id,
+        name: shopName || "—",
+        quantity: 0,
+        value: 0,
+      });
+    }
+    const row = shopByLoc.get(id);
+    row.quantity = round2(row.quantity + qty);
+    row.value = round2(row.value + value);
+  };
+
+  for (const t of transfers) {
+    const shop = t.to_location_id;
+    if (Number(shop?.location_type) !== LOCATION_TYPE.SHOP) continue;
+    const qty = Number(t.quantity || 0);
+    const unitPrice = Number(t.product_id?.price || 0);
+    const value = round2(qty * unitPrice);
+    const shopId = String(shop?._id || "unknown");
+    const shopName = shop?.name || "—";
+    bumpShop(shopId, shopName, qty, value);
+    shopDetails.push({
+      date: fmtDateStr(t.transfer_date),
+      product_name: t.product_id?.name || "—",
+      unit: t.product_id?.unit || "",
+      quantity: round2(qty),
+      value,
+      from_name: t.from_location_id?.name || "—",
+      shop_name: shopName,
+      transfer_code: t.transfer_code || null,
+      status: Number(t.status),
+      received: Number(t.status) === TRANSFER_STATUS.RECEIVED,
+      source: "transfer",
+    });
+  }
+
+  for (const p of productions) {
+    const dest =
+      p.store_receipt_id?.to_location_id ||
+      p.product_stock_id?.location_id ||
+      null;
+    if (!dest || Number(dest.location_type) !== LOCATION_TYPE.SHOP) continue;
+    const qty = Number(p.cakes_produced || 0);
+    const unitPrice = Number(p.product_id?.price || 0);
+    const value = round2(qty * unitPrice);
+    const shopId = String(dest._id || "unknown");
+    const shopName = dest.name || "—";
+    bumpShop(shopId, shopName, qty, value);
+    shopDetails.push({
+      date: fmtDateStr(p.production_date),
+      product_name: p.product_id?.name || "—",
+      unit: p.product_id?.unit || "",
+      quantity: round2(qty),
+      value,
+      from_name: "Direct receive",
+      shop_name: shopName,
+      transfer_code: p.store_receipt_id?.receipt_code || null,
+      status: TRANSFER_STATUS.RECEIVED,
+      received: true,
+      source: "direct_receive",
+    });
+  }
+
+  shopDetails.sort((a, b) => {
+    const byShop = String(a.shop_name).localeCompare(String(b.shop_name));
+    if (byShop !== 0) return byShop;
+    return String(a.date).localeCompare(String(b.date));
+  });
+
+  const by_shop = Array.from(shopByLoc.values()).sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+
+  const shop_in = {
+    total_qty: round2(
+      shopDetails.reduce((s, r) => s + Number(r.quantity || 0), 0),
+    ),
+    total_value: round2(
+      shopDetails.reduce((s, r) => s + Number(r.value || 0), 0),
+    ),
+    by_shop,
+    details: shopDetails,
+  };
+
+  return {
+    period: meta.period || "daily",
+    date: meta.end_date || meta.start_date || "",
+    start_date: meta.start_date || "",
+    end_date: meta.end_date || "",
+    label: meta.label || meta.end_date || "",
+    rm_diya,
+    product_receive,
+    shop_in,
+  };
+}
 
 const ORDER_STATUS = {
   1: "Pending",
@@ -82,6 +444,7 @@ const getData = async (req, res) => {
     const monthStart = startOfMonth(now);
     const last7Start = startOfDay(addDays(now, -6));
     const last30Start = startOfDay(addDays(now, -29));
+    const opsPeriod = resolveOpsPeriod(req.query || {}, now);
 
     const activeOrderFilter = { isDeleted: false, status: { $ne: 4 } };
 
@@ -107,8 +470,8 @@ const getData = async (req, res) => {
       topProductsRaw,
       cakeOrderStatusAgg,
       salesLast30Agg,
+      ops,
     ] = await Promise.all([
-      // Today's delivered / billed order totals
       Order.aggregate([
         {
           $match: {
@@ -238,7 +601,6 @@ const getData = async (req, res) => {
         { $match: { ...activeOrderFilter } },
         { $group: { _id: "$payment_status", count: { $sum: 1 } } },
       ]),
-      // Daily sales — last 7 days
       Order.aggregate([
         {
           $match: {
@@ -258,7 +620,6 @@ const getData = async (req, res) => {
         },
         { $sort: { _id: 1 } },
       ]),
-      // Monthly — last 12 calendar months
       Order.aggregate([
         {
           $match: {
@@ -345,6 +706,7 @@ const getData = async (req, res) => {
           },
         },
       ]),
+      buildOpsInRange(opsPeriod.start, opsPeriod.end, opsPeriod),
     ]);
 
     const todaySales = todaySalesAgg[0] || { total: 0, count: 0, paid: 0 };
@@ -366,7 +728,6 @@ const getData = async (req, res) => {
     const productionToday = productionTodayAgg[0]?.total || 0;
     const salesLast30 = salesLast30Agg[0] || { total: 0, count: 0 };
 
-    // Fill last 7 days continuously
     const dailyMap = new Map(
       (dailySalesRaw || []).map((r) => [r._id, round2(r.amount)]),
     );
@@ -381,7 +742,6 @@ const getData = async (req, res) => {
       });
     }
 
-    // Fill last 12 months
     const monthMap = new Map(
       (monthlySalesRaw || []).map((r) => [
         `${r._id.y}-${String(r._id.m).padStart(2, "0")}`,
@@ -466,7 +826,6 @@ const getData = async (req, res) => {
         net_position: netPosition,
         collected_today: round2(collectedToday),
       },
-      // Back-compat keys used by older UI fragments
       current_value: {
         cash: round2(collectedToday),
         bank: 0,
@@ -484,6 +843,7 @@ const getData = async (req, res) => {
       payment_status,
       cake_order_status,
       top_products,
+      ops,
     };
 
     return successMessage(res, payload, "Dashboard data fetched successfully.");

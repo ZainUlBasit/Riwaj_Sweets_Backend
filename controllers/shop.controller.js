@@ -951,6 +951,10 @@ async function loadPendingTransferForShop(shop, rawCode) {
     err.status = 400;
     throw err;
   }
+
+  const { ensureShopLocationHealthy } = require("../Middleware/shopAuth");
+  await ensureShopLocationHealthy(shop);
+
   if (!shop?.location_id) {
     const err = new Error(
       "Shop has no linked location. Admin se Shop account location set karwayein.",
@@ -961,9 +965,28 @@ async function loadPendingTransferForShop(shop, rawCode) {
 
   const shopLocId = String(shop.location_id._id || shop.location_id);
 
+  // Also accept transfers aimed at any active Shop location with this shop's name
+  // (covers recreate / soft-delete of DispatchLocation while shop pointer lagged).
+  const shopName = String(shop.name || "").trim();
+  const nameLocIds = shopName
+    ? (
+        await DispatchLocation.find({
+          isDeleted: false,
+          location_type: LOCATION_TYPE.SHOP,
+          name: new RegExp(
+            `^${shopName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+            "i",
+          ),
+        })
+          .select("_id")
+          .lean()
+      ).map((l) => String(l._id))
+    : [];
+  const candidateLocIds = [...new Set([shopLocId, ...nameLocIds])];
+
   const pending = await ProductTransfer.find({
     transfer_code: code,
-    to_location_id: shopLocId,
+    to_location_id: { $in: candidateLocIds },
     status: TRANSFER_STATUS.PENDING,
     isDeleted: false,
   })
@@ -975,13 +998,19 @@ async function loadPendingTransferForShop(shop, rawCode) {
     const any = await ProductTransfer.findOne({
       transfer_code: code,
       isDeleted: false,
-    }).populate("to_location_id", "name");
+    }).populate("to_location_id", "name location_type");
     if (!any) {
       const err = new Error(`Transfer barcode not found: ${code}`);
       err.status = 404;
       throw err;
     }
-    if (String(any.to_location_id?._id || any.to_location_id) !== shopLocId) {
+    const destId = String(any.to_location_id?._id || any.to_location_id);
+    const destName = String(any.to_location_id?.name || "").trim();
+    const sameShopByName =
+      destName &&
+      shopName &&
+      destName.toLowerCase() === shopName.toLowerCase();
+    if (!candidateLocIds.includes(destId) && !sameShopByName) {
       const dest = any.to_location_id?.name || "another shop";
       const err = new Error(
         `Yeh transfer "${dest}" ke liye hai — is shop (${shop.name}) pe receive nahi ho sakta.`,
@@ -1008,6 +1037,13 @@ async function loadPendingTransferForShop(shop, rawCode) {
     throw err;
   }
 
+  // Credit stock to the transfer's real destination (active location).
+  const creditLocId = String(
+    pending[0].to_location_id?._id ||
+      pending[0].to_location_id ||
+      shopLocId,
+  );
+
   const items = pending.map((row) => ({
     transfer_id: row._id,
     product_id: row.product_id?._id || row.product_id,
@@ -1026,7 +1062,7 @@ async function loadPendingTransferForShop(shop, rawCode) {
 
   return {
     code,
-    shopLocId,
+    shopLocId: creditLocId,
     pending,
     preview: {
       transfer_code: code,

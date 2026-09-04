@@ -98,9 +98,9 @@ const getOne = async (req, res) => {
 
 /**
  * Create transfer batch:
- * - Debit Product Store only (stock in transit)
- * - Do NOT credit shop yet
- * - Return shared transfer_code barcode for shop receive
+ * - Debit Product Store
+ * - Credit Shop immediately
+ * - Status = Received (admin transfer — no shop barcode scan needed)
  */
 const create = async (req, res) => {
   try {
@@ -218,6 +218,7 @@ const create = async (req, res) => {
     await assertRmManagerStoreAccess(req, [from_location_id, ...shopIds]);
 
     const fromInvType = getInventoryTypeForLocation(fromType);
+    const toInvType = getInventoryTypeForLocation(LOCATION_TYPE.SHOP);
 
     for (const [productId, needQty] of neededByProduct.entries()) {
       const available = await getLocationInventoryQty(
@@ -238,6 +239,7 @@ const create = async (req, res) => {
 
     const userId = getUserId(req);
     const transfer_code = generateTransferCode();
+    const receivedAt = new Date();
 
     const createdIds = await withTransaction(async (session) => {
       const ids = [];
@@ -257,8 +259,13 @@ const create = async (req, res) => {
         const productId = row.product_id;
         const qty = row.quantity;
         const prevFrom = remaining.get(String(productId)) ?? 0;
+        const prevShop = await getLocationInventoryQty(
+          row.to_location_id,
+          productId,
+          toInvType,
+          session,
+        );
 
-        // Only leave Product Store — shop credit happens on barcode receive
         await adjustLocationInventory(
           from_location_id,
           productId,
@@ -267,6 +274,14 @@ const create = async (req, res) => {
           session,
         );
         remaining.set(String(productId), prevFrom - qty);
+
+        await adjustLocationInventory(
+          row.to_location_id,
+          productId,
+          qty,
+          toInvType,
+          session,
+        );
 
         const [item] = await ProductTransfer.create(
           [
@@ -278,7 +293,8 @@ const create = async (req, res) => {
               transfer_date: new Date(transfer_date),
               notes: notes ?? "",
               transfer_code,
-              status: TRANSFER_STATUS.PENDING,
+              status: TRANSFER_STATUS.RECEIVED,
+              received_at: receivedAt,
               created_by: userId,
               isDeleted: false,
             },
@@ -297,9 +313,27 @@ const create = async (req, res) => {
             referenceType: "ProductTransfer",
             referenceId: item._id,
             userId,
-            notes: `Transfer out (in transit) → ${toLoc.name} [${transfer_code}]`,
+            notes: `Transfer → ${toLoc.name} [${transfer_code}]`,
             previousBalance: prevFrom,
             newBalance: prevFrom - qty,
+          },
+          session,
+        );
+
+        await writeLedger(
+          {
+            transactionType: TX.SHOP_TRANSFER,
+            direction: DIR.IN,
+            productId,
+            quantity: qty,
+            locationId: row.to_location_id,
+            storeId: toLoc.store_id,
+            referenceType: "ProductTransfer",
+            referenceId: item._id,
+            userId,
+            notes: `Shop receive [${transfer_code}] · ${toLoc.name}`,
+            previousBalance: prevShop,
+            newBalance: prevShop + qty,
           },
           session,
         );
@@ -328,11 +362,11 @@ const create = async (req, res) => {
         items: populatedResult,
         count: createdIds.length,
         transfer_code,
-        status: TRANSFER_STATUS.PENDING,
+        status: TRANSFER_STATUS.RECEIVED,
       },
       createdIds.length > 1
-        ? `${createdIds.length} lines dispatched. Shop barcode: ${transfer_code}`
-        : `Transfer dispatched. Shop barcode: ${transfer_code}`,
+        ? `${createdIds.length} lines transferred — shop stock updated (Received).`
+        : `Transfer complete — shop stock updated (Received).`,
     );
   } catch (err) {
     console.error("ProductTransfer create error:", err);
