@@ -24,6 +24,47 @@ const {
   applyStoreLocationFilter,
   getAssignedStoreId,
 } = require("../utils/storeScope");
+const {
+  resolveQueryDateRange,
+  assertNotPastDate,
+  todayDateOnly,
+} = require("../utils/dateOnly");
+
+/** Super Admin = Users.role 1. Difference / profit figures are admin-only. */
+const isSuperAdmin = (req) => Number(req?.user?.role) === 1;
+
+/**
+ * Strip value_difference from job summary / report payloads for non-admins.
+ * Calculation logic stays unchanged — field is only omitted from the response.
+ */
+const omitProfitFields = (payload, req) => {
+  if (!payload || isSuperAdmin(req)) return payload;
+
+  if (payload.totals && Object.prototype.hasOwnProperty.call(payload.totals, "value_difference")) {
+    const { value_difference: _omit, ...restTotals } = payload.totals;
+    payload = { ...payload, totals: restTotals };
+  }
+
+  if (Array.isArray(payload.jobs)) {
+    payload = {
+      ...payload,
+      jobs: payload.jobs.map((j) => {
+        if (!j || !Object.prototype.hasOwnProperty.call(j, "value_difference")) return j;
+        const { value_difference: _omit, ...rest } = j;
+        return rest;
+      }),
+    };
+  }
+
+  if (Array.isArray(payload.items)) {
+    payload = {
+      ...payload,
+      items: payload.items.map((item) => omitProfitFields(item, req)),
+    };
+  }
+
+  return payload;
+};
 
 const generateJobCode = () => {
   const rand = crypto.randomBytes(3).toString("hex").toUpperCase();
@@ -353,7 +394,7 @@ const buildSummary = async (job) => {
  */
 const list = async (req, res) => {
   try {
-    const { status, ustad_name, ustad_id, location_id, start_date, end_date } =
+    const { status, ustad_name, ustad_id, location_id, start_date, end_date, date } =
       req.query || {};
 
     const baseFilter = { isDeleted: false };
@@ -367,15 +408,18 @@ const list = async (req, res) => {
       );
     }
     if (location_id) baseFilter.location_id = location_id;
-    if (start_date || end_date) {
+
+    const range = resolveQueryDateRange({ date, start_date, end_date });
+    if (range.error) return createError(res, 400, range.error);
+    if (range.start_date || range.end_date) {
       baseFilter.issue_date = {};
-      if (start_date) {
-        const start = new Date(start_date);
+      if (range.start_date) {
+        const start = new Date(range.start_date);
         start.setHours(0, 0, 0, 0);
         baseFilter.issue_date.$gte = start;
       }
-      if (end_date) {
-        const end = new Date(end_date);
+      if (range.end_date) {
+        const end = new Date(range.end_date);
         end.setHours(23, 59, 59, 999);
         baseFilter.issue_date.$lte = end;
       }
@@ -769,32 +813,38 @@ async function buildOneUstadReportPayload(req, ustad, start_date, end_date, star
  */
 const report = async (req, res) => {
   try {
-    const { ustad_id, start_date, end_date } = req.query || {};
+    const { ustad_id, start_date, end_date, date } = req.query || {};
     if (!ustad_id) {
       return createError(res, 400, "Ustad select karein.");
     }
-    if (!start_date || !end_date) {
-      return createError(res, 400, "Date range required.");
+
+    const range = resolveQueryDateRange({ date, start_date, end_date });
+    if (range.error) return createError(res, 400, range.error);
+    if (!range.start_date || !range.end_date) {
+      return createError(res, 400, "Date required.");
     }
 
     const ustad = await Ustad.findById(ustad_id).where({ isDeleted: false });
     if (!ustad) return createError(res, 404, "Ustad not found.");
 
-    const start = new Date(start_date);
+    const start = new Date(range.start_date);
     start.setHours(0, 0, 0, 0);
-    const end = new Date(end_date);
+    const end = new Date(range.end_date);
     end.setHours(23, 59, 59, 999);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
-      return createError(res, 400, "Invalid date range.");
+      return createError(res, 400, "Invalid date.");
     }
 
-    const payload = await buildOneUstadReportPayload(
+    const payload = omitProfitFields(
+      await buildOneUstadReportPayload(
+        req,
+        ustad,
+        range.start_date,
+        range.end_date,
+        start,
+        end,
+      ),
       req,
-      ustad,
-      start_date,
-      end_date,
-      start,
-      end,
     );
     return successMessage(res, payload, "Ustad report fetched.");
   } catch (err) {
@@ -809,17 +859,19 @@ const report = async (req, res) => {
  */
 const reportAll = async (req, res) => {
   try {
-    const { start_date, end_date } = req.query || {};
-    if (!start_date || !end_date) {
-      return createError(res, 400, "Date range required.");
+    const { start_date, end_date, date } = req.query || {};
+    const range = resolveQueryDateRange({ date, start_date, end_date });
+    if (range.error) return createError(res, 400, range.error);
+    if (!range.start_date || !range.end_date) {
+      return createError(res, 400, "Date required.");
     }
 
-    const start = new Date(start_date);
+    const start = new Date(range.start_date);
     start.setHours(0, 0, 0, 0);
-    const end = new Date(end_date);
+    const end = new Date(range.end_date);
     end.setHours(23, 59, 59, 999);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
-      return createError(res, 400, "Invalid date range.");
+      return createError(res, 400, "Invalid date.");
     }
 
     const ustads = await Ustad.find({ isDeleted: false }).sort({ name: 1 });
@@ -828,8 +880,8 @@ const reportAll = async (req, res) => {
       const payload = await buildOneUstadReportPayload(
         req,
         ustad,
-        start_date,
-        end_date,
+        range.start_date,
+        range.end_date,
         start,
         end,
       );
@@ -838,11 +890,14 @@ const reportAll = async (req, res) => {
 
     return successMessage(
       res,
-      {
-        range: { start_date, end_date },
-        ustads_count: items.length,
-        items,
-      },
+      omitProfitFields(
+        {
+          range: { start_date: range.start_date, end_date: range.end_date },
+          ustads_count: items.length,
+          items,
+        },
+        req,
+      ),
       `All ustads report fetched (${items.length}).`,
     );
   } catch (err) {
@@ -875,7 +930,7 @@ const getOne = async (req, res) => {
       return createError(res, err.status || 403, err.message);
     }
 
-    const summary = await buildSummary(job);
+    const summary = omitProfitFields(await buildSummary(job), req);
     return successMessage(res, summary, "Ustad job summary fetched.");
   } catch (err) {
     console.error("UstadJob getOne error:", err);
@@ -932,6 +987,12 @@ const create = async (req, res) => {
     }
     if (!issue_date) {
       return createError(res, 400, "issue_date is required.");
+    }
+    let issueDateOnly;
+    try {
+      issueDateOnly = assertNotPastDate(issue_date, "Issue date");
+    } catch (err) {
+      return createError(res, err.status || 400, err.message);
     }
     if (!Array.isArray(lines) || lines.length === 0) {
       return createError(res, 400, "At least one RM line is required.");
@@ -1012,7 +1073,7 @@ const create = async (req, res) => {
             ustad_id: ustadDoc?._id ?? null,
             from_location_id: fromLoc._id,
             location_id: toLoc._id,
-            issue_date: new Date(issue_date),
+            issue_date: new Date(issueDateOnly),
             status: JOB_STATUS.OPEN,
             notes: notes ?? "",
             planned_products: planned,
@@ -1032,7 +1093,7 @@ const create = async (req, res) => {
         ustadName,
         userId,
         rows: normalized,
-        issueDate: new Date(issue_date),
+        issueDate: new Date(issueDateOnly),
         isExtra: false,
         session,
       });
@@ -1093,9 +1154,14 @@ const addRm = async (req, res) => {
       return createError(res, 400, "At least one RM line is required.");
     }
 
-    const issuedAt = issue_date ? new Date(issue_date) : new Date();
-    if (Number.isNaN(issuedAt.getTime())) {
-      return createError(res, 400, "Invalid issue_date.");
+    let issuedAt;
+    try {
+      const dateOnly = issue_date
+        ? assertNotPastDate(issue_date, "Issue date")
+        : assertNotPastDate(todayDateOnly(), "Issue date");
+      issuedAt = new Date(dateOnly);
+    } catch (err) {
+      return createError(res, err.status || 400, err.message);
     }
 
     try {
@@ -1243,9 +1309,11 @@ const updateRmLine = async (req, res) => {
 
     let issuedAt = existing.issued_at || job.issue_date || new Date();
     if (issue_date) {
-      issuedAt = new Date(issue_date);
-      if (Number.isNaN(issuedAt.getTime())) {
-        return createError(res, 400, "Invalid issue_date.");
+      try {
+        const dateOnly = assertNotPastDate(issue_date, "Issue date");
+        issuedAt = new Date(dateOnly);
+      } catch (err) {
+        return createError(res, err.status || 400, err.message);
       }
     }
 
