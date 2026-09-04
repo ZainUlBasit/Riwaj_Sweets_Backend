@@ -27,7 +27,6 @@ const {
   withTransaction,
 } = require("../Services/inventoryService");
 const { assertRmManagerStoreAccess, applyStoreLocationFilter, getAssignedStoreId } = require("../utils/storeScope");
-const { assertNotPastDate } = require("../utils/dateOnly");
 
 const escapeRegex = (value = "") =>
   String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -387,12 +386,6 @@ const create = async (req, res) => {
     if (!production_date) {
       return createError(res, 400, "production_date is required.");
     }
-    let productionDateOnly;
-    try {
-      productionDateOnly = assertNotPastDate(production_date, "Production date");
-    } catch (err) {
-      return createError(res, err.status || 400, err.message);
-    }
     if (!product_id) {
       return createError(res, 400, "product_id is required.");
     }
@@ -548,7 +541,7 @@ const create = async (req, res) => {
       const [created] = await CakeProduction.create(
         [
           {
-            production_date: new Date(productionDateOnly),
+            production_date: new Date(production_date),
             cakes_produced: cakes,
             product_id: product._id,
             location_id: productionLocation?._id ?? null,
@@ -566,7 +559,7 @@ const create = async (req, res) => {
       const { productStock, consumptions, storeReceipt } = await applyProductionImpact({
         product,
         cakes,
-        productionDate: productionDateOnly,
+        productionDate: production_date,
         productionLocation,
         userId,
         referenceType: "CakeProduction",
@@ -632,17 +625,8 @@ const update = async (req, res) => {
     const userId = getUserId(req);
     const updatePayload = { isDeleted: false };
 
-    if (production_date !== undefined) {
-      try {
-        const productionDateOnly = assertNotPastDate(
-          production_date,
-          "Production date",
-        );
-        updatePayload.production_date = new Date(productionDateOnly);
-      } catch (err) {
-        return createError(res, err.status || 400, err.message);
-      }
-    }
+    if (production_date !== undefined)
+      updatePayload.production_date = new Date(production_date);
     if (cakes_produced !== undefined) {
       const cakes = Number(cakes_produced);
       if (!Number.isFinite(cakes) || cakes < 0) {
