@@ -1,8 +1,10 @@
 /**
- * Calendar-date helpers (YYYY-MM-DD). Avoids Date timezone shift on comparisons.
+ * Calendar-date helpers (YYYY-MM-DD).
+ * Business timezone: Asia/Karachi (UTC+05:00) — matches shop / ERP usage.
  */
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const PKT_OFFSET = "+05:00";
 
 const parseDateOnly = (value) => {
   if (value == null || value === "") return null;
@@ -10,13 +12,44 @@ const parseDateOnly = (value) => {
   return DATE_ONLY_RE.test(s) ? s : null;
 };
 
-/** Local server calendar today as YYYY-MM-DD. */
+/** Local server calendar today as YYYY-MM-DD (fallback). Prefer PKT for business day. */
 const todayDateOnly = () => {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+  // Asia/Karachi "today" via Intl — works on Vercel (UTC) and local.
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Karachi",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+  } catch {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, "0");
+    const d = String(now.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+};
+
+/**
+ * Inclusive start/end Date objects for a calendar day in Asia/Karachi.
+ * Avoids `new Date("YYYY-MM-DD")` + setHours() timezone drift (empty lists on Vercel).
+ */
+const dayBounds = (dateStr) => {
+  const d = parseDateOnly(dateStr);
+  if (!d) return null;
+  const start = new Date(`${d}T00:00:00.000${PKT_OFFSET}`);
+  const end = new Date(`${d}T23:59:59.999${PKT_OFFSET}`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  return { start, end };
+};
+
+/** Inclusive bounds spanning start_date .. end_date (PKT calendar days). */
+const rangeBounds = (startDateStr, endDateStr) => {
+  const startDay = dayBounds(startDateStr);
+  const endDay = dayBounds(endDateStr || startDateStr);
+  if (!startDay || !endDay) return null;
+  return { start: startDay.start, end: endDay.end };
 };
 
 /**
@@ -72,9 +105,19 @@ const assertNotPastDate = (value, fieldLabel = "Date") => {
   return s;
 };
 
+/** Store calendar dates at PKT noon so they always land on the intended day. */
+const toStoredDate = (dateStr) => {
+  const d = parseDateOnly(dateStr);
+  if (!d) return null;
+  return new Date(`${d}T12:00:00.000${PKT_OFFSET}`);
+};
+
 module.exports = {
   parseDateOnly,
   todayDateOnly,
+  dayBounds,
+  rangeBounds,
   resolveQueryDateRange,
   assertNotPastDate,
+  toStoredDate,
 };
