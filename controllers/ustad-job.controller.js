@@ -999,7 +999,7 @@ const create = async (req, res) => {
     }
 
     try {
-      // RM Store (type 1) + Production (type 2) are shared; Product/Shop still scoped.
+      // RM Store must belong to this manager's store; Production/Shop/FG may be shared.
       await assertRmManagerStoreAccess(req, [fromLoc._id, toLoc._id]);
     } catch (err) {
       return createError(res, err.status || 403, err.message);

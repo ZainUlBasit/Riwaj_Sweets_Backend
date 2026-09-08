@@ -2,6 +2,9 @@ const DispatchLocation = require("../Models/DispatchLocation");
 
 const RM_MANAGER_ROLE = 6;
 
+/** Shared across RM Managers for transfers / receive — NOT RM Store (type 1). */
+const SHARED_LOCATION_TYPES = [2, 3, 4]; // Production, Shop, Product Store
+
 const getAssignedStoreId = (req) => {
   if (!req.user) return null;
   if (Number(req.user.role) === RM_MANAGER_ROLE) {
@@ -14,16 +17,18 @@ const isRmManager = (req) => Number(req.user?.role) === RM_MANAGER_ROLE;
 
 async function assertLocationBelongsToStore(locationId, storeId) {
   if (!locationId || !storeId) return;
-  const loc = await DispatchLocation.findById(locationId).where({ isDeleted: false });
+  const loc = await DispatchLocation.findById(locationId).where({
+    isDeleted: false,
+  });
   if (!loc) {
     const err = new Error("Location not found.");
     err.status = 404;
     throw err;
   }
   const type = Number(loc.location_type);
-  // Shared system / simple masters used across RM Manager godowns:
-  //   1 = RM Store, 2 = Production, 3 = Shop, 4 = Product Store
-  if (type === 1 || type === 2 || type === 3 || type === 4) return;
+  // Shop / Product Store / Production can be used across godowns.
+  // RM Store (type 1) must belong to the manager's assigned store.
+  if (SHARED_LOCATION_TYPES.includes(type)) return;
 
   if (!loc.store_id || String(loc.store_id) !== String(storeId)) {
     const err = new Error("This location is outside your assigned store.");
@@ -47,9 +52,9 @@ async function getStoreLocationIds(storeId) {
     store_id: storeId,
     isDeleted: false,
   }).distinct("_id");
-  // Shared simple masters: RM Store, Production, Shop, Product Store
+  // Shared masters only (not RM Store — each manager keeps their own RM Store)
   const shared = await DispatchLocation.find({
-    location_type: { $in: [1, 2, 3, 4] },
+    location_type: { $in: SHARED_LOCATION_TYPES },
     isDeleted: false,
   }).distinct("_id");
   const ids = new Set([...own, ...shared].map(String));
@@ -65,6 +70,7 @@ async function applyStoreLocationFilter(req, filter, field = "location_id") {
 
 module.exports = {
   RM_MANAGER_ROLE,
+  SHARED_LOCATION_TYPES,
   getAssignedStoreId,
   isRmManager,
   assertLocationBelongsToStore,
