@@ -8,8 +8,21 @@ const parseMoney = (raw) => {
   if (!Number.isFinite(n) || n < 0) return null;
   return Math.round(n * 100) / 100;
 };
+
+const assertManagerOwnsUstad = (req, ustad) => {
+  const assignedStoreId = getAssignedStoreId(req);
+  if (!assignedStoreId) return null;
+  if (String(ustad.store_id || "") !== String(assignedStoreId)) {
+    const err = new Error("This ustad is outside your assigned store.");
+    err.status = 403;
+    return err;
+  }
+  return null;
+};
+
 /**
  * GET /api/ustad
+ * RM Manager → only ustads for their Store (Store 1 / Store 2).
  */
 const list = async (req, res) => {
   try {
@@ -19,19 +32,18 @@ const list = async (req, res) => {
 
     const assignedStoreId = getAssignedStoreId(req);
     if (assignedStoreId) {
-      filter.$or = [
-        { store_id: assignedStoreId },
-        { store_id: null },
-        { store_id: { $exists: false } },
-      ];
+      filter.store_id = assignedStoreId;
     } else if (req.query.store_id) {
       filter.store_id = req.query.store_id;
     }
 
+    const deletedFilter = { isDeleted: true };
+    if (assignedStoreId) deletedFilter.store_id = assignedStoreId;
+
     const items = await Ustad.find(filter)
       .populate("store_id", "name")
       .sort({ name: 1, createdAt: -1 });
-    const deletedItems = await Ustad.find({ isDeleted: true })
+    const deletedItems = await Ustad.find(deletedFilter)
       .populate("store_id", "name")
       .sort({ name: 1 });
 
@@ -52,6 +64,8 @@ const getOne = async (req, res) => {
       .where({ isDeleted: false })
       .populate("store_id", "name");
     if (!item) return createError(res, 404, "Ustad not found.");
+    const denied = assertManagerOwnsUstad(req, item);
+    if (denied) return createError(res, denied.status, denied.message);
     return successMessage(res, item, "Ustad fetched successfully.");
   } catch (err) {
     console.error("Ustad getOne error:", err);
@@ -93,7 +107,15 @@ const create = async (req, res) => {
     }
 
     const assignedStoreId = getAssignedStoreId(req);
-    const storeId = store_id || assignedStoreId || null;
+    // RM Manager always stamped to their store; Admin must pick Store 1 / Store 2.
+    const storeId = assignedStoreId || store_id || null;
+    if (!storeId) {
+      return createError(
+        res,
+        400,
+        "Select Store 1 or Store 2 for this ustad.",
+      );
+    }
 
     const duplicate = await Ustad.findOne({
       name: new RegExp(
@@ -101,7 +123,7 @@ const create = async (req, res) => {
         "i",
       ),
       isDeleted: false,
-      ...(storeId ? { store_id: storeId } : {}),
+      store_id: storeId,
     });
     if (duplicate) {
       return createError(res, 409, "Is naam ka ustad pehle se registered hai.");
@@ -120,7 +142,8 @@ const create = async (req, res) => {
       isDeleted: false,
     });
 
-    return successMessage(res, item, "Ustad registered successfully.");
+    const populated = await Ustad.findById(item._id).populate("store_id", "name");
+    return successMessage(res, populated, "Ustad registered successfully.");
   } catch (err) {
     console.error("Ustad create error:", err);
     return createError(res, 500, err.message || "Failed to register ustad.");
@@ -133,6 +156,9 @@ const update = async (req, res) => {
       isDeleted: false,
     });
     if (!existing) return createError(res, 404, "Ustad not found.");
+
+    const denied = assertManagerOwnsUstad(req, existing);
+    if (denied) return createError(res, denied.status, denied.message);
 
     const {
       name,
@@ -181,7 +207,17 @@ const update = async (req, res) => {
       }
       payload.tea_expense = parsedTea;
     }
-    if (store_id !== undefined) payload.store_id = store_id || null;
+
+    const assignedStoreId = getAssignedStoreId(req);
+    if (assignedStoreId) {
+      payload.store_id = assignedStoreId;
+    } else if (store_id !== undefined) {
+      if (!store_id) {
+        return createError(res, 400, "Select Store 1 or Store 2 for this ustad.");
+      }
+      payload.store_id = store_id;
+    }
+
     if (isActive !== undefined) payload.isActive = !!isActive;
 
     const item = await Ustad.findByIdAndUpdate(req.params.id, payload, {
@@ -198,6 +234,13 @@ const update = async (req, res) => {
 
 const remove = async (req, res) => {
   try {
+    const existing = await Ustad.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!existing) return createError(res, 404, "Ustad not found.");
+    const denied = assertManagerOwnsUstad(req, existing);
+    if (denied) return createError(res, denied.status, denied.message);
+
     const item = await Ustad.findOneAndUpdate(
       { _id: req.params.id, isDeleted: false },
       { isDeleted: true, isActive: false },
