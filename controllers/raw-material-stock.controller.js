@@ -16,6 +16,7 @@ const {
   debitRmStoreOnPurchaseReverse,
   withTransaction,
 } = require("../Services/inventoryService");
+const { applyInventoryStoreFilter } = require("../utils/storeScope");
 
 /** Resolve RM Store for a purchase — stored field, or legacy ledger lookup. */
 async function resolvePurchaseRmStoreId(stockDoc, session = null) {
@@ -44,7 +45,7 @@ function resolvePurchaseSupplierId(stockDoc, rawMaterialDoc = null) {
 
 const list = async (req, res) => {
   try {
-    const filter = { isDeleted: false };
+    const filter = {};
     if (req.query.raw_material_id) {
       filter.raw_material_id = req.query.raw_material_id;
     }
@@ -52,18 +53,30 @@ const list = async (req, res) => {
       filter.purpose = Number(req.query.purpose);
     }
 
+    const scopedFilter = await applyInventoryStoreFilter(
+      req,
+      filter,
+      "rm_store_location_id",
+    );
+
     const locationPopulate = {
       path: "rm_store_location_id",
       select: "name location_type store_id",
       populate: { path: "store_id", select: "name" },
     };
 
-    const items = await RawMaterialStock.find(filter)
+    const items = await RawMaterialStock.find({
+      ...scopedFilter,
+      isDeleted: false,
+    })
       .populate("raw_material_id")
       .populate("supplier_id")
       .populate(locationPopulate)
       .sort({ createdAt: -1 });
-    const deletedItems = await RawMaterialStock.find({ isDeleted: true })
+    const deletedItems = await RawMaterialStock.find({
+      ...scopedFilter,
+      isDeleted: true,
+    })
       .populate("raw_material_id")
       .populate("supplier_id")
       .populate(locationPopulate)

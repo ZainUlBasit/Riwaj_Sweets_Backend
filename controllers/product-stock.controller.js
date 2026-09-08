@@ -21,6 +21,7 @@ const {
   getLocationInventoryQty,
   withTransaction,
 } = require("../Services/inventoryService");
+const { applyInventoryStoreFilter } = require("../utils/storeScope");
 
 const STOCK_SOURCE = { SELF_PRODUCTION: 1, SUPPLIER: 2 };
 
@@ -126,18 +127,38 @@ async function applyRawMaterialUsage(rawMaterialsUsed, multiplier = 1, userId = 
 
 const list = async (req, res) => {
   try {
-    const filter = { isDeleted: false };
+    const filter = {};
     if (req.query.product_id) filter.product_id = req.query.product_id;
 
-    const items = await ProductStock.find(filter)
+    const scopedFilter = await applyInventoryStoreFilter(
+      req,
+      filter,
+      "location_id",
+    );
+
+    const items = await ProductStock.find({
+      ...scopedFilter,
+      isDeleted: false,
+    })
       .populate("product_id")
-      .populate("location_id")
+      .populate({
+        path: "location_id",
+        select: "name location_type store_id",
+        populate: { path: "store_id", select: "name" },
+      })
       .populate("supplier_id")
       .populate("raw_materials_used.raw_material_id")
       .sort({ createdAt: -1 });
-    const deletedItems = await ProductStock.find({ isDeleted: true })
+    const deletedItems = await ProductStock.find({
+      ...scopedFilter,
+      isDeleted: true,
+    })
       .populate("product_id")
-      .populate("location_id")
+      .populate({
+        path: "location_id",
+        select: "name location_type store_id",
+        populate: { path: "store_id", select: "name" },
+      })
       .populate("supplier_id")
       .populate("raw_materials_used.raw_material_id")
       .sort({ createdAt: -1 });
@@ -787,7 +808,13 @@ const listLogs = async (req, res) => {
       if (end_date) filter.createdAt.$lte = new Date(end_date);
     }
 
-    const items = await InventoryLedger.find(filter)
+    const scopedFilter = await applyInventoryStoreFilter(
+      req,
+      filter,
+      "location_id",
+    );
+
+    const items = await InventoryLedger.find(scopedFilter)
       .populate("product_id", "name unit id")
       .populate("location_id", "name location_type")
       .populate("user_id", "name email")
