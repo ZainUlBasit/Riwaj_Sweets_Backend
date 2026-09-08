@@ -15,6 +15,9 @@ const populateStore = (q) => q.populate("store_id", "name description");
 
 const list = async (_req, res) => {
   try {
+    const { ensureDefaultLocations } = require("../Services/ensureDefaultLocations");
+    await ensureDefaultLocations();
+
     const items = await populateStore(
       User.find({ isDeleted: false, role: RM_MANAGER_ROLE })
         .sort({ createdAt: -1 })

@@ -10,16 +10,32 @@ const findByExactName = (name) =>
     isDeleted: false,
   });
 
+async function ensureGodown(name, description) {
+  const nameRe = new RegExp(`^${escapeRe(name)}$`, "i");
+  let store = await Store.findOne({ name: nameRe, isDeleted: false });
+  if (!store) {
+    store = await Store.create({
+      name,
+      description,
+      isDeleted: false,
+    });
+  } else if (description && store.description !== description) {
+    store.description = description;
+    await store.save();
+  }
+  return store;
+}
+
 /**
- * Ensure a named default location exists (active). Soft-deleted matches
- * with the same type are restored instead of creating a duplicate.
+ * Ensure a named location exists and is attached to `storeId`.
+ * Soft-deleted same-name+type rows are restored.
+ * Existing active rows are re-attached to the correct godown (pairing heal).
  *
- * @param {number} minCountForType — if this many (or more) locations of
- *   `location_type` already exist, skip creating a missing default name
- *   (user may have renamed "Shop 1" without wanting a new "Shop 1").
+ * @param {number} minCountForType — skip create if enough of this type exist
+ *   under other names (user renamed defaults).
  */
 async function ensureNamedLocation(
-  mainId,
+  storeId,
   { name, location_type, description },
   minCountForType = 1,
 ) {
@@ -33,7 +49,7 @@ async function ensureNamedLocation(
   if (softDeleted) {
     softDeleted.isDeleted = false;
     softDeleted.description = softDeleted.description || description;
-    if (!softDeleted.store_id) softDeleted.store_id = mainId;
+    softDeleted.store_id = storeId;
     await softDeleted.save();
     return softDeleted;
   }
@@ -41,10 +57,16 @@ async function ensureNamedLocation(
   const existing = await findByExactName(name);
   if (existing) {
     if (Number(existing.location_type) !== location_type) return existing;
-    if (!existing.store_id) {
-      existing.store_id = mainId;
-      await existing.save();
+    let dirty = false;
+    if (String(existing.store_id || "") !== String(storeId)) {
+      existing.store_id = storeId;
+      dirty = true;
     }
+    if (description && !existing.description) {
+      existing.description = description;
+      dirty = true;
+    }
+    if (dirty) await existing.save();
     return existing;
   }
 
@@ -59,36 +81,22 @@ async function ensureNamedLocation(
   return DispatchLocation.create({
     name,
     description,
-    store_id: mainId,
+    store_id: storeId,
     location_type,
     isDeleted: false,
   });
 }
 
 /**
- * Simple masters defaults (shown on /stores):
- * - RM Store 1 / RM Store 2
- * - Product Store 1 / Product Store 2
- * - Shop 1 / Shop 2
- * - Hidden Main godown + Production (for inventory)
- *
- * Do NOT auto soft-delete Product Stores — that hid them from RM Managers
- * on every /dispatch-location list call.
+ * Masters defaults with manager pairs:
+ *   Store 1 → RM Store 1 + Product Store 1
+ *   Store 2 → RM Store 2 + Product Store 2
+ * Shops + Production stay on Main (shared across managers).
  */
 async function ensureDefaultLocations() {
-  let main = await Store.findOne({
-    name: /^Main$/i,
-    isDeleted: false,
-  });
-  if (!main) {
-    main = await Store.create({
-      name: "Main",
-      description: "Internal — auto Production",
-      isDeleted: false,
-    });
-  }
+  const main = await ensureGodown("Main", "Internal — shared Production / Shops");
 
-  // Production stays auto/hidden for manufacturing flows
+  // Production stays auto/hidden for manufacturing flows (shared)
   let production = await DispatchLocation.findOne({
     store_id: main._id,
     location_type: LOCATION_TYPE.PRODUCTION_AREA,
@@ -100,7 +108,7 @@ async function ensureDefaultLocations() {
       byName &&
       Number(byName.location_type) === LOCATION_TYPE.PRODUCTION_AREA
     ) {
-      if (!byName.store_id) {
+      if (String(byName.store_id || "") !== String(main._id)) {
         byName.store_id = main._id;
         await byName.save();
       }
@@ -115,50 +123,76 @@ async function ensureDefaultLocations() {
     }
   }
 
-  const defaults = [
+  const store1 = await ensureGodown(
+    "Store 1",
+    "RM Manager 1 — RM Store 1 + Product Store 1",
+  );
+  const store2 = await ensureGodown(
+    "Store 2",
+    "RM Manager 2 — RM Store 2 + Product Store 2",
+  );
+
+  const paired = [
     {
+      storeId: store1._id,
       name: "RM Store 1",
       location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
-      description: "Raw material store",
+      description: "Raw material store (Manager 1)",
     },
     {
-      name: "RM Store 2",
-      location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
-      description: "Raw material store",
-    },
-    {
+      storeId: store1._id,
       name: "Product Store 1",
       location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
-      description: "Finished goods store",
+      description: "Finished goods store (Manager 1)",
     },
     {
+      storeId: store2._id,
+      name: "RM Store 2",
+      location_type: LOCATION_TYPE.RAW_MATERIAL_STORE,
+      description: "Raw material store (Manager 2)",
+    },
+    {
+      storeId: store2._id,
       name: "Product Store 2",
       location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,
-      description: "Finished goods store",
+      description: "Finished goods store (Manager 2)",
     },
+  ];
+
+  const sharedShops = [
     {
+      storeId: main._id,
       name: "Shop 1",
       location_type: LOCATION_TYPE.SHOP,
       description: "Retail shop",
     },
     {
+      storeId: main._id,
       name: "Shop 2",
       location_type: LOCATION_TYPE.SHOP,
       description: "Retail shop",
     },
   ];
 
-  const quotaByType = defaults.reduce((acc, d) => {
+  const all = [...paired, ...sharedShops];
+  const quotaByType = all.reduce((acc, d) => {
     acc[d.location_type] = (acc[d.location_type] || 0) + 1;
     return acc;
   }, {});
 
-  for (const d of defaults) {
-    await ensureNamedLocation(main._id, d, quotaByType[d.location_type]);
+  for (const d of all) {
+    await ensureNamedLocation(
+      d.storeId,
+      {
+        name: d.name,
+        location_type: d.location_type,
+        description: d.description,
+      },
+      quotaByType[d.location_type],
+    );
   }
 
-  // Legacy singular "Product Store" (older seed) — restore if soft-deleted so
-  // existing inventory links keep working, then keep it visible on /stores.
+  // Legacy singular "Product Store" — restore if soft-deleted; leave on Main.
   const legacyPs = await DispatchLocation.findOne({
     name: /^Product Store$/i,
     location_type: LOCATION_TYPE.FINISHED_GOODS_STORE,

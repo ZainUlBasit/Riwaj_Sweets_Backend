@@ -2,8 +2,12 @@ const DispatchLocation = require("../Models/DispatchLocation");
 
 const RM_MANAGER_ROLE = 6;
 
-/** Shared across RM Managers for transfers / receive — NOT RM Store (type 1). */
-const SHARED_LOCATION_TYPES = [2, 3, 4]; // Production, Shop, Product Store
+/**
+ * Shared across RM Managers for transfers / receive.
+ * RM Store (1) + Product Store (4) are per assigned Store
+ * (Store 1 → RM1+PS1, Store 2 → RM2+PS2).
+ */
+const SHARED_LOCATION_TYPES = [2, 3]; // Production, Shop
 
 const getAssignedStoreId = (req) => {
   if (!req.user) return null;
@@ -26,8 +30,8 @@ async function assertLocationBelongsToStore(locationId, storeId) {
     throw err;
   }
   const type = Number(loc.location_type);
-  // Shop / Product Store / Production can be used across godowns.
-  // RM Store (type 1) must belong to the manager's assigned store.
+  // Shop / Production can be used across godowns.
+  // RM Store + Product Store must belong to the manager's assigned store.
   if (SHARED_LOCATION_TYPES.includes(type)) return;
 
   if (!loc.store_id || String(loc.store_id) !== String(storeId)) {
@@ -52,7 +56,7 @@ async function getStoreLocationIds(storeId) {
     store_id: storeId,
     isDeleted: false,
   }).distinct("_id");
-  // Shared masters only (not RM Store — each manager keeps their own RM Store)
+  // Shared masters only (Shop / Production — not RM or Product Store)
   const shared = await DispatchLocation.find({
     location_type: { $in: SHARED_LOCATION_TYPES },
     isDeleted: false,

@@ -55,10 +55,10 @@ const findByName = (name) =>
 /**
  * RM Manager store scope for /stores masters.
  * Include:
- *  - locations on their assigned godown (incl. that godown's RM Store)
- *  - unscoped legacy rows (store_id null) for Shop / Product Store
- *  - system-wide Shop + Product Store (needed for transfers / receive)
- * RM Store is NOT global — each RM Manager only sees their store's RM Store.
+ *  - locations on their assigned godown (RM Store + Product Store pair)
+ *  - unscoped legacy Shop rows (store_id null)
+ *  - system-wide Shop + Production (transfers / receive / manufacturing)
+ * RM Store + Product Store are NOT global — each manager sees only their pair.
  */
 const buildListFilter = (req, { deleted }) => {
   const filter = { isDeleted: !!deleted };
@@ -74,15 +74,9 @@ const buildListFilter = (req, { deleted }) => {
       { store_id: scopedStore },
       {
         store_id: null,
-        location_type: {
-          $in: [
-            LOCATION_TYPE.SHOP,
-            LOCATION_TYPE.FINISHED_GOODS_STORE,
-          ],
-        },
+        location_type: LOCATION_TYPE.SHOP,
       },
       { location_type: LOCATION_TYPE.SHOP },
-      { location_type: LOCATION_TYPE.FINISHED_GOODS_STORE },
       { location_type: LOCATION_TYPE.PRODUCTION_AREA },
     ],
   };
