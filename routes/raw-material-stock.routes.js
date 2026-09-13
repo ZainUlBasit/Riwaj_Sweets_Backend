@@ -9,6 +9,7 @@ router.use(verifyToken);
 // `/:id` routes so Express does not interpret "production" as an :id.
 router.post("/production", controller.createProduction);
 router.delete("/production/:id", controller.removeProduction);
+router.post("/bulk", controller.createBulk);
 
 router.get("/", controller.list);
 router.get("/:id", controller.getOne);

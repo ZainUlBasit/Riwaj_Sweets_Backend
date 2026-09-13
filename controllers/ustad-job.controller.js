@@ -1100,85 +1100,131 @@ const create = async (req, res) => {
  * Extra RM on an open job (weekly top-up, not a new job).
  * Body: { issue_date?, lines: [{ raw_material_id, raw_material_stock_id, quantity }] }
  */
+const findOpenJobForUstad = async (ustadId) => {
+  if (!ustadId) return null;
+  return UstadJob.findOne({
+    ustad_id: ustadId,
+    status: JOB_STATUS.OPEN,
+    isDeleted: false,
+  }).sort({ issue_date: -1, createdAt: -1 });
+};
+
+/**
+ * Issue extra RM lines onto an already-open job (same rules as addRm).
+ * Used by HTTP addRm and bulk RM stock-in.
+ */
+async function issueExtraRmOnOpenJob({
+  job,
+  lines,
+  issue_date,
+  userId,
+  req = null,
+}) {
+  if (!job) {
+    const err = new Error("Ustad job not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (Number(job.status) === JOB_STATUS.CLOSED) {
+    const err = new Error(
+      "Job closed hai. Extra RM ke liye pehle reopen karein.",
+    );
+    err.status = 409;
+    throw err;
+  }
+  if (!Array.isArray(lines) || lines.length === 0) {
+    const err = new Error("At least one RM line is required.");
+    err.status = 400;
+    throw err;
+  }
+
+  const issuedAt = issue_date ? new Date(issue_date) : new Date();
+  if (Number.isNaN(issuedAt.getTime())) {
+    const err = new Error("Invalid issue_date.");
+    err.status = 400;
+    throw err;
+  }
+
+  if (req) {
+    await assertRmManagerStoreAccess(req, [
+      job.from_location_id,
+      job.location_id,
+    ]);
+  }
+
+  const fromLoc = await DispatchLocation.findById(job.from_location_id).where({
+    isDeleted: false,
+  });
+  const toLoc = await DispatchLocation.findById(job.location_id).where({
+    isDeleted: false,
+  });
+  if (!fromLoc) {
+    const err = new Error("RM Store not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (!toLoc) {
+    const err = new Error("Production area not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  const normalized = await snapshotRmLines(lines);
+  const extraValue = round2(
+    normalized.reduce((s, r) => s + Number(r.line_value || 0), 0),
+  );
+
+  await withTransaction(async (session) => {
+    const saved = await issueRmLines({
+      job,
+      fromLoc,
+      toLoc,
+      ustadName: job.ustad_name,
+      userId,
+      rows: normalized,
+      issueDate: issuedAt,
+      isExtra: true,
+      session,
+    });
+    job.lines = [...(job.lines || []), ...saved];
+    job.rm_value_issued = round2(Number(job.rm_value_issued || 0) + extraValue);
+    await job.save({ session });
+    await writeAudit({
+      entityType: "UstadJob",
+      entityId: job._id,
+      action: "update",
+      newValue: { extra_rm: saved, extra_value: extraValue },
+      userId,
+      notes: `Extra RM Rs ${extraValue.toLocaleString("en-IN")} issued`,
+      session,
+    });
+  });
+
+  return { job, extraValue };
+}
+
 const addRm = async (req, res) => {
   try {
     const job = await UstadJob.findById(req.params.id).where({
       isDeleted: false,
     });
     if (!job) return createError(res, 404, "Ustad job not found.");
-    if (Number(job.status) === JOB_STATUS.CLOSED) {
-      return createError(
-        res,
-        409,
-        "Job closed hai. Extra RM ke liye pehle reopen karein.",
-      );
-    }
 
     const { lines, issue_date } = req.body || {};
-    if (!Array.isArray(lines) || lines.length === 0) {
-      return createError(res, 400, "At least one RM line is required.");
-    }
+    const userId = getUserId(req);
 
-    const issuedAt = issue_date ? new Date(issue_date) : new Date();
-    if (Number.isNaN(issuedAt.getTime())) {
-      return createError(res, 400, "Invalid issue_date.");
-    }
-
+    let extraValue;
     try {
-      await assertRmManagerStoreAccess(req, [
-        job.from_location_id,
-        job.location_id,
-      ]);
-    } catch (err) {
-      return createError(res, err.status || 403, err.message);
-    }
-
-    const fromLoc = await DispatchLocation.findById(job.from_location_id).where({
-      isDeleted: false,
-    });
-    const toLoc = await DispatchLocation.findById(job.location_id).where({
-      isDeleted: false,
-    });
-    if (!fromLoc) return createError(res, 404, "RM Store not found.");
-    if (!toLoc) return createError(res, 404, "Production area not found.");
-
-    let normalized;
-    try {
-      normalized = await snapshotRmLines(lines);
+      ({ extraValue } = await issueExtraRmOnOpenJob({
+        job,
+        lines,
+        issue_date,
+        userId,
+        req,
+      }));
     } catch (err) {
       return createError(res, err.status || 400, err.message);
     }
-
-    const extraValue = round2(
-      normalized.reduce((s, r) => s + Number(r.line_value || 0), 0),
-    );
-    const userId = getUserId(req);
-
-    await withTransaction(async (session) => {
-      const saved = await issueRmLines({
-        job,
-        fromLoc,
-        toLoc,
-        ustadName: job.ustad_name,
-        userId,
-        rows: normalized,
-        issueDate: issuedAt,
-        isExtra: true,
-        session,
-      });
-      job.lines = [...(job.lines || []), ...saved];
-      job.rm_value_issued = round2(Number(job.rm_value_issued || 0) + extraValue);
-      await job.save({ session });
-      await writeAudit({
-        entityType: "UstadJob",
-        entityId: job._id,
-        action: "update",
-        newValue: { extra_rm: saved, extra_value: extraValue },
-        userId,
-        notes: `Extra RM Rs ${extraValue.toLocaleString("en-IN")} issued`,
-        session,
-      });
-    });
 
     const populated = await populateJob(UstadJob.findById(job._id));
     const summary = await buildSummary(populated);
@@ -1727,4 +1773,6 @@ module.exports = {
   remove,
   JOB_STATUS,
   generateJobCode,
+  findOpenJobForUstad,
+  issueExtraRmOnOpenJob,
 };

@@ -16,7 +16,7 @@ const {
   debitRmStoreOnPurchaseReverse,
   withTransaction,
 } = require("../Services/inventoryService");
-const { applyInventoryStoreFilter } = require("../utils/storeScope");
+const { applyInventoryStoreFilter, assertRmManagerStoreAccess } = require("../utils/storeScope");
 
 /** Resolve RM Store for a purchase — stored field, or legacy ledger lookup. */
 async function resolvePurchaseRmStoreId(stockDoc, session = null) {
@@ -178,136 +178,151 @@ const getOne = async (req, res) => {
   }
 };
 
+
+/** Create one purchase stock entry (same rules as POST /). */
+async function createPurchaseStock(body, userId) {
+  const {
+    raw_material_id,
+    supplier_id,
+    desc,
+    quantity,
+    price,
+    total_price,
+    rm_store_location_id,
+  } = body || {};
+
+  if (!raw_material_id) {
+    const err = new Error("raw_material_id is required.");
+    err.status = 400;
+    throw err;
+  }
+  if (!supplier_id) {
+    const err = new Error("supplier_id is required.");
+    err.status = 400;
+    throw err;
+  }
+  const batchDesc = String(desc ?? "").trim();
+  if (!batchDesc) {
+    const err = new Error("Description (Batch) is required.");
+    err.status = 400;
+    throw err;
+  }
+  if (!rm_store_location_id) {
+    const err = new Error(
+      "rm_store_location_id is required. Purchase must go into an RM Store.",
+    );
+    err.status = 400;
+    throw err;
+  }
+  const qty = Number(quantity ?? 0);
+  if (!qty || qty <= 0) {
+    const err = new Error("quantity must be greater than 0.");
+    err.status = 400;
+    throw err;
+  }
+  const prc = Number(price ?? 0);
+  const totalPrice = total_price != null ? Number(total_price) : qty * prc;
+
+  const rawMaterial = await RawMaterial.findById(raw_material_id).where({
+    isDeleted: false,
+  });
+  if (!rawMaterial) {
+    const err = new Error("Raw material not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  const supplier = await Supplier.findById(supplier_id).where({
+    isDeleted: false,
+  });
+  if (!supplier) {
+    const err = new Error("Supplier not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  const loc = await DispatchLocation.findById(rm_store_location_id).where({
+    isDeleted: false,
+  });
+  if (!loc) {
+    const err = new Error("RM Store location not found.");
+    err.status = 404;
+    throw err;
+  }
+  if (Number(loc.location_type) !== 1) {
+    const err = new Error("rm_store_location_id must be a Raw Material Store.");
+    err.status = 400;
+    throw err;
+  }
+
+  return withTransaction(async (session) => {
+    const opts = { session };
+
+    const [created] = await RawMaterialStock.create(
+      [
+        {
+          raw_material_id,
+          supplier_id,
+          desc: batchDesc,
+          quantity: qty,
+          out_quantity: 0,
+          remaining_quantity: qty,
+          price: prc,
+          total_price: totalPrice,
+          purpose: 1,
+          rm_store_location_id,
+          isDeleted: false,
+        },
+      ],
+      opts,
+    );
+
+    await RawMaterial.findByIdAndUpdate(
+      raw_material_id,
+      { price: prc },
+      opts,
+    );
+
+    await adjustRawMaterial(
+      raw_material_id,
+      { inDelta: qty, availDelta: qty },
+      session,
+    );
+
+    await Supplier.findByIdAndUpdate(
+      supplier_id,
+      { $inc: { total_amount: totalPrice, payable: totalPrice } },
+      opts,
+    );
+
+    await creditRmStoreOnPurchase({
+      rmStoreLocationId: rm_store_location_id,
+      rawMaterialId: raw_material_id,
+      quantity: qty,
+      referenceType: "RawMaterialStock",
+      referenceId: created._id,
+      userId,
+      notes: batchDesc || "Raw material purchase",
+      session,
+    });
+
+    await writeAudit({
+      entityType: "RawMaterialStock",
+      entityId: created._id,
+      action: "create",
+      newValue: created.toObject?.() ?? created,
+      userId,
+      session,
+    });
+
+    return created;
+  });
+}
+
 const create = async (req, res) => {
   try {
-    const {
-      raw_material_id,
-      supplier_id,
-      desc,
-      quantity,
-      price,
-      total_price,
-      rm_store_location_id,
-    } = req.body;
-    if (!raw_material_id) {
-      return createError(res, 400, "raw_material_id is required.");
-    }
-    if (!supplier_id) {
-      return createError(res, 400, "supplier_id is required.");
-    }
-    const batchDesc = String(desc ?? "").trim();
-    if (!batchDesc) {
-      return createError(res, 400, "Description (Batch) is required.");
-    }
-    if (!rm_store_location_id) {
-      return createError(
-        res,
-        400,
-        "rm_store_location_id is required. Purchase must go into an RM Store.",
-      );
-    }
-    const qty = Number(quantity ?? 0);
-    if (!qty || qty <= 0) {
-      return createError(res, 400, "quantity must be greater than 0.");
-    }
-    const prc = Number(price ?? 0);
-    const totalPrice = total_price != null ? Number(total_price) : qty * prc;
-
-    const rawMaterial = await RawMaterial.findById(raw_material_id).where({
-      isDeleted: false,
-    });
-    if (!rawMaterial) {
-      return createError(res, 404, "Raw material not found.");
-    }
-
-    const supplier = await Supplier.findById(supplier_id).where({
-      isDeleted: false,
-    });
-    if (!supplier) {
-      return createError(res, 404, "Supplier not found.");
-    }
-
-    const loc = await DispatchLocation.findById(rm_store_location_id).where({
-      isDeleted: false,
-    });
-    if (!loc) {
-      return createError(res, 404, "RM Store location not found.");
-    }
-    if (Number(loc.location_type) !== 1) {
-      return createError(
-        res,
-        400,
-        "rm_store_location_id must be a Raw Material Store.",
-      );
-    }
-
     const userId = getUserId(req);
-
-    const item = await withTransaction(async (session) => {
-      const opts = { session };
-
-      const [created] = await RawMaterialStock.create(
-        [
-          {
-            raw_material_id,
-            supplier_id,
-            desc: batchDesc,
-            quantity: qty,
-            out_quantity: 0,
-            remaining_quantity: qty,
-            price: prc,
-            total_price: totalPrice,
-            purpose: 1,
-            rm_store_location_id,
-            isDeleted: false,
-          },
-        ],
-        opts,
-      );
-
-      // Latest purchase price becomes the Raw Material unit price.
-      await RawMaterial.findByIdAndUpdate(
-        raw_material_id,
-        { price: prc },
-        opts,
-      );
-
-      await adjustRawMaterial(
-        raw_material_id,
-        { inDelta: qty, availDelta: qty },
-        session,
-      );
-
-      await Supplier.findByIdAndUpdate(
-        supplier_id,
-        { $inc: { total_amount: totalPrice, payable: totalPrice } },
-        opts,
-      );
-
-      // Location credit + ledger (type 1) — single source, no duplicate ledger.
-      await creditRmStoreOnPurchase({
-        rmStoreLocationId: rm_store_location_id,
-        rawMaterialId: raw_material_id,
-        quantity: qty,
-        referenceType: "RawMaterialStock",
-        referenceId: created._id,
-        userId,
-        notes: batchDesc || "Raw material purchase",
-        session,
-      });
-
-      await writeAudit({
-        entityType: "RawMaterialStock",
-        entityId: created._id,
-        action: "create",
-        newValue: created.toObject?.() ?? created,
-        userId,
-        session,
-      });
-
-      return created;
-    });
-
+    const item = await createPurchaseStock(req.body, userId);
     return successMessage(
       res,
       item,
@@ -319,6 +334,134 @@ const create = async (req, res) => {
       res,
       err.status || 500,
       err.message || "Failed to create raw material stock.",
+    );
+  }
+};
+
+/**
+ * POST /api/raw-material-stock/bulk
+ * Bulk purchase stock-in. Optional give_to_ustad adds RM to that ustad's
+ * OPEN job only (no new job create).
+ */
+const createBulk = async (req, res) => {
+  try {
+    const {
+      items,
+      supplier_id: headerSupplierId,
+      rm_store_location_id: headerRmStoreId,
+    } = req.body || {};
+    if (!Array.isArray(items) || items.length === 0) {
+      return createError(res, 400, "items array is required.");
+    }
+    if (items.length > 200) {
+      return createError(res, 400, "Max 200 items per bulk request.");
+    }
+
+    const userId = getUserId(req);
+    const {
+      findOpenJobForUstad,
+      issueExtraRmOnOpenJob,
+    } = require("./ustad-job.controller");
+
+    const created = [];
+    const issued = [];
+    const errors = [];
+    const pendingByJob = new Map();
+
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i] || {};
+      const label = `Item ${i + 1}`;
+      const payload = {
+        raw_material_id: row.raw_material_id,
+        supplier_id: row.supplier_id || headerSupplierId,
+        desc: row.desc,
+        quantity: row.quantity,
+        price: row.price,
+        total_price: row.total_price,
+        rm_store_location_id: row.rm_store_location_id || headerRmStoreId,
+      };
+
+      try {
+        await assertRmManagerStoreAccess(req, [payload.rm_store_location_id]);
+        const stock = await createPurchaseStock(payload, userId);
+        created.push(stock);
+
+        const giveToUstad =
+          row.give_to_ustad === true ||
+          row.giveToUstad === true;
+        if (giveToUstad) {
+          const ustadId = row.ustad_id;
+          if (!ustadId) {
+            errors.push(`${label}: ustad_id required when give_to_ustad.`);
+            continue;
+          }
+          const openJob = await findOpenJobForUstad(ustadId);
+          if (!openJob) {
+            errors.push(
+              `${label}: Ustad ka active (open) job nahi mila — pehle job kholo.`,
+            );
+            continue;
+          }
+          const issueDate = row.issue_date || row.issueDate || null;
+          const key = `${openJob._id}|${issueDate || ""}`;
+          const group = pendingByJob.get(key) || {
+            job: openJob,
+            issue_date: issueDate,
+            lines: [],
+          };
+          group.lines.push({
+            raw_material_id: payload.raw_material_id,
+            raw_material_stock_id: stock._id,
+            quantity: Number(payload.quantity),
+          });
+          pendingByJob.set(key, group);
+        }
+      } catch (err) {
+        errors.push(`${label}: ${err.message || "Failed"}`);
+      }
+    }
+
+    for (const group of pendingByJob.values()) {
+      try {
+        const { extraValue } = await issueExtraRmOnOpenJob({
+          job: group.job,
+          lines: group.lines,
+          issue_date: group.issue_date,
+          userId,
+          req,
+        });
+        issued.push({
+          job_id: group.job._id,
+          job_code: group.job.job_code,
+          lines: group.lines.length,
+          extra_value: extraValue,
+        });
+      } catch (err) {
+        errors.push(
+          `Ustad job ${group.job.job_code || group.job._id}: ${err.message}`,
+        );
+      }
+    }
+
+    return successMessage(
+      res,
+      {
+        created,
+        issued,
+        errors,
+        created_count: created.length,
+        issued_jobs: issued.length,
+      },
+      errors.length
+        ? `Bulk done with ${errors.length} warning(s).`
+        : "Bulk RM stock created successfully.",
+    );
+  } catch (err) {
+    console.error("RawMaterialStock createBulk error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to bulk create raw material stock.",
     );
   }
 };
@@ -759,6 +902,7 @@ module.exports = {
   list,
   getOne,
   create,
+  createBulk,
   update,
   remove,
   createProduction,
