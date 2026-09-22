@@ -1,15 +1,20 @@
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({
+  path: path.resolve(__dirname, "..", ".env"),
+});
 const express = require("express");
-const port = process.env.PORT || 8000;
+const port = Number(process.env.PORT) || 8000;
 const app = express();
 const http = require("http");
 const server = http.createServer(app);
 const mongoose = require("mongoose");
-const path = require("path");
 const cookieParser = require("cookie-parser");
 const cors = require("cors");
 
-global.rootDirectory = path.resolve(__dirname);
+global.rootDirectory = path.resolve(__dirname, "..");
+
+// Behind Hostinger / reverse proxy (HTTPS termination)
+app.set("trust proxy", 1);
 
 // CORS allowlist (env-driven, with sensible defaults for prod + local dev).
 // Configure by setting CORS_ORIGINS to a comma-separated list, e.g.
@@ -141,10 +146,11 @@ async function connectToDatabase() {
     const opts = {
       bufferCommands: false,
       maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
+      serverSelectionTimeoutMS: 20_000,
+      connectTimeoutMS: 20_000,
+      socketTimeoutMS: 120_000,
       family: 4,
-      maxIdleTimeMS: 30000,
+      maxIdleTimeMS: 60_000,
     };
 
     cached.promise = mongoose
@@ -183,12 +189,8 @@ app.get("/api/test", (req, res) => {
 });
 
 // ===================================================
-// Vercel Cron stub
+// Optional cron health stub (legacy path kept)
 // ===================================================
-// `vercel.json` schedules this endpoint weekly. The original implementation
-// in Services/cronJobs.js depends on a Customer model that does not exist
-// in this repo — returning a documented no-op keeps the cron green and
-// surfaces a clear status payload for monitoring.
 app.get("/api/cron/reset-call-status-weekly", (req, res) => {
   res.status(200).json({
     success: true,
@@ -259,6 +261,11 @@ app.use("/api/raw-material-stock", RawMaterialStockRoutes);
 // ===================================================
 const CategoryRoutes = require("../routes/category.routes");
 app.use("/api/category", CategoryRoutes);
+// ===================================================
+// Payment Method Routes (supplier ledger payment dropdown)
+// ===================================================
+const PaymentMethodRoutes = require("../routes/payment-method.routes");
+app.use("/api/payment-method", PaymentMethodRoutes);
 // ===================================================
 // Counter Routes
 // ===================================================
@@ -411,9 +418,9 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
+// Start long-lived server (Hostinger / local). Skip only on Vercel serverless.
 if (!process.env.VERCEL) {
-  server.listen(port, () => {
+  server.listen(port, "0.0.0.0", () => {
     console.log(`🚀 Server running on port ${port}`);
   });
 }
