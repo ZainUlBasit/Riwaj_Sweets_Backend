@@ -56,16 +56,23 @@ const getOne = async (req, res) => {
  */
 const create = async (req, res) => {
   try {
-    const { name, contact, address, desc, paid } = req.body;
-    if (!name || !contact) {
-      return createError(res, 400, "Name and contact are required.");
+    const { name, contact, address, desc, paid, opening_balance, phone, city, notes } =
+      req.body || {};
+    if (!name || !String(name).trim()) {
+      return createError(res, 400, "Name is required.");
     }
+    const contactVal = String(contact || phone || "—").trim() || "—";
+    const opening = Number(opening_balance) || 0;
+    const paidVal = Number(paid) || 0;
+
     const supplier = await Supplier.create({
-      name,
-      contact,
-      address: address ?? "",
-      desc: desc ?? "",
-      paid: paid ?? 0,
+      name: String(name).trim(),
+      contact: contactVal,
+      address: address ?? city ?? "",
+      desc: desc ?? notes ?? "",
+      paid: paidVal,
+      total_amount: opening,
+      payable: Math.max(0, opening - paidVal),
       isDeleted: false,
     });
     return successMessage(res, supplier, "Supplier created successfully.");

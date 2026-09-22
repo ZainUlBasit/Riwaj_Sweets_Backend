@@ -12,6 +12,7 @@ router.get("/:id/logs", controller.listLogs);
 router.get("/:id", controller.getOne);
 router.post("/", controller.create);
 router.post("/:id/rm", controller.addRm);
+router.post("/:id/transfer-rm", controller.transferRm);
 router.patch("/:id/rm/:lineId", controller.updateRmLine);
 router.delete("/:id/rm/:lineId", controller.removeRmLine);
 router.patch("/:id/close", controller.close);

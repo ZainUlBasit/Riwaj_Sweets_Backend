@@ -12,7 +12,11 @@ const parseMoney = (raw) => {
 const assertManagerOwnsUstad = (req, ustad) => {
   const assignedStoreId = getAssignedStoreId(req);
   if (!assignedStoreId) return null;
-  if (String(ustad.store_id || "") !== String(assignedStoreId)) {
+  // store_id may be populated ({ _id, name }) — compare ids only.
+  const ustadStoreId = String(
+    ustad?.store_id?._id ?? ustad?.store_id ?? "",
+  );
+  if (!ustadStoreId || ustadStoreId !== String(assignedStoreId)) {
     const err = new Error("This ustad is outside your assigned store.");
     err.status = 403;
     return err;

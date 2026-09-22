@@ -180,7 +180,7 @@ const getOne = async (req, res) => {
 
 
 /** Create one purchase stock entry (same rules as POST /). */
-async function createPurchaseStock(body, userId) {
+async function createPurchaseStock(body, userId, cache = null) {
   const {
     raw_material_id,
     supplier_id,
@@ -223,27 +223,42 @@ async function createPurchaseStock(body, userId) {
   const prc = Number(price ?? 0);
   const totalPrice = total_price != null ? Number(total_price) : qty * prc;
 
-  const rawMaterial = await RawMaterial.findById(raw_material_id).where({
-    isDeleted: false,
-  });
+  const rmKey = String(raw_material_id);
+  let rawMaterial = cache?.rawMaterials?.get(rmKey);
+  if (!rawMaterial) {
+    rawMaterial = await RawMaterial.findById(raw_material_id).where({
+      isDeleted: false,
+    });
+    if (cache?.rawMaterials) cache.rawMaterials.set(rmKey, rawMaterial || null);
+  }
   if (!rawMaterial) {
     const err = new Error("Raw material not found.");
     err.status = 404;
     throw err;
   }
 
-  const supplier = await Supplier.findById(supplier_id).where({
-    isDeleted: false,
-  });
+  const supplierKey = String(supplier_id);
+  let supplier = cache?.suppliers?.get(supplierKey);
+  if (!supplier) {
+    supplier = await Supplier.findById(supplier_id).where({
+      isDeleted: false,
+    });
+    if (cache?.suppliers) cache.suppliers.set(supplierKey, supplier || null);
+  }
   if (!supplier) {
     const err = new Error("Supplier not found.");
     err.status = 404;
     throw err;
   }
 
-  const loc = await DispatchLocation.findById(rm_store_location_id).where({
-    isDeleted: false,
-  });
+  const locKey = String(rm_store_location_id);
+  let loc = cache?.locations?.get(locKey);
+  if (!loc) {
+    loc = await DispatchLocation.findById(rm_store_location_id).where({
+      isDeleted: false,
+    });
+    if (cache?.locations) cache.locations.set(locKey, loc || null);
+  }
   if (!loc) {
     const err = new Error("RM Store location not found.");
     err.status = 404;
@@ -341,7 +356,7 @@ const create = async (req, res) => {
 /**
  * POST /api/raw-material-stock/bulk
  * Bulk purchase stock-in. Optional give_to_ustad adds RM to that ustad's
- * OPEN job only (no new job create).
+ * OPEN job; if none exists, creates a new open job.
  */
 const createBulk = async (req, res) => {
   try {
@@ -361,12 +376,20 @@ const createBulk = async (req, res) => {
     const {
       findOpenJobForUstad,
       issueExtraRmOnOpenJob,
+      createOpenJobWithRm,
     } = require("./ustad-job.controller");
 
     const created = [];
     const issued = [];
     const errors = [];
     const pendingByJob = new Map();
+    const pendingNewJobs = new Map();
+    const lookupCache = {
+      rawMaterials: new Map(),
+      suppliers: new Map(),
+      locations: new Map(),
+    };
+    const assertedStores = new Set();
 
     for (let i = 0; i < items.length; i++) {
       const row = items[i] || {};
@@ -382,39 +405,80 @@ const createBulk = async (req, res) => {
       };
 
       try {
-        await assertRmManagerStoreAccess(req, [payload.rm_store_location_id]);
-        const stock = await createPurchaseStock(payload, userId);
-        created.push(stock);
+        const storeKey = String(payload.rm_store_location_id || "");
+        if (storeKey && !assertedStores.has(storeKey)) {
+          await assertRmManagerStoreAccess(req, [payload.rm_store_location_id]);
+          assertedStores.add(storeKey);
+        }
+        const stock = await createPurchaseStock(payload, userId, lookupCache);
+        created.push({
+          _id: stock._id,
+          raw_material_id: stock.raw_material_id,
+          quantity: stock.quantity,
+          price: stock.price,
+          desc: stock.desc,
+          rm_store_location_id: stock.rm_store_location_id,
+        });
 
         const giveToUstad =
-          row.give_to_ustad === true ||
-          row.giveToUstad === true;
+          row.give_to_ustad === true || row.giveToUstad === true;
         if (giveToUstad) {
           const ustadId = row.ustad_id;
           if (!ustadId) {
             errors.push(`${label}: ustad_id required when give_to_ustad.`);
             continue;
           }
-          const openJob = await findOpenJobForUstad(ustadId);
-          if (!openJob) {
+          const issueDate = row.issue_date || row.issueDate || null;
+          const purchaseQty = Number(payload.quantity);
+          const rawUstadQty =
+            row.ustad_quantity ?? row.ustadQuantity ?? row.give_qty;
+          const ustadQty = Number(rawUstadQty);
+          if (!Number.isFinite(ustadQty) || ustadQty <= 0) {
             errors.push(
-              `${label}: Ustad ka active (open) job nahi mila — pehle job kholo.`,
+              `${label}: Ustad qty enter karein (0 se zyada, alag from stock qty).`,
             );
             continue;
           }
-          const issueDate = row.issue_date || row.issueDate || null;
-          const key = `${openJob._id}|${issueDate || ""}`;
-          const group = pendingByJob.get(key) || {
-            job: openJob,
-            issue_date: issueDate,
-            lines: [],
-          };
-          group.lines.push({
+          if (ustadQty > purchaseQty) {
+            errors.push(
+              `${label}: Ustad qty (${ustadQty}) stock qty (${purchaseQty}) se zyada nahi ho sakti.`,
+            );
+            continue;
+          }
+          const line = {
             raw_material_id: payload.raw_material_id,
             raw_material_stock_id: stock._id,
-            quantity: Number(payload.quantity),
-          });
-          pendingByJob.set(key, group);
+            quantity: ustadQty,
+          };
+
+          const openJob = await findOpenJobForUstad(ustadId);
+          if (openJob) {
+            const key = `${openJob._id}|${issueDate || ""}`;
+            const group = pendingByJob.get(key) || {
+              job: openJob,
+              issue_date: issueDate,
+              lines: [],
+            };
+            group.lines.push(line);
+            pendingByJob.set(key, group);
+          } else {
+            const fromLoc = payload.rm_store_location_id;
+            if (!fromLoc) {
+              errors.push(
+                `${label}: RM Store required to create new ustad job.`,
+              );
+              continue;
+            }
+            const key = `${ustadId}|${fromLoc}|${issueDate || ""}`;
+            const group = pendingNewJobs.get(key) || {
+              ustad_id: ustadId,
+              from_location_id: fromLoc,
+              issue_date: issueDate,
+              lines: [],
+            };
+            group.lines.push(line);
+            pendingNewJobs.set(key, group);
+          }
         }
       } catch (err) {
         errors.push(`${label}: ${err.message || "Failed"}`);
@@ -435,11 +499,36 @@ const createBulk = async (req, res) => {
           job_code: group.job.job_code,
           lines: group.lines.length,
           extra_value: extraValue,
+          mode: "extra",
         });
       } catch (err) {
         errors.push(
           `Ustad job ${group.job.job_code || group.job._id}: ${err.message}`,
         );
+      }
+    }
+
+    for (const group of pendingNewJobs.values()) {
+      try {
+        const issueDate =
+          group.issue_date || new Date().toISOString().slice(0, 10);
+        const { job, job_code, rm_value_issued } = await createOpenJobWithRm({
+          ustad_id: group.ustad_id,
+          from_location_id: group.from_location_id,
+          issue_date: issueDate,
+          lines: group.lines,
+          userId,
+          req,
+        });
+        issued.push({
+          job_id: job._id,
+          job_code,
+          lines: group.lines.length,
+          extra_value: rm_value_issued,
+          mode: "created",
+        });
+      } catch (err) {
+        errors.push(`New ustad job: ${err.message}`);
       }
     }
 

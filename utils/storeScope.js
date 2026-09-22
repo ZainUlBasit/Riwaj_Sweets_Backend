@@ -112,6 +112,34 @@ async function applyStoreLocationFilter(req, filter, field = "location_id") {
   return { ...filter, [field]: { $in: locIds } };
 }
 
+/**
+ * Ustad jobs list: RM Manager only sees jobs for ustads assigned to their Store.
+ * (Store 1 → that store's ustads' jobs; not every shared Production location job.)
+ */
+async function applyUstadStoreFilter(req, filter) {
+  const storeId = getAssignedStoreId(req);
+  if (!storeId) return filter;
+
+  const Ustad = require("../Models/Ustad");
+  const ustadIds = await Ustad.find({
+    store_id: storeId,
+    isDeleted: false,
+  }).distinct("_id");
+
+  if (filter.ustad_id) {
+    const requested = String(
+      filter.ustad_id?._id ?? filter.ustad_id ?? "",
+    );
+    const allowed = ustadIds.some((id) => String(id) === requested);
+    if (!allowed) {
+      return { ...filter, ustad_id: { $in: [] } };
+    }
+    return filter;
+  }
+
+  return { ...filter, ustad_id: { $in: ustadIds } };
+}
+
 /** Product / RM stock lists — only that manager's RM + Product Store pair. */
 async function applyInventoryStoreFilter(req, filter, field = "location_id") {
   if (!isRmManager(req)) return filter;
@@ -134,5 +162,6 @@ module.exports = {
   getStoreLocationIds,
   getInventoryLocationIdsForStore,
   applyStoreLocationFilter,
+  applyUstadStoreFilter,
   applyInventoryStoreFilter,
 };

@@ -19,6 +19,7 @@ const {
   adjustProduct,
   adjustLocationInventory,
   getLocationInventoryQty,
+  getInventoryTypeForLocation,
   withTransaction,
 } = require("../Services/inventoryService");
 const { applyInventoryStoreFilter } = require("../utils/storeScope");
@@ -44,9 +45,10 @@ async function ensureStockCode(doc, session = null) {
   return updated || doc;
 }
 
-async function resolveProductStoreLocation(locationId, session = null) {
+/** Product Store (4) or Shop (3) — supplier stock can go direct to shop. */
+async function resolveStockLocation(locationId, session = null) {
   if (!locationId) {
-    const err = new Error("Product Store (location_id) is required.");
+    const err = new Error("location_id (Product Store or Shop) is required.");
     err.status = 400;
     throw err;
   }
@@ -54,12 +56,16 @@ async function resolveProductStoreLocation(locationId, session = null) {
   if (session) q.session(session);
   const loc = await q;
   if (!loc) {
-    const err = new Error("Product Store location not found.");
+    const err = new Error("Location not found.");
     err.status = 404;
     throw err;
   }
-  if (Number(loc.location_type) !== LOCATION_TYPE.FINISHED_GOODS_STORE) {
-    const err = new Error("location_id must be a Product Store.");
+  const t = Number(loc.location_type);
+  if (
+    t !== LOCATION_TYPE.FINISHED_GOODS_STORE &&
+    t !== LOCATION_TYPE.SHOP
+  ) {
+    const err = new Error("location_id must be a Product Store or Shop.");
     err.status = 400;
     throw err;
   }
@@ -299,7 +305,8 @@ const create = async (req, res) => {
       if (!supplier) return createError(res, 404, "Supplier not found.");
     }
 
-    const storeLoc = await resolveProductStoreLocation(location_id);
+    const storeLoc = await resolveStockLocation(location_id);
+    const invType = getInventoryTypeForLocation(storeLoc.location_type);
     const userId = getUserId(req);
     const rmUsed = Array.isArray(raw_materials_used) ? raw_materials_used : [];
     const unitPrice = Number(price ?? 0);
@@ -309,9 +316,13 @@ const create = async (req, res) => {
       sourceNum === STOCK_SOURCE.SUPPLIER
         ? `Supplier: ${supplier.name}`
         : "Self Production";
+    const destLabel =
+      Number(storeLoc.location_type) === LOCATION_TYPE.SHOP
+        ? "Shop"
+        : "Product Store";
     const notes =
       desc?.trim() ||
-      `Product Store stock-in (${sourceLabel}) → ${storeLoc.name}`;
+      `${destLabel} stock-in (${sourceLabel}) → ${storeLoc.name}`;
 
     const item = await withTransaction(async (session) => {
       const opts = { session };
@@ -326,7 +337,7 @@ const create = async (req, res) => {
             total_price: totalPrice,
             raw_materials_used: rmUsed,
             location_id: storeLoc._id,
-            inventory_type: INV_TYPE.STORE,
+            inventory_type: invType,
             source: sourceNum,
             supplier_id:
               sourceNum === STOCK_SOURCE.SUPPLIER ? supplier._id : null,
@@ -349,14 +360,14 @@ const create = async (req, res) => {
       const prevStoreQty = await getLocationInventoryQty(
         storeLoc._id,
         product_id,
-        INV_TYPE.STORE,
+        invType,
         session,
       );
       await adjustLocationInventory(
         storeLoc._id,
         product_id,
         qty,
-        INV_TYPE.STORE,
+        invType,
         session,
       );
 
@@ -407,7 +418,7 @@ const create = async (req, res) => {
     return successMessage(
       res,
       populated || item,
-      "Product stock added to Product Store.",
+      `Product stock added to ${destLabel}.`,
     );
   } catch (err) {
     console.error("ProductStock create error:", err);
@@ -488,7 +499,8 @@ const update = async (req, res) => {
 
     const finalLocationId =
       location_id !== undefined ? location_id : oldItem.location_id;
-    const storeLoc = await resolveProductStoreLocation(finalLocationId);
+    const storeLoc = await resolveStockLocation(finalLocationId);
+    const invType = getInventoryTypeForLocation(storeLoc.location_type);
 
     const userId = getUserId(req);
     const oldQty = Number(oldItem.quantity ?? 0);
@@ -501,9 +513,13 @@ const update = async (req, res) => {
       sourceNum === STOCK_SOURCE.SUPPLIER
         ? `Supplier: ${supplier.name}`
         : "Self Production";
+    const destLabel =
+      Number(storeLoc.location_type) === LOCATION_TYPE.SHOP
+        ? "Shop"
+        : "Product Store";
     const notes =
       (desc !== undefined ? desc : oldItem.desc)?.trim() ||
-      `Product Store stock update (${sourceLabel}) → ${storeLoc.name}`;
+      `${destLabel} stock update (${sourceLabel}) → ${storeLoc.name}`;
 
     const item = await withTransaction(async (session) => {
       const opts = { session };
@@ -554,7 +570,7 @@ const update = async (req, res) => {
         price: unitPrice,
         total_price: totalPrice,
         location_id: storeLoc._id,
-        inventory_type: INV_TYPE.STORE,
+        inventory_type: invType,
         source: sourceNum,
         supplier_id:
           sourceNum === STOCK_SOURCE.SUPPLIER ? supplier._id : null,
@@ -585,14 +601,14 @@ const update = async (req, res) => {
       const prevStoreQty = await getLocationInventoryQty(
         storeLoc._id,
         newProductId,
-        INV_TYPE.STORE,
+        invType,
         session,
       );
       await adjustLocationInventory(
         storeLoc._id,
         newProductId,
         newQty,
-        INV_TYPE.STORE,
+        invType,
         session,
       );
 

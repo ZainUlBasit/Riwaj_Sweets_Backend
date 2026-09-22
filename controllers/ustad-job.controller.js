@@ -22,6 +22,7 @@ const {
 const {
   assertRmManagerStoreAccess,
   applyStoreLocationFilter,
+  applyUstadStoreFilter,
   getAssignedStoreId,
 } = require("../utils/storeScope");
 
@@ -117,7 +118,10 @@ async function resolveProductionArea(storeHint) {
 
 const populateJob = (q) =>
   q
-    .populate("ustad_id", "name phone")
+    .populate(
+      "ustad_id",
+      "name phone salary bejli_expense meal_expense tea_expense",
+    )
     .populate("from_location_id", "name location_type store_id")
     .populate("location_id", "name location_type store_id")
     .populate("created_by", "name email")
@@ -335,8 +339,20 @@ const buildSummary = async (job) => {
   );
   const rm_value_issued = Number(job.rm_value_issued || 0);
 
+  const ustadDoc =
+    job.ustad_id && typeof job.ustad_id === "object" ? job.ustad_id : null;
+
   return {
     job,
+    ustad: {
+      _id: ustadDoc?._id || job.ustad_id || null,
+      name: ustadDoc?.name || job.ustad_name || "",
+      phone: ustadDoc?.phone || "",
+      salary: round2(Number(ustadDoc?.salary || 0)),
+      bejli_expense: round2(Number(ustadDoc?.bejli_expense || 0)),
+      meal_expense: round2(Number(ustadDoc?.meal_expense || 0)),
+      tea_expense: round2(Number(ustadDoc?.tea_expense || 0)),
+    },
     rm_lines: (job.lines || []).map((line) => {
       const stock = line.raw_material_stock_id;
       const stockRemaining =
@@ -413,11 +429,7 @@ const list = async (req, res) => {
       ];
     }
 
-    const scopedFilter = await applyStoreLocationFilter(
-      req,
-      baseFilter,
-      "location_id",
-    );
+    const scopedFilter = await applyUstadStoreFilter(req, baseFilter);
 
     const items = await populateJob(
       UstadJob.find(scopedFilter).sort({ issue_date: -1, createdAt: -1 }),
@@ -481,11 +493,7 @@ const listOpen = async (req, res) => {
       );
     }
 
-    const scopedFilter = await applyStoreLocationFilter(
-      req,
-      baseFilter,
-      "location_id",
-    );
+    const scopedFilter = await applyUstadStoreFilter(req, baseFilter);
 
     const items = await populateJob(
       UstadJob.find(scopedFilter).sort({ issue_date: -1 }).limit(100),
@@ -611,6 +619,7 @@ async function buildOneUstadReportPayload(req, ustad, start_date, end_date, star
 
     const jobRows = jobs
       .map((job) => {
+        // Per-job RM/FG values are for the selected date range only.
         const fg = jobsFg.get(String(job._id)) || { qty: 0, value: 0, count: 0 };
         const rm = jobsRm.get(String(job._id)) || { value: 0, extra: 0 };
         if (!rm.value && !fg.count) return null;
@@ -910,6 +919,180 @@ const getOne = async (req, res) => {
 };
 
 /**
+ * Create a new OPEN ustad job and issue the given RM lines.
+ * Shared by POST /ustad-job and bulk RM stock-in (when no open job exists).
+ */
+async function createOpenJobWithRm({
+  ustad_id,
+  ustad_name,
+  from_location_id,
+  location_id,
+  issue_date,
+  notes,
+  lines,
+  planned_products,
+  userId,
+  req = null,
+}) {
+  let ustadName = String(ustad_name || "").trim();
+  let ustadDoc = null;
+  if (ustad_id) {
+    ustadDoc = await Ustad.findById(ustad_id).where({
+      isDeleted: false,
+      isActive: true,
+    });
+    if (!ustadDoc) {
+      const err = new Error("Registered ustad not found / inactive.");
+      err.status = 404;
+      throw err;
+    }
+    ustadName = ustadDoc.name;
+  }
+  if (!ustadName) {
+    const err = new Error(
+      "Registered ustad select karein (ustad_id required).",
+    );
+    err.status = 400;
+    throw err;
+  }
+  if (!ustad_id) {
+    const err = new Error(
+      "Ustad pehle register karein, phir yahan select karein.",
+    );
+    err.status = 400;
+    throw err;
+  }
+  if (!from_location_id) {
+    const err = new Error("from_location_id (RM Store) is required.");
+    err.status = 400;
+    throw err;
+  }
+  if (!issue_date) {
+    const err = new Error("issue_date is required.");
+    err.status = 400;
+    throw err;
+  }
+  if (!Array.isArray(lines) || lines.length === 0) {
+    const err = new Error("At least one RM line is required.");
+    err.status = 400;
+    throw err;
+  }
+
+  const fromLoc = await DispatchLocation.findById(from_location_id).where({
+    isDeleted: false,
+  });
+  if (!fromLoc) {
+    const err = new Error("RM Store not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  // Production area is internal — auto-resolve under assigned/ustad/RM godown.
+  let toLoc = null;
+  if (location_id) {
+    toLoc = await DispatchLocation.findById(location_id).where({
+      isDeleted: false,
+    });
+  }
+  if (!toLoc) {
+    const storeHint =
+      (req ? getAssignedStoreId(req) : null) ||
+      (ustadDoc?.store_id
+        ? String(ustadDoc.store_id._id ?? ustadDoc.store_id)
+        : null) ||
+      (fromLoc.store_id ? String(fromLoc.store_id) : null);
+    toLoc = await resolveProductionArea(storeHint);
+  }
+  if (!toLoc) {
+    const err = new Error(
+      "Production area configure nahi hai. Stores pe Store setup karein.",
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  await validateRmTransferLocations(fromLoc._id, toLoc._id);
+
+  if (req) {
+    // RM Store must belong to this manager's store; Production/Shop/FG may be shared.
+    await assertRmManagerStoreAccess(req, [fromLoc._id, toLoc._id]);
+  }
+
+  const normalized = await snapshotRmLines(lines);
+  const rm_value_issued = round2(
+    normalized.reduce((s, r) => s + Number(r.line_value || 0), 0),
+  );
+
+  const planned = [];
+  if (Array.isArray(planned_products)) {
+    for (const row of planned_products) {
+      const pq = Number(row.quantity);
+      if (!row.product_id || !Number.isFinite(pq) || pq <= 0) continue;
+      planned.push({ product_id: row.product_id, quantity: pq });
+    }
+  }
+
+  const job_code = generateJobCode();
+  const issueAt = new Date(issue_date);
+  if (Number.isNaN(issueAt.getTime())) {
+    const err = new Error("Invalid issue_date.");
+    err.status = 400;
+    throw err;
+  }
+
+  const created = await withTransaction(async (session) => {
+    const opts = { session };
+    const [job] = await UstadJob.create(
+      [
+        {
+          job_code,
+          ustad_name: ustadName,
+          ustad_id: ustadDoc?._id ?? null,
+          from_location_id: fromLoc._id,
+          location_id: toLoc._id,
+          issue_date: issueAt,
+          status: JOB_STATUS.OPEN,
+          notes: notes ?? "",
+          planned_products: planned,
+          lines: [],
+          rm_value_issued,
+          created_by: userId,
+          isDeleted: false,
+        },
+      ],
+      opts,
+    );
+
+    job.lines = await issueRmLines({
+      job,
+      fromLoc,
+      toLoc,
+      ustadName,
+      userId,
+      rows: normalized,
+      issueDate: issueAt,
+      isExtra: false,
+      session,
+    });
+    await job.save(opts);
+
+    await writeAudit({
+      entityType: "UstadJob",
+      entityId: job._id,
+      action: "create",
+      newValue: job.toObject?.() ?? job,
+      userId,
+      notes: `Job created · RM Rs ${Number(job.rm_value_issued || 0).toLocaleString("en-IN")} · ${ustadName}`,
+      session,
+    });
+
+    return job;
+  });
+
+  return { job: created, job_code, rm_value_issued };
+}
+
+/**
  * POST /api/ustad-job
  * Body: ustad_name, from_location_id, location_id, issue_date, notes,
  *        lines: [{ raw_material_id, raw_material_stock_id, quantity }]
@@ -927,163 +1110,32 @@ const create = async (req, res) => {
       planned_products,
     } = req.body || {};
 
-    let ustadName = String(ustad_name || "").trim();
-    let ustadDoc = null;
-    if (ustad_id) {
-      ustadDoc = await Ustad.findById(ustad_id).where({
-        isDeleted: false,
-        isActive: true,
-      });
-      if (!ustadDoc) {
-        return createError(res, 404, "Registered ustad not found / inactive.");
-      }
-      ustadName = ustadDoc.name;
-    }
-    if (!ustadName) {
-      return createError(
-        res,
-        400,
-        "Registered ustad select karein (ustad_id required).",
-      );
-    }
-    if (!ustad_id) {
-      return createError(
-        res,
-        400,
-        "Ustad pehle register karein, phir yahan select karein.",
-      );
-    }
-    if (!from_location_id) {
-      return createError(res, 400, "from_location_id (RM Store) is required.");
-    }
-    if (!issue_date) {
-      return createError(res, 400, "issue_date is required.");
-    }
-    if (!Array.isArray(lines) || lines.length === 0) {
-      return createError(res, 400, "At least one RM line is required.");
-    }
-
-    const fromLoc = await DispatchLocation.findById(from_location_id).where({
-      isDeleted: false,
-    });
-    if (!fromLoc) return createError(res, 404, "RM Store not found.");
-
-    // Production area is internal — auto-resolve under assigned/ustad/RM godown.
-    let toLoc = null;
-    if (location_id) {
-      toLoc = await DispatchLocation.findById(location_id).where({
-        isDeleted: false,
-      });
-    }
-    if (!toLoc) {
-      const storeHint =
-        getAssignedStoreId(req) ||
-        (ustadDoc?.store_id
-          ? String(ustadDoc.store_id._id ?? ustadDoc.store_id)
-          : null) ||
-        (fromLoc.store_id ? String(fromLoc.store_id) : null);
-      toLoc = await resolveProductionArea(storeHint);
-    }
-    if (!toLoc) {
-      return createError(
-        res,
-        400,
-        "Production area configure nahi hai. Stores pe Store setup karein.",
-      );
-    }
-
-    try {
-      await validateRmTransferLocations(fromLoc._id, toLoc._id);
-    } catch (err) {
-      return createError(res, err.status || 400, err.message);
-    }
-
-    try {
-      // RM Store must belong to this manager's store; Production/Shop/FG may be shared.
-      await assertRmManagerStoreAccess(req, [fromLoc._id, toLoc._id]);
-    } catch (err) {
-      return createError(res, err.status || 403, err.message);
-    }
-
-    let normalized;
-    try {
-      normalized = await snapshotRmLines(lines);
-    } catch (err) {
-      return createError(res, err.status || 400, err.message);
-    }
-
-    const rm_value_issued = round2(
-      normalized.reduce((s, r) => s + Number(r.line_value || 0), 0),
-    );
-
-    const planned = [];
-    if (Array.isArray(planned_products)) {
-      for (const row of planned_products) {
-        const pq = Number(row.quantity);
-        if (!row.product_id || !Number.isFinite(pq) || pq <= 0) continue;
-        planned.push({ product_id: row.product_id, quantity: pq });
-      }
-    }
-
     const userId = getUserId(req);
-    const job_code = generateJobCode();
-
-    const created = await withTransaction(async (session) => {
-      const opts = { session };
-      const [job] = await UstadJob.create(
-        [
-          {
-            job_code,
-            ustad_name: ustadName,
-            ustad_id: ustadDoc?._id ?? null,
-            from_location_id: fromLoc._id,
-            location_id: toLoc._id,
-            issue_date: new Date(issue_date),
-            status: JOB_STATUS.OPEN,
-            notes: notes ?? "",
-            planned_products: planned,
-            lines: [],
-            rm_value_issued,
-            created_by: userId,
-            isDeleted: false,
-          },
-        ],
-        opts,
-      );
-
-      job.lines = await issueRmLines({
-        job,
-        fromLoc,
-        toLoc,
-        ustadName,
+    let created;
+    try {
+      created = await createOpenJobWithRm({
+        ustad_name,
+        ustad_id,
+        from_location_id,
+        location_id,
+        issue_date,
+        notes,
+        lines,
+        planned_products,
         userId,
-        rows: normalized,
-        issueDate: new Date(issue_date),
-        isExtra: false,
-        session,
+        req,
       });
-      await job.save(opts);
+    } catch (err) {
+      return createError(res, err.status || 400, err.message);
+    }
 
-      await writeAudit({
-        entityType: "UstadJob",
-        entityId: job._id,
-        action: "create",
-        newValue: job.toObject?.() ?? job,
-        userId,
-        notes: `Job created · RM Rs ${Number(job.rm_value_issued || 0).toLocaleString("en-IN")} · ${ustadName}`,
-        session,
-      });
-
-      return job;
-    });
-
-    const populated = await populateJob(UstadJob.findById(created._id));
+    const populated = await populateJob(UstadJob.findById(created.job._id));
     const summary = await buildSummary(populated);
 
     return successMessage(
       res,
       summary,
-      `Ustad job ${job_code} created · RM Rs ${rm_value_issued.toLocaleString("en-IN")} issued.`,
+      `Ustad job ${created.job_code} created · RM Rs ${created.rm_value_issued.toLocaleString("en-IN")} issued.`,
     );
   } catch (err) {
     console.error("UstadJob create error:", err);
@@ -1239,6 +1291,341 @@ const addRm = async (req, res) => {
       res,
       err.status || 500,
       err.message || "Failed to issue extra RM.",
+    );
+  }
+};
+
+/**
+ * POST /api/ustad-job/:id/transfer-rm
+ * Move some already-issued RM from this job to another ustad's open job
+ * (or create a new open job). Stock: reverse source → re-issue remaining
+ * on source + transfer qty on target.
+ *
+ * Body: { to_ustad_id, to_job_id?, issue_date?, lines: [{ line_id, quantity }] }
+ */
+const transferRm = async (req, res) => {
+  try {
+    const sourceJob = await UstadJob.findById(req.params.id).where({
+      isDeleted: false,
+    });
+    if (!sourceJob) return createError(res, 404, "Ustad job not found.");
+    if (Number(sourceJob.status) === JOB_STATUS.CLOSED) {
+      return createError(
+        res,
+        409,
+        "Job closed hai. Transfer ke liye pehle reopen karein.",
+      );
+    }
+
+    const { to_ustad_id, to_job_id, issue_date, lines } = req.body || {};
+    if (!to_ustad_id) {
+      return createError(res, 400, "Dusra ustad select karein (to_ustad_id).");
+    }
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return createError(res, 400, "Kam az kam ek RM line select karein.");
+    }
+
+    const targetUstad = await Ustad.findById(to_ustad_id).where({
+      isDeleted: false,
+      isActive: true,
+    });
+    if (!targetUstad) {
+      return createError(res, 404, "Target ustad not found / inactive.");
+    }
+
+    const sourceUstadId = String(
+      sourceJob.ustad_id?._id ?? sourceJob.ustad_id ?? "",
+    );
+    if (sourceUstadId && sourceUstadId === String(targetUstad._id)) {
+      return createError(res, 400, "Same ustad pe transfer nahi hota.");
+    }
+
+    const assignedStoreId = getAssignedStoreId(req);
+    if (assignedStoreId) {
+      const sourceUstad = sourceUstadId
+        ? await Ustad.findById(sourceUstadId).where({ isDeleted: false })
+        : null;
+      const checkStore = (u) => {
+        if (!u) return false;
+        const sid = String(u.store_id?._id ?? u.store_id ?? "");
+        return sid && sid === String(assignedStoreId);
+      };
+      if (sourceUstad && !checkStore(sourceUstad)) {
+        return createError(
+          res,
+          403,
+          "This ustad is outside your assigned store.",
+        );
+      }
+      if (!checkStore(targetUstad)) {
+        return createError(
+          res,
+          403,
+          "Target ustad is outside your assigned store.",
+        );
+      }
+    }
+
+    try {
+      await assertRmManagerStoreAccess(req, [
+        sourceJob.from_location_id,
+        sourceJob.location_id,
+      ]);
+    } catch (err) {
+      return createError(res, err.status || 403, err.message);
+    }
+
+    const issuedAt = issue_date ? new Date(issue_date) : new Date();
+    if (Number.isNaN(issuedAt.getTime())) {
+      return createError(res, 400, "Invalid issue_date.");
+    }
+
+    const fromLoc = await DispatchLocation.findById(
+      sourceJob.from_location_id,
+    ).where({ isDeleted: false });
+    const toLoc = await DispatchLocation.findById(sourceJob.location_id).where({
+      isDeleted: false,
+    });
+    if (!fromLoc) return createError(res, 404, "RM Store not found.");
+    if (!toLoc) return createError(res, 404, "Production area not found.");
+
+    const userId = getUserId(req);
+    let targetJobId = null;
+    let transferredValue = 0;
+
+    await withTransaction(async (session) => {
+      const opts = { session };
+      const transferRows = [];
+
+      const byLine = new Map();
+      for (const row of lines) {
+        const lid = String(row.line_id || row._id || "");
+        const qty = Number(row.quantity);
+        if (!lid) {
+          const err = new Error("line_id required.");
+          err.status = 400;
+          throw err;
+        }
+        if (!Number.isFinite(qty) || qty <= 0) {
+          const err = new Error("Transfer quantity must be > 0.");
+          err.status = 400;
+          throw err;
+        }
+        byLine.set(lid, qty);
+      }
+
+      for (const [lineId, transferQty] of byLine.entries()) {
+        const lineIdx = (sourceJob.lines || []).findIndex(
+          (l) => String(l._id) === lineId,
+        );
+        if (lineIdx < 0) {
+          const err = new Error("RM line not found on this job.");
+          err.status = 404;
+          throw err;
+        }
+        const existing = sourceJob.lines[lineIdx];
+        const have = Number(existing.quantity || 0);
+        if (transferQty > have + 1e-9) {
+          const err = new Error(
+            `Transfer qty (${transferQty}) line pe available (${have}) se zyada hai.`,
+          );
+          err.status = 400;
+          throw err;
+        }
+
+        const remaining = round2(have - transferQty);
+        const stockId =
+          existing.raw_material_stock_id?._id || existing.raw_material_stock_id;
+        const rmId = existing.raw_material_id?._id || existing.raw_material_id;
+        const keepExtra = Boolean(existing.is_extra);
+
+        await reverseJobRmLine(existing, userId, session);
+
+        if (remaining > 0) {
+          const normalizedRemain = await snapshotRmLines([
+            {
+              raw_material_id: rmId,
+              raw_material_stock_id: stockId,
+              quantity: remaining,
+            },
+          ]);
+          const savedRemain = await issueRmLines({
+            job: sourceJob,
+            fromLoc,
+            toLoc,
+            ustadName: sourceJob.ustad_name,
+            userId,
+            rows: normalizedRemain,
+            issueDate: existing.issued_at || sourceJob.issue_date || issuedAt,
+            isExtra: keepExtra,
+            session,
+          });
+          const next = savedRemain[0];
+          const lineDoc = sourceJob.lines[lineIdx];
+          lineDoc.raw_material_id = next.raw_material_id;
+          lineDoc.raw_material_stock_id = next.raw_material_stock_id;
+          lineDoc.quantity = next.quantity;
+          lineDoc.unit_price = next.unit_price;
+          lineDoc.line_value = next.line_value;
+          lineDoc.dispatch_id = next.dispatch_id;
+          lineDoc.issued_at = next.issued_at;
+          lineDoc.is_extra = keepExtra;
+        } else {
+          sourceJob.lines.splice(lineIdx, 1);
+        }
+
+        transferRows.push({
+          raw_material_id: rmId,
+          raw_material_stock_id: stockId,
+          quantity: transferQty,
+        });
+      }
+
+      sourceJob.markModified("lines");
+      sourceJob.rm_value_issued = recalcRmValue(sourceJob.lines);
+      await sourceJob.save(opts);
+
+      const normalizedTransfer = await snapshotRmLines(transferRows);
+      transferredValue = round2(
+        normalizedTransfer.reduce((s, r) => s + Number(r.line_value || 0), 0),
+      );
+
+      let targetJob = null;
+      if (to_job_id) {
+        targetJob = await UstadJob.findById(to_job_id)
+          .where({ isDeleted: false })
+          .session(session);
+        if (!targetJob) {
+          const err = new Error("Target job not found.");
+          err.status = 404;
+          throw err;
+        }
+        if (String(targetJob.ustad_id || "") !== String(targetUstad._id)) {
+          const err = new Error("Target job is us ustad ki nahi.");
+          err.status = 400;
+          throw err;
+        }
+        if (Number(targetJob.status) === JOB_STATUS.CLOSED) {
+          const err = new Error(
+            "Target job closed hai — reopen karein ya blank chhoro (naya banega).",
+          );
+          err.status = 409;
+          throw err;
+        }
+      } else {
+        targetJob = await UstadJob.findOne({
+          ustad_id: targetUstad._id,
+          status: JOB_STATUS.OPEN,
+          isDeleted: false,
+        })
+          .sort({ issue_date: -1, createdAt: -1 })
+          .session(session);
+      }
+
+      if (!targetJob) {
+        const [created] = await UstadJob.create(
+          [
+            {
+              job_code: generateJobCode(),
+              ustad_name: targetUstad.name,
+              ustad_id: targetUstad._id,
+              from_location_id: fromLoc._id,
+              location_id: toLoc._id,
+              issue_date: issuedAt,
+              status: JOB_STATUS.OPEN,
+              notes: `RM transfer from ${sourceJob.job_code}`,
+              planned_products: [],
+              lines: [],
+              rm_value_issued: 0,
+              created_by: userId,
+              isDeleted: false,
+            },
+          ],
+          opts,
+        );
+        targetJob = created;
+      }
+
+      const targetFrom = await DispatchLocation.findById(
+        targetJob.from_location_id,
+      )
+        .where({ isDeleted: false })
+        .session(session);
+      const targetTo = await DispatchLocation.findById(targetJob.location_id)
+        .where({ isDeleted: false })
+        .session(session);
+      if (!targetFrom || !targetTo) {
+        const err = new Error("Target job locations missing.");
+        err.status = 400;
+        throw err;
+      }
+
+      const savedTransfer = await issueRmLines({
+        job: targetJob,
+        fromLoc: targetFrom,
+        toLoc: targetTo,
+        ustadName: targetJob.ustad_name,
+        userId,
+        rows: normalizedTransfer,
+        issueDate: issuedAt,
+        isExtra: true,
+        session,
+      });
+      targetJob.lines = [...(targetJob.lines || []), ...savedTransfer];
+      targetJob.rm_value_issued = recalcRmValue(targetJob.lines);
+      await targetJob.save(opts);
+      targetJobId = targetJob._id;
+
+      await writeAudit({
+        entityType: "UstadJob",
+        entityId: sourceJob._id,
+        action: "update",
+        newValue: {
+          transfer_out: transferRows,
+          to_ustad_id: targetUstad._id,
+          to_ustad_name: targetUstad.name,
+          to_job_id: targetJob._id,
+          to_job_code: targetJob.job_code,
+          value: transferredValue,
+        },
+        userId,
+        notes: `RM transfer → ${targetUstad.name} (${targetJob.job_code}) · Rs ${transferredValue.toLocaleString("en-IN")}`,
+        session,
+      });
+      await writeAudit({
+        entityType: "UstadJob",
+        entityId: targetJob._id,
+        action: "update",
+        newValue: {
+          transfer_in: savedTransfer,
+          from_job_id: sourceJob._id,
+          from_job_code: sourceJob.job_code,
+          from_ustad_name: sourceJob.ustad_name,
+          value: transferredValue,
+        },
+        userId,
+        notes: `RM transfer ← ${sourceJob.ustad_name} (${sourceJob.job_code}) · Rs ${transferredValue.toLocaleString("en-IN")}`,
+        session,
+      });
+    });
+
+    const populated = await populateJob(UstadJob.findById(sourceJob._id));
+    const summary = await buildSummary(populated);
+    return successMessage(
+      res,
+      {
+        ...summary,
+        transferred_to_job_id: targetJobId,
+        transferred_value: transferredValue,
+      },
+      `RM transfer ho gaya → ${targetUstad.name} · Rs ${transferredValue.toLocaleString("en-IN")}`,
+    );
+  } catch (err) {
+    console.error("UstadJob transferRm error:", err);
+    return createError(
+      res,
+      err.status || 500,
+      err.message || "Failed to transfer RM.",
     );
   }
 };
@@ -1536,13 +1923,30 @@ const listLogs = async (req, res) => {
 
     const items = rows.map((row) => {
       const isFg = row.entity_type === "CakeProduction";
+      const nv = row.new_value || {};
+      const isTransfer =
+        Boolean(nv.transfer_out || nv.transfer_in) ||
+        /RM transfer/i.test(String(row.notes || ""));
+      const transferOut = Boolean(nv.transfer_out);
+      let section = "rm";
+      let section_label = "RM diya";
+      let action_label = row.action || "—";
+      if (isFg) {
+        section = "fg";
+        section_label = "Products banaye (wapas)";
+      } else if (isTransfer) {
+        section = "transfer";
+        section_label = "RM transfer";
+        action_label = transferOut ? "Transfer out" : "Transfer in";
+      }
       return {
         _id: row._id,
-        section: isFg ? "fg" : "rm",
-        section_label: isFg ? "Products banaye (wapas)" : "RM diya",
+        section,
+        section_label,
         entity_type: row.entity_type,
         entity_id: row.entity_id,
         action: row.action,
+        action_label,
         notes: row.notes || "",
         previous_value: row.previous_value,
         new_value: row.new_value,
@@ -1765,6 +2169,7 @@ module.exports = {
   getOne,
   create,
   addRm,
+  transferRm,
   updateRmLine,
   removeRmLine,
   listLogs,
@@ -1775,4 +2180,5 @@ module.exports = {
   generateJobCode,
   findOpenJobForUstad,
   issueExtraRmOnOpenJob,
+  createOpenJobWithRm,
 };

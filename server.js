@@ -1,6 +1,5 @@
 /**
- * Hostinger / generic Node entry.
- * Vercel still boots from api/index.js (vercel.json).
+ * Hostinger Node.js / Express entry file.
+ * hPanel → Application type: Express · Entry file: server.js · Start: npm start
  */
-// Testing
 require("./api/index.js");

@@ -1,7 +1,7 @@
 {
   "name": "riwajsweets-backend",
   "version": "1.0.0",
-  "description": "Riwaj Sweets Express API",
+  "description": "Riwaj Sweets Express API (Hostinger)",
   "main": "server.js",
   "engines": {
     "node": ">=18"
