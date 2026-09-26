@@ -5,9 +5,10 @@ const AutoIncrement = require("mongoose-sequence")(mongoose);
 const Schema = mongoose.Schema;
 
 /**
- * Counter — physical POS terminal (Sale or Cash).
+ * Counter — physical POS terminal (Sale or Cash), scoped to one Shop.
  *
- *   counter_number      Auto-increment human-friendly id.
+ *   shop_id             Which outlet owns this counter (Riwaj 1 / 2 / 3…).
+ *   counter_number      Auto-increment per shop (each shop has its own #1, #2…).
  *   type                1: Cash (web, scans barcodes, prints bills)
  *                       2: Sale (Expo mobile, creates orders + barcode)
  *   email/password_hash Counter login credentials. Counter token is signed
@@ -20,6 +21,14 @@ const Schema = mongoose.Schema;
  */
 const CounterSchema = new Schema(
   {
+    shop_id: {
+      type: Schema.Types.ObjectId,
+      ref: "Shop",
+      // Required on create (controller). Optional in schema so legacy
+      // counters without a shop can still load / be assigned later.
+      default: null,
+      index: true,
+    },
     counter_number: { type: Number, default: 1 },
     type: {
       type: Number,
@@ -69,10 +78,20 @@ CounterSchema.index(
   },
 );
 
-// 1 se start, har nayi counter par last + 1
+// Counter # is unique within a shop (Riwaj 1 Counter 1 ≠ Riwaj 2 Counter 1).
+CounterSchema.index(
+  { shop_id: 1, counter_number: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { isDeleted: false },
+  },
+);
+
+// Per-shop sequence: each shop starts at Counter 1 independently.
 CounterSchema.plugin(AutoIncrement, {
-  id: "counter_number_seq",
+  id: "counter_number_per_shop",
   inc_field: "counter_number",
+  reference_fields: ["shop_id"],
   start_seq: 1,
 });
 

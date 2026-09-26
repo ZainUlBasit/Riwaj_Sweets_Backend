@@ -1,6 +1,7 @@
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const Counter = require("../Models/Counter");
+const Shop = require("../Models/Shop");
 const Product = require("../Models/Products");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 
@@ -8,7 +9,10 @@ const COUNTER_SECRET =
   process.env.COUNTER_SECRET_KEY || process.env.ACCESS_SECRET_KEY;
 const COUNTER_TOKEN_TTL = "12h";
 
-const populate = (q) => q.populate("assigned_products");
+const populate = (q) =>
+  q
+    .populate("assigned_products")
+    .populate("shop_id", "name code shop_number location_id isActive");
 
 const sanitize = (doc) => {
   if (!doc) return doc;
@@ -43,16 +47,27 @@ const resolveAssignedProducts = async (raw) => {
   return ids.filter((id) => validIds.has(String(id)));
 };
 
+const resolveShopId = async (rawShopId) => {
+  if (!rawShopId) return null;
+  const shop = await Shop.findById(rawShopId).where({ isDeleted: false });
+  return shop || null;
+};
+
 const list = async (req, res) => {
   try {
+    const shopFilter = req.query?.shop_id
+      ? { shop_id: req.query.shop_id }
+      : {};
     const items = await populate(
-      Counter.find({ isDeleted: false }).sort({
+      Counter.find({ isDeleted: false, ...shopFilter }).sort({
+        shop_id: 1,
         counter_number: 1,
         createdAt: -1,
       }),
     );
     const deletedItems = await populate(
-      Counter.find({ isDeleted: true }).sort({
+      Counter.find({ isDeleted: true, ...shopFilter }).sort({
+        shop_id: 1,
         counter_number: 1,
         createdAt: -1,
       }),
@@ -87,6 +102,7 @@ const getOne = async (req, res) => {
 const create = async (req, res) => {
   try {
     const {
+      shop_id,
       type,
       location,
       description,
@@ -96,6 +112,10 @@ const create = async (req, res) => {
       assigned_products,
     } = req.body;
 
+    const shop = await resolveShopId(shop_id);
+    if (!shop) {
+      return createError(res, 400, "Shop select karein (Riwaj 1 / 2 / 3…).");
+    }
     if (type == null) {
       return createError(res, 400, "Type is required (1: Cash, 2: Sale).");
     }
@@ -131,6 +151,7 @@ const create = async (req, res) => {
     const products = await resolveAssignedProducts(assigned_products);
 
     const item = await Counter.create({
+      shop_id: shop._id,
       type: Number(type),
       location: location ?? "",
       description: description ?? "",
@@ -153,7 +174,7 @@ const create = async (req, res) => {
       res,
       err.code === 11000 ? 409 : 500,
       err.code === 11000
-        ? "Email already in use."
+        ? "Email already in use or counter # conflict for this shop."
         : err.message || "Failed to create counter.",
     );
   }
@@ -162,6 +183,7 @@ const create = async (req, res) => {
 const update = async (req, res) => {
   try {
     const {
+      shop_id,
       type,
       location,
       description,
@@ -173,6 +195,13 @@ const update = async (req, res) => {
 
     const updatePayload = { isDeleted: false };
 
+    if (shop_id !== undefined) {
+      const shop = await resolveShopId(shop_id);
+      if (!shop) {
+        return createError(res, 400, "Shop select karein (Riwaj 1 / 2 / 3…).");
+      }
+      updatePayload.shop_id = shop._id;
+    }
     if (type !== undefined) {
       if (![1, 2].includes(Number(type))) {
         return createError(res, 400, "Type must be 1 (Cash) or 2 (Sale).");
@@ -276,6 +305,7 @@ const login = async (req, res) => {
         kind: "counter",
         counter_id: String(counter._id),
         type: counter.type,
+        shop_id: counter.shop_id ? String(counter.shop_id) : null,
       },
       COUNTER_SECRET,
       { expiresIn: COUNTER_TOKEN_TTL },
