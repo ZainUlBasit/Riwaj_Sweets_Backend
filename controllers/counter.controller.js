@@ -53,6 +53,23 @@ const resolveShopId = async (rawShopId) => {
   return shop || null;
 };
 
+/** User-entered counter # — positive integer, unique within shop. */
+const resolveCounterNumber = (raw) => {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) return null;
+  return n;
+};
+
+const assertUniqueCounterNumber = async (shopId, counterNumber, excludeId) => {
+  const filter = {
+    shop_id: shopId,
+    counter_number: counterNumber,
+    isDeleted: false,
+  };
+  if (excludeId) filter._id = { $ne: excludeId };
+  return Counter.findOne(filter);
+};
+
 const list = async (req, res) => {
   try {
     const shopFilter = req.query?.shop_id
@@ -103,6 +120,7 @@ const create = async (req, res) => {
   try {
     const {
       shop_id,
+      counter_number,
       type,
       location,
       description,
@@ -115,6 +133,18 @@ const create = async (req, res) => {
     const shop = await resolveShopId(shop_id);
     if (!shop) {
       return createError(res, 400, "Shop select karein (Riwaj 1 / 2 / 3…).");
+    }
+    const counterNumber = resolveCounterNumber(counter_number);
+    if (counterNumber == null) {
+      return createError(res, 400, "Counter number enter karein (1, 2, 3…).");
+    }
+    const dupNum = await assertUniqueCounterNumber(shop._id, counterNumber);
+    if (dupNum) {
+      return createError(
+        res,
+        409,
+        `Is shop pe Counter #${counterNumber} pehle se maujood hai.`,
+      );
     }
     if (type == null) {
       return createError(res, 400, "Type is required (1: Cash, 2: Sale).");
@@ -152,6 +182,7 @@ const create = async (req, res) => {
 
     const item = await Counter.create({
       shop_id: shop._id,
+      counter_number: counterNumber,
       type: Number(type),
       location: location ?? "",
       description: description ?? "",
@@ -184,6 +215,7 @@ const update = async (req, res) => {
   try {
     const {
       shop_id,
+      counter_number,
       type,
       location,
       description,
@@ -202,6 +234,44 @@ const update = async (req, res) => {
       }
       updatePayload.shop_id = shop._id;
     }
+    if (counter_number !== undefined) {
+      const counterNumber = resolveCounterNumber(counter_number);
+      if (counterNumber == null) {
+        return createError(res, 400, "Counter number enter karein (1, 2, 3…).");
+      }
+      updatePayload.counter_number = counterNumber;
+    }
+
+    // Uniqueness of (shop, counter#) after resolving final shop_id
+    if (
+      updatePayload.counter_number !== undefined ||
+      updatePayload.shop_id !== undefined
+    ) {
+      const current = await Counter.findById(req.params.id).where({
+        isDeleted: false,
+      });
+      if (!current) return createError(res, 404, "Counter not found.");
+      const finalShopId = updatePayload.shop_id || current.shop_id;
+      const finalNum =
+        updatePayload.counter_number !== undefined
+          ? updatePayload.counter_number
+          : current.counter_number;
+      if (finalShopId && finalNum != null) {
+        const dupNum = await assertUniqueCounterNumber(
+          finalShopId,
+          finalNum,
+          req.params.id,
+        );
+        if (dupNum) {
+          return createError(
+            res,
+            409,
+            `Is shop pe Counter #${finalNum} pehle se maujood hai.`,
+          );
+        }
+      }
+    }
+
     if (type !== undefined) {
       if (![1, 2].includes(Number(type))) {
         return createError(res, 400, "Type must be 1 (Cash) or 2 (Sale).");
@@ -252,7 +322,7 @@ const update = async (req, res) => {
       res,
       err.code === 11000 ? 409 : 500,
       err.code === 11000
-        ? "Email already in use."
+        ? "Email already in use or counter # conflict for this shop."
         : err.message || "Failed to update counter.",
     );
   }

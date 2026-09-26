@@ -16,6 +16,9 @@ const UserDto = (user) => {
     role: user.role,
     store_id: storeId,
     store_name: storeName,
+    module_permissions: Array.isArray(user.module_permissions)
+      ? user.module_permissions
+      : null,
   };
 };
 

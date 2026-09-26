@@ -23,6 +23,14 @@ const UsersSchema = new Schema(
       default: null,
       index: true,
     },
+    /**
+     * Module permissions for RM Manager.
+     * Shape: [{ key, view, edit, delete }] (legacy string[] still accepted).
+     */
+    module_permissions: {
+      type: [Schema.Types.Mixed],
+      default: undefined,
+    },
     isDeleted: requiredBooleanWithDefaultFalse,
   },
   {

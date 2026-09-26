@@ -4,6 +4,79 @@ const Store = require("../Models/Store");
 const { createError, successMessage } = require("../utils/ResponseMessage");
 const { RM_MANAGER_ROLE } = require("../utils/storeScope");
 
+/** Allowed module keys Admin can assign to RM Managers */
+const ALLOWED_MODULE_KEYS = new Set([
+  "rm-home",
+  "supplier",
+  "raw-material",
+  "raw-material-stock",
+  "cake-production",
+  "ustad",
+  "ustad-job",
+  "category",
+  "product",
+  "product-stock",
+  "product-bulk",
+  "counter",
+  "product-transfer",
+  "raw-material-dispatch",
+  "rm-wastage",
+  "inventory-reports",
+  "stores",
+  "shops",
+]);
+
+/**
+ * Accepts:
+ *  - string[]  → each module gets view+edit+delete
+ *  - { key, view, edit, delete }[]
+ *  - { modules: ... } already unwrapped by caller
+ */
+const sanitizeModules = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  const byKey = new Map();
+
+  for (const item of raw) {
+    if (typeof item === "string") {
+      const key = item.trim();
+      if (!ALLOWED_MODULE_KEYS.has(key)) continue;
+      byKey.set(key, { key, view: true, edit: true, delete: true });
+      continue;
+    }
+    if (item && typeof item === "object") {
+      const key = String(item.key || item.module || "").trim();
+      if (!ALLOWED_MODULE_KEYS.has(key)) continue;
+      const hasActionFields =
+        item.view != null || item.edit != null || item.delete != null;
+      byKey.set(key, {
+        key,
+        view: hasActionFields ? item.view !== false : true,
+        edit: hasActionFields ? !!item.edit : true,
+        delete: hasActionFields ? !!item.delete : true,
+      });
+    }
+  }
+
+  // Drop modules with view=false (except keep nothing — view false means disabled)
+  const cleaned = [...byKey.values()].filter(
+    (p) => p.view || p.key === "rm-home",
+  );
+  const home = cleaned.find((p) => p.key === "rm-home");
+  if (!home) {
+    cleaned.unshift({
+      key: "rm-home",
+      view: true,
+      edit: false,
+      delete: false,
+    });
+  } else {
+    home.view = true;
+    home.edit = false;
+    home.delete = false;
+  }
+  return cleaned;
+};
+
 const sanitize = (doc) => {
   if (!doc) return doc;
   const obj = doc.toObject ? doc.toObject() : { ...doc };
@@ -59,7 +132,7 @@ const getOne = async (req, res) => {
 
 const create = async (req, res) => {
   try {
-    const { name, email, password, store_id } = req.body;
+    const { name, email, password, store_id, module_permissions } = req.body;
     if (!name?.trim() || !email?.trim() || !password) {
       return createError(res, 400, "Name, email and password are required.");
     }
@@ -78,16 +151,23 @@ const create = async (req, res) => {
     if (exists) return createError(res, 409, "Email already registered.");
 
     const hashedPassword = await bcrypt.hash(String(password), 10);
-    const item = await User.create({
+    const payload = {
       name: String(name).trim(),
       email: normalizedEmail,
       password: hashedPassword,
       role: RM_MANAGER_ROLE,
       store_id,
       isDeleted: false,
-    });
+    };
+    if (module_permissions !== undefined) {
+      payload.module_permissions = sanitizeModules(module_permissions);
+    }
 
-    const populated = await populateStore(User.findById(item._id).select("-password"));
+    const item = await User.create(payload);
+
+    const populated = await populateStore(
+      User.findById(item._id).select("-password"),
+    );
     return successMessage(
       res,
       sanitize(populated || item),
@@ -101,7 +181,7 @@ const create = async (req, res) => {
 
 const update = async (req, res) => {
   try {
-    const { name, email, password, store_id } = req.body;
+    const { name, email, password, store_id, module_permissions } = req.body;
     const updatePayload = {};
 
     if (name !== undefined) updatePayload.name = String(name).trim();
@@ -128,6 +208,9 @@ const update = async (req, res) => {
       if (!store) return createError(res, 404, "Store not found.");
       updatePayload.store_id = store_id;
     }
+    if (module_permissions !== undefined) {
+      updatePayload.module_permissions = sanitizeModules(module_permissions);
+    }
 
     const item = await populateStore(
       User.findOneAndUpdate(
@@ -142,6 +225,38 @@ const update = async (req, res) => {
   } catch (err) {
     console.error("RmStaff update error:", err);
     return createError(res, 500, err.message || "Failed to update RM manager.");
+  }
+};
+
+/**
+ * PUT/PATCH /api/rm-staff/:id/permissions
+ * Body: { modules: [{ key, view, edit, delete }] | string[] }
+ */
+const updatePermissions = async (req, res) => {
+  try {
+    const modules = sanitizeModules(
+      req.body?.modules ?? req.body?.module_permissions ?? [],
+    );
+    const item = await populateStore(
+      User.findOneAndUpdate(
+        { _id: req.params.id, isDeleted: false, role: RM_MANAGER_ROLE },
+        { module_permissions: modules },
+        { new: true, runValidators: true },
+      ).select("-password"),
+    );
+    if (!item) return createError(res, 404, "RM manager not found.");
+    return successMessage(
+      res,
+      sanitize(item),
+      "Module permissions saved successfully.",
+    );
+  } catch (err) {
+    console.error("RmStaff updatePermissions error:", err);
+    return createError(
+      res,
+      500,
+      err.message || "Failed to save module permissions.",
+    );
   }
 };
 
@@ -162,4 +277,11 @@ const remove = async (req, res) => {
   }
 };
 
-module.exports = { list, getOne, create, update, remove };
+module.exports = {
+  list,
+  getOne,
+  create,
+  update,
+  updatePermissions,
+  remove,
+};
